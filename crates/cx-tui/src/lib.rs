@@ -70,7 +70,6 @@ fn run_loop(
     app.note("正在连接守护进程…");
 
     let tick = Duration::from_millis(DEFAULT_REDRAW_MS);
-    let mut last_preview_request: Option<usize> = None;
 
     loop {
         // 1) 处理后台线程送来的消息
@@ -78,17 +77,15 @@ fn run_loop(
             app.apply(event);
         }
 
-        // 2) 列表变化时按需拉取选中项的完整内容
-        if app.selected_position() != last_preview_request
-            && let Some(position) = app.selected_position()
-        {
-            client.request_preview(position);
-            last_preview_request = Some(position);
+        // 2) 为**当前可见窗口**补拉内容摘要（见 app.rs 的说明：位置会漂移，
+        //    所以请求带上对象名，结果按名字贴回对应的行）
+        for (position, name) in app.take_preview_requests() {
+            client.request_preview(position, name);
         }
 
-        // 3) 画一帧
+        // 3) 画一帧（渲染同时回填可视行数，供预取与翻页使用）
         terminal
-            .draw(|frame| ui::draw(frame, &app))
+            .draw(|frame| ui::draw(frame, &mut app))
             .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
 
         // 4) 等键盘（最多等一个刷新间隔）
@@ -110,7 +107,8 @@ fn run_loop(
                     KeyOutcome::Refresh => {
                         client.request_status();
                         client.request_history(HISTORY_LIMIT);
-                        last_preview_request = None;
+                        // 历史整体重来，摘要缓存也重来
+                        app.forget_previews();
                     }
                     KeyOutcome::Push => client.request_push(),
                     KeyOutcome::Reload => client.request("reload"),
@@ -151,17 +149,17 @@ pub fn snapshot(paths: &Paths, width: u16, height: u16) -> Result<String, TuiErr
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // 再等选中项的完整预览
-    if let Some(position) = app.selected_position() {
-        client.request_preview(position);
+    // 再等选中项的内容摘要：快照是"读到了什么"的证据，因此这里要等到位（或超时）
+    for (position, name) in app.take_preview_requests() {
+        client.request_preview(position, name);
+    }
+    let wanted = app.selected_item().map(|item| item.name.clone());
+    if let Some(name) = wanted {
         loop {
             while let Ok(event) = client.try_recv() {
                 app.apply(event);
             }
-            if app.preview.is_some()
-                || app.preview_error.is_some()
-                || std::time::Instant::now() >= deadline
-            {
+            if app.preview_state(&name).is_some() || std::time::Instant::now() >= deadline {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -173,7 +171,7 @@ pub fn snapshot(paths: &Paths, width: u16, height: u16) -> Result<String, TuiErr
     let mut terminal = ratatui::Terminal::new(backend)
         .map_err(|err| TuiError::Io(format!("无法创建测试终端：{err}")))?;
     terminal
-        .draw(|frame| ui::draw(frame, &app))
+        .draw(|frame| ui::draw(frame, &mut app))
         .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
 
     let buffer = terminal.backend().buffer();

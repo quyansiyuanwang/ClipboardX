@@ -2,33 +2,65 @@
 //!
 //! 与终端解耦：`draw` 只依赖 `ratatui::Frame`，所以可以在 `TestBackend` 上画一帧
 //! 再断言"画面上有什么字"——TUI 的渲染逻辑因此也进了单元测试，而不是只能靠人眼。
+//!
+//! 布局策略：宽屏左右分栏（列表 + 预览），**窄屏改为上下**——在 80 列以下的终端里
+//! 左右分栏会把两边都挤到不可读，上下堆叠反而能用。
 
-use crate::app::App;
+use crate::app::{App, PreviewState};
+use cx_proto::control::HistorySummary;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+/// 低于这个宽度就改成上下布局。
+const NARROW_WIDTH: u16 = 84;
+
 /// 画一帧。
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+///
+/// 接收 `&mut App` 是因为渲染同时要回填"列表可视行数"（决定预取窗口与分页步长），
+/// 这样布局只有一个权威来源，不必在别处再算一遍。
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // 标题 + 状态
+            Constraint::Length(3), // 标题 + 状态（必要时 + 提示）
             Constraint::Min(6),    // 历史 + 预览
-            Constraint::Length(1), // 快捷键
+            Constraint::Length(1), // 快捷键 / 过滤输入
         ])
         .split(area);
 
+    let preview_rows = draw_body(frame, chunks[1], app);
     draw_header(frame, chunks[0], app);
-    draw_body(frame, chunks[1], app);
-    draw_footer(frame, chunks[2], app);
+    draw_footer(frame, chunks[2], app, preview_rows);
 
     if app.show_help {
         draw_help(frame, area);
     }
+}
+
+/// 画主体（列表 + 预览），返回列表的可视行数供调用方回填。
+fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> usize {
+    let narrow = area.width < NARROW_WIDTH;
+    let panes = if narrow {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .split(area)
+    };
+
+    draw_history(frame, panes[0], app);
+    draw_preview(frame, panes[1], app);
+
+    // 列表内高（去掉上下边框）
+    panes[0].height.saturating_sub(2) as usize
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -60,41 +92,21 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 }
 
-fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(area);
-
-    draw_history(frame, panes[0], app);
-    draw_preview(frame, panes[1], app);
-}
-
 fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let width = area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem<'_>> = app
-        .items
+        .visible()
         .iter()
-        .map(|item| {
-            let marker = if item.origin == "remote" {
-                "↓"
-            } else {
-                "↑"
-            };
-            let text = format!(
-                "{} #{} {} {} {}",
-                marker,
-                item.position,
-                human_time(item.created_ms),
-                human_bytes(item.bytes as u64),
-                short_hash(&item.hash)
-            );
-            ListItem::new(Line::from(text))
-        })
+        .filter_map(|index| app.items.get(*index))
+        .map(|item| ListItem::new(row_text(item, app, width)))
         .collect();
 
-    let title = format!(" 历史（{} 条，0 = 最新）", app.items.len());
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(history_title(app)),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::Blue)
@@ -103,69 +115,241 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
         .highlight_symbol("▶ ");
     let mut state = ratatui::widgets::ListState::default();
-    if !app.items.is_empty() {
-        state.select(Some(app.cursor.min(app.items.len() - 1)));
+    if !app.visible().is_empty() {
+        state.select(Some(app.cursor.min(app.visible().len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = match app.selected_position() {
-        Some(position) => format!(" 内容预览（第 {position} 条）"),
-        None => " 内容预览 ".to_string(),
+/// 列表标题：条数 + 光标位置，过滤生效时把过滤词也写出来。
+fn history_title(app: &App) -> String {
+    let total = app.items.len();
+    let shown = app.visible_len();
+    let position = if shown == 0 {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", app.cursor + 1, shown)
     };
-    let text = match (&app.preview, &app.preview_error) {
-        (_, Some(err)) => Text::from(vec![Line::from(Span::styled(
+    if app.filter_active() {
+        format!(
+            " 历史 {position}（过滤 “{}”，命中 {shown}/{total}，0 = 最新）",
+            app.filter()
+        )
+    } else {
+        format!(" 历史 {position}（共 {total} 条，0 = 最新）")
+    }
+}
+
+/// 一行：标记 + 时间 + 类型 + 大小 + 内容摘要。
+///
+/// 内容摘要来自按需加载的预览：没加载出来时显示 `…`，失败就地把原因标出来，
+/// 这样"这一行是什么"不必先选中才知道。
+fn row_text(item: &HistorySummary, app: &App, width: usize) -> Line<'static> {
+    let marker = origin_marker(item, app);
+    let kind = kind_label(&item.kind);
+    let state = app.preview_state(&item.name);
+
+    let (summary, summary_style) = match state {
+        None | Some(PreviewState::Loading) => {
+            ("…".to_string(), Style::default().fg(Color::DarkGray))
+        }
+        Some(PreviewState::Failed(_)) => {
+            ("（读取失败）".to_string(), Style::default().fg(Color::Red))
+        }
+        Some(PreviewState::Ready(preview)) => {
+            let text = preview
+                .text
+                .as_deref()
+                .map(one_line)
+                .or_else(|| {
+                    preview
+                        .image
+                        .as_deref()
+                        .map(|image| format!("图片 {image}"))
+                })
+                .unwrap_or_else(|| "（空内容）".to_string());
+            (text, Style::default())
+        }
+    };
+
+    let head = format!(
+        "{marker} {} {kind} {} ",
+        relative_time(item.created_ms),
+        human_bytes(item.bytes as u64)
+    );
+    let used = display_width(&head) + 2; // 高亮符号 "▶ " 占两列
+    let room = width.saturating_sub(used);
+    if room == 0 {
+        return Line::from(Span::raw(head.trim_end().to_string()));
+    }
+    Line::from(vec![
+        Span::raw(head),
+        Span::styled(clamp_width_value(summary, room), summary_style),
+    ])
+}
+
+/// 单行化：把换行/制表符折成空格，便于列表里一眼看全。
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        "image" => "图片",
+        "text" | "" => "文本",
+        other => other,
+    }
+}
+
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let item = app.selected_item();
+    let title = match (item, app.preview_scroll()) {
+        (Some(item), 0) => format!(" 内容预览（第 {} 条）", item.position),
+        (Some(item), offset) => format!(
+            " 内容预览（第 {} 条，已下滚 {offset} 行，0 回到开头）",
+            item.position
+        ),
+        (None, _) => " 内容预览 ".to_string(),
+    };
+
+    let text = match (app.selected_preview(), app.selected_preview_error(), item) {
+        (Some(preview), _, Some(item)) => preview_text(preview, item, app),
+        (None, Some(err), _) => Text::from(vec![Line::from(Span::styled(
             format!("读取预览失败：{err}"),
             Style::default().fg(Color::Red),
         ))]),
-        (None, None) => Text::from(vec![Line::from(Span::styled(
+        (None, None, None) => Text::from(vec![Line::from(Span::styled(
+            if app.filter_active() {
+                "当前过滤没有匹配到内容（Esc 清除过滤）"
+            } else {
+                "历史里还没有内容。复制点什么，或者按 p 发布当前剪贴板。"
+            },
+            Style::default().fg(Color::DarkGray),
+        ))]),
+        // 有内容摘要在手上时走第一个分支；这里兜住其余组合（正在读取等）
+        _ => Text::from(vec![Line::from(Span::styled(
             "（正在读取…）",
             Style::default().fg(Color::DarkGray),
         ))]),
-        (Some(preview), None) => {
-            let mut lines = Vec::new();
-            lines.push(Line::from(vec![
-                Span::styled("类型 ", Style::default().fg(Color::DarkGray)),
-                Span::raw(preview.kind.clone()),
-                Span::styled("   大小 ", Style::default().fg(Color::DarkGray)),
-                Span::raw(human_bytes(preview.bytes as u64)),
-                Span::styled("   位置 ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("#{}", preview.position)),
-            ]));
-            if let Some(text) = &preview.text {
-                lines.push(Line::from(""));
-                for line in text.lines().take(200) {
-                    lines.push(Line::from(line.to_string()));
-                }
-                if preview.truncated {
-                    lines.push(Line::from(Span::styled(
-                        "…（内容已截断，cx show 可看全）",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            } else if preview.image.is_some() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "这是一张图片。终端里不渲染图片，按回车即可写回剪贴板。",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            Text::from(lines)
-        }
     };
 
     let block = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((app.preview_scroll(), 0));
     frame.render_widget(block, area);
 }
 
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+/// 来源标记：↑ 本机发出、↓ 来自别的设备、· 还不知道（没拿到状态）。
+///
+/// 判据是**来源设备 id 与本机设备 id 是否相同**。早先这里比的是 `origin == "remote"`，
+/// 而 `origin` 装的是设备名（例如 `ALEXLAPTOP`），于是所有条目都被标成"本机"——
+/// 快照里一眼就能看出来，现在改成按 id 比。
+fn origin_marker(item: &HistorySummary, app: &App) -> &'static str {
+    match &app.status {
+        None => "·",
+        Some(status) if item.origin_device == status.device_id => "↑",
+        Some(_) => "↓",
+    }
+}
+
+/// 来源描述：自己的条目说"本机"，别人的带设备名与短 id（完整 id 会把这一行撑爆）。
+fn origin_label(item: &HistorySummary, app: &App) -> String {
+    let mine = app
+        .status
+        .as_ref()
+        .map(|status| item.origin_device == status.device_id)
+        .unwrap_or(false);
+    if mine {
+        return "本机".to_string();
+    }
+    let name = if item.origin.is_empty() {
+        "未知设备".to_string()
+    } else {
+        item.origin.clone()
+    };
+    format!("{name}（{}）", crate::app::short(&item.origin_device))
+}
+
+fn preview_text(
+    preview: &cx_proto::control::HistoryPreview,
+    item: &HistorySummary,
+    app: &App,
+) -> Text<'static> {
+    let origin = origin_label(item, app);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("类型 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(kind_label(&preview.kind).to_string()),
+            Span::styled("   大小 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(human_bytes(preview.bytes as u64)),
+            Span::styled("   来源 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(origin),
+        ]),
+        Line::from(vec![
+            Span::styled("时间 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(absolute_time(item.created_ms)),
+            Span::styled("   哈希 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(short_hash(&item.hash)),
+        ]),
+    ];
+
+    if let Some(text) = &preview.text {
+        lines.push(Line::from(""));
+        for line in text.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+        if preview.truncated {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "…内容较长，这里只显示前一段；cx show <序号> 可看全文",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else if let Some(image) = &preview.image {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "这是一张图片（终端里不渲染图片）。",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("尺寸信息：{image}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "按回车写回剪贴板。",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    Text::from(lines)
+}
+
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
+    if app.filter_input {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" 过滤 ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{}▌", app.filter())),
+                Span::styled(
+                    "　回车 确定　Esc 取消　（匹配类型 / 来源 / 对象名 / 哈希 / 已加载的内容摘要）",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
+
     let hint = if app.show_help {
         " 任意键返回　q 退出 "
+    } else if app.filter_active() {
+        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　/ 改过滤　Esc 清过滤　? 帮助　q 退出 "
     } else {
-        " ↑↓/jk 选择　回车 写回剪贴板　空格 暂停/恢复　p 发布　r 刷新　R 重载配置　? 帮助　q 退出 "
+        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　p 发布　/ 过滤　r 刷新　R 重载配置　? 帮助　q 退出 "
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -177,7 +361,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 60, 60);
+    let popup = centered(area, 66, 80);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
@@ -185,18 +369,32 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  ↑ / k        上移"),
-        Line::from("  ↓ / j        下移"),
-        Line::from("  Home / g     回到最新"),
-        Line::from("  End / G      跳到最旧"),
-        Line::from("  回车         把选中项写回剪贴板"),
-        Line::from("  空格         暂停 / 恢复同步"),
-        Line::from("  p            立即发布本机剪贴板"),
-        Line::from("  r            刷新状态与历史"),
-        Line::from("  R            重新读取配置"),
-        Line::from("  ?            帮助（本页）"),
-        Line::from("  q / Esc      退出"),
+        Line::from("  ↑ / k            上移一行"),
+        Line::from("  ↓ / j            下移一行"),
+        Line::from("  PgUp / PgDn      上下翻页"),
+        Line::from("  Home / g         回到最新"),
+        Line::from("  End / G          跳到最旧"),
+        Line::from("  回车             把选中项写回剪贴板"),
+        Line::from("  /                过滤（回车确定，Esc 取消）"),
+        Line::from("  Esc              有过滤时先清过滤，再按退出"),
+        Line::from("  J / K            预览下滚 / 上滚一行"),
+        Line::from("  Ctrl+D / Ctrl+U  预览上下翻页"),
+        Line::from("  0                预览回到开头"),
+        Line::from("  空格             暂停 / 恢复同步"),
+        Line::from("  p                立即发布本机剪贴板"),
+        Line::from("  r                刷新状态与历史"),
+        Line::from("  R                重新读取配置"),
+        Line::from("  ?                帮助（本页）"),
+        Line::from("  q                退出"),
         Line::from(""),
+        Line::from(Span::styled(
+            "  ↑ 本机发出，↓ 来自别的设备，· 状态未知；行内摘要是按需加载的，",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  因此过滤只能匹配已加载的内容摘要（类型/来源/哈希总能匹配）。",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(Span::styled(
             "  界面只读控制套接字：不直接动剪贴板、不直接访问网络。",
             Style::default().fg(Color::DarkGray),
@@ -210,7 +408,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-/// 居中放一个固定大小的弹窗（自动收进屏幕内）。
+/// 居中放一个固定比例的弹窗（自动收进屏幕内）。
 fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -220,41 +418,91 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(area);
-    Layout::default()
+    let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage((100 - percent_x) / 2),
             Constraint::Percentage(percent_x),
             Constraint::Percentage((100 - percent_x) / 2),
         ])
-        .split(vertical[1])[1]
+        .split(vertical[1]);
+    horizontal[1]
 }
 
 fn short_hash(hash: &str) -> String {
     hash.chars().take(8).collect()
 }
 
-/// 毫秒时间戳 → `MM-DD HH:MM`（本地时区不做换算，直接用 UTC，避免引时区库）。
-fn human_time(ms: u64) -> String {
-    let seconds = ms / 1000;
-    let days = seconds / 86_400;
-    let rest = seconds % 86_400;
-    let (_, month, day) = cx_proto::civil::civil_from_days(days as i64);
-    format!(
-        "{month:02}-{day:02} {:02}:{:02}",
-        rest / 3600,
-        (rest % 3600) / 60
-    )
+/// 相对时间：列表里"多久以前"比绝对时间好读。
+fn relative_time(ms: u64) -> String {
+    let now = cx_core::now_ms();
+    if ms == 0 || ms > now {
+        return "--".to_string();
+    }
+    let seconds = (now - ms) / 1000;
+    match seconds {
+        0..=9 => "刚刚".to_string(),
+        10..=59 => format!("{seconds} 秒前"),
+        60..=3599 => format!("{} 分钟前", seconds / 60),
+        3600..=86_399 => format!("{} 小时前", seconds / 3600),
+        86_400..=604_799 => format!("{} 天前", seconds / 86_400),
+        _ => absolute_time(ms),
+    }
+}
+
+/// 绝对时间（本地时区，`MM-DD HH:MM`）。
+fn absolute_time(ms: u64) -> String {
+    let total_seconds = (ms / 1000) as i64;
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let (year, month, day) = cx_proto::civil::civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let _ = year;
+    format!("{month:02}-{day:02} {hour:02}:{minute:02}")
 }
 
 fn human_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
+    const KIB: f64 = 1024.0;
+    let value = bytes as f64;
+    if value < KIB {
         format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if value < KIB * KIB {
+        format!("{:.1} KB", value / KIB)
     } else {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        format!("{:.1} MB", value / (KIB * KIB))
     }
+}
+
+/// 文本的显示宽度（CJK 算两列）。
+fn display_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+/// 按显示宽度截断（超过就加 …）。CJK 按两列计算，所以不会把中文截成半宽。
+fn clamp_width_value(text: String, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(&text) <= max {
+        return text;
+    }
+    // 二分找最长的可容纳前缀（宽度按列算，避免中文被截成两半）
+    let chars: Vec<char> = text.chars().collect();
+    let (mut low, mut high) = (0usize, chars.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect();
+        // +1 是给末尾的省略号留一列
+        if display_width(&candidate) < max {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let mut cut: String = chars[..low.min(chars.len())].iter().collect();
+    cut.push('…');
+    cut
 }
 
 #[cfg(test)]
@@ -263,23 +511,62 @@ mod tests {
     use crate::app::App;
     use crate::client::UiEvent;
     use cx_proto::control::{HistoryPreview, HistorySummary, StatusReport};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
 
     fn item(position: usize, origin: &str) -> HistorySummary {
         HistorySummary {
             position,
             name: format!("1759323998000-ab12cd34-9f3c1e77-{position}"),
             kind: "text".to_string(),
-            created_ms: 1_759_323_998_000 + position as u64 * 60_000,
-            bytes: 12,
-            hash: format!("{}{}", "ab".repeat(8), position),
+            created_ms: cx_core::now_ms() - 120_000,
+            bytes: 1234,
+            hash: "a1b2c3d4".repeat(8),
             origin: origin.to_string(),
             origin_device: "ab12cd34".to_string(),
         }
     }
 
-    /// 用 JSON 构造状态报告：字段增删时测试不会碎，也更贴近真实到达路径。
+    /// 来源标记必须按"来源设备 id 是否等于本机"判断。
+    ///
+    /// 这里曾经比的是 `origin == "remote"`，而 origin 装的是设备名，
+    /// 于是所有条目都被标成"本机"——是个一眼看不出来、但会误导人的错误。
+    #[test]
+    fn 来源标记按设备_id_判断而不是设备名() {
+        let app = app_with(1);
+        let device_id = app.status.as_ref().unwrap().device_id.clone();
+
+        let mut mine = item(0, "ALEXLAPTOP");
+        mine.origin_device = device_id.clone();
+        assert_eq!(origin_marker(&mine, &app), "↑", "来源就是本机");
+
+        let mut remote = item(0, "ALEXLAPTOP");
+        remote.origin_device = "ffffffffffffffff".to_string();
+        assert_eq!(origin_marker(&remote, &app), "↓", "来源是别的设备");
+        assert!(origin_label(&remote, &app).contains("ALEXLAPTOP"));
+        assert!(
+            origin_label(&remote, &app).contains("ffffffff"),
+            "别人的条目要带短设备 id"
+        );
+        assert_eq!(origin_label(&mine, &app), "本机");
+
+        // 没拿到状态时不下结论，标成"未知"而不是猜"本机"
+        let blind = App::new();
+        assert_eq!(origin_marker(&remote, &blind), "·");
+    }
+
+    fn loaded(position: usize, text: &str) -> UiEvent {
+        UiEvent::Preview {
+            name: format!("1759323998000-ab12cd34-9f3c1e77-{position}"),
+            result: Ok(Box::new(HistoryPreview {
+                position,
+                kind: "text".to_string(),
+                text: Some(text.to_string()),
+                image: None,
+                truncated: false,
+                bytes: text.len() as u32,
+            })),
+        }
+    }
+
     fn status(paused: bool) -> StatusReport {
         serde_json::from_value(serde_json::json!({
             "version": "0.1.0",
@@ -303,139 +590,283 @@ mod tests {
         .expect("状态 JSON 应当能反序列化")
     }
 
-    /// 画一帧并把缓冲区拼成文本（按行、去尾空白）。
-    fn render(app: &App, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buffer.area.height {
-            let mut line = String::new();
-            for x in 0..buffer.area.width {
-                line.push_str(buffer[(x, y)].symbol());
-            }
-            out.push_str(line.trim_end());
-            out.push('\n');
-        }
-        out
+    fn app_with(count: usize) -> App {
+        let mut app = App::new();
+        app.apply(UiEvent::History(
+            (0..count).map(|i| item(i, "cli")).collect(),
+        ));
+        app.apply(UiEvent::Status(Box::new(status(false))));
+        app
     }
 
-    /// 忽略空白后再比较。
-    ///
-    /// 原因：`TestBackend` 对宽字符（中文）会在缓冲区里留一个占位空格，
-    /// 于是"同步中"读出来是"同 步 中"。这是测试后端的行为，不是画面问题。
+    /// 画一帧并返回屏幕文本。
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("测试终端应当能创建");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("渲染不应失败");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn compact(text: &str) -> String {
         text.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     fn has(screen: &str, needle: &str) -> bool {
-        screen.contains(needle) || compact(screen).contains(&compact(needle))
+        compact(screen).contains(&compact(needle))
     }
 
     #[test]
     fn 画面上能看到状态与历史() {
-        let mut app = App::new();
-        app.apply(UiEvent::Status(Box::new(status(false))));
-        app.apply(UiEvent::History(vec![item(0, "remote"), item(1, "local")]));
-        app.apply(UiEvent::Preview(HistoryPreview {
-            position: 0,
-            kind: "text".to_string(),
-            text: Some("这是来自另一台设备的文本".to_string()),
-            image: None,
-            truncated: false,
-            bytes: 30,
-        }));
-
-        let screen = render(&app, 100, 30);
+        let mut app = app_with(3);
+        app.apply(loaded(0, "第一条内容"));
+        let screen = render(&mut app, 120, 30);
         assert!(has(&screen, "ClipboardX"), "{screen}");
-        assert!(has(&screen, "同步中"), "{screen}");
         assert!(has(&screen, "笔记本"), "{screen}");
-        assert!(has(&screen, "历史（2 条"), "{screen}");
-        assert!(has(&screen, "这是来自另一台设备的文本"), "{screen}");
-        assert!(has(&screen, "↓"), "远端条目应有方向标记");
-        assert!(has(&screen, "↑"), "本机条目应有方向标记");
-        assert!(has(&screen, "回车 写回剪贴板"), "页脚应给出快捷键提示");
+        assert!(has(&screen, "历史"), "{screen}");
+        assert!(has(&screen, "内容预览"), "{screen}");
+    }
+
+    #[test]
+    fn 行内直接显示内容摘要而不是只有哈希() {
+        let mut app = app_with(3);
+        app.apply(loaded(0, "这是一段可以直接看到的内容"));
+        app.apply(loaded(1, "第二条内容"));
+        let screen = render(&mut app, 140, 30);
+        assert!(
+            has(&screen, "这是一段可以直接看到的内容"),
+            "列表行里应当能看到内容摘要：{screen}"
+        );
+        assert!(has(&screen, "第二条内容"), "{screen}");
+        // 还没加载的那条显示占位符
+        assert!(has(&screen, "…"), "{screen}");
+    }
+
+    #[test]
+    fn 未加载的行显示占位符_加载失败的行标出原因() {
+        let mut app = app_with(2);
+        app.apply(UiEvent::Preview {
+            name: "1759323998000-ab12cd34-9f3c1e77-0".to_string(),
+            result: Err("内容已过期".to_string()),
+        });
+        let screen = render(&mut app, 140, 30);
+        assert!(has(&screen, "读取失败"), "{screen}");
+        assert!(has(&screen, "读取预览失败：内容已过期"), "{screen}");
+    }
+
+    #[test]
+    fn 列表标题显示光标位置与总数() {
+        let mut app = app_with(12);
+        app.down();
+        app.down();
+        let screen = render(&mut app, 140, 30);
+        assert!(has(&screen, "3/12"), "应当显示第几条/共几条：{screen}");
+        assert!(has(&screen, "共 12 条"), "{screen}");
+    }
+
+    #[test]
+    fn 过滤生效时标题与页脚都提示() {
+        let mut app = app_with(4);
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        for ch in "图片".chars() {
+            app.on_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let screen = render(&mut app, 140, 30);
+        assert!(has(&screen, "过滤"), "{screen}");
+        assert!(has(&screen, "命中 0/4"), "{screen}");
+        assert!(
+            has(&screen, "Esc 取消"),
+            "输入态页脚应当说明怎么退出：{screen}"
+        );
+    }
+
+    #[test]
+    fn 过滤无结果时预览区给出出路而不是空白() {
+        let mut app = app_with(3);
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        for ch in "image".chars() {
+            app.on_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = render(&mut app, 140, 30);
+        assert!(has(&screen, "没有匹配到内容"), "{screen}");
+        assert!(has(&screen, "Esc 清除过滤"), "{screen}");
     }
 
     #[test]
     fn 暂停时状态栏变黄且显示已暂停() {
         let mut app = App::new();
         app.apply(UiEvent::Status(Box::new(status(true))));
-        let screen = render(&app, 100, 20);
+        let screen = render(&mut app, 120, 24);
         assert!(has(&screen, "已暂停"), "{screen}");
     }
 
     #[test]
     fn 未连接时给出明确提示() {
-        let app = App::new();
-        let screen = render(&app, 100, 20);
+        let mut app = App::new();
+        let screen = render(&mut app, 120, 24);
         assert!(has(&screen, "未连接守护进程"), "{screen}");
-        assert!(has(&screen, "正在读取"), "{screen}");
+        assert!(has(&screen, "历史里还没有内容"), "{screen}");
     }
 
     #[test]
-    fn 图片不渲染但给出说明() {
-        let mut app = App::new();
-        app.apply(UiEvent::History(vec![item(0, "local")]));
-        app.apply(UiEvent::Preview(HistoryPreview {
-            position: 0,
-            kind: "image".to_string(),
-            text: None,
-            image: Some("iVBORw0KGgo=".to_string()),
-            truncated: false,
-            bytes: 4096,
-        }));
-        let screen = render(&app, 100, 24);
-        assert!(has(&screen, "图片"), "{screen}");
-        assert!(has(&screen, "回车即可写回剪贴板"), "{screen}");
-        assert!(has(&screen, "4.0 KB"), "{screen}");
+    fn 相对时间比绝对时间更好读() {
+        let now = cx_core::now_ms();
+        assert_eq!(relative_time(now - 3_000), "刚刚");
+        assert_eq!(relative_time(now - 120_000), "2 分钟前");
+        assert_eq!(relative_time(now - 7_200_000), "2 小时前");
+        assert_eq!(relative_time(now - 3 * 86_400_000), "3 天前");
+        // 太久以前退回绝对时间
+        assert!(relative_time(now - 40 * 86_400_000).contains('-'));
+        // 时钟异常（未来时间）不该 panic
+        assert_eq!(relative_time(now + 60_000), "--");
+        assert_eq!(relative_time(0), "--");
     }
 
     #[test]
-    fn 预览失败时显示原因而不是空白() {
-        let mut app = App::new();
-        app.apply(UiEvent::History(vec![item(0, "local")]));
-        app.apply(UiEvent::Failure {
-            command: "history.show".to_string(),
-            message: "第 9 条不存在".to_string(),
+    fn 中文按两列截断且不超宽() {
+        let text = "这是一段很长的中文内容需要被截断".to_string();
+        let cut = clamp_width_value(text.clone(), 20);
+        assert!(
+            display_width(&cut) <= 20,
+            "截断后宽度 {} 超了",
+            display_width(&cut)
+        );
+        assert!(cut.ends_with('…'), "{cut}");
+        // 够宽时原样返回
+        assert_eq!(clamp_width_value(text.clone(), 200), text);
+        // 宽度为 0 时返回空串而不是 panic
+        assert_eq!(clamp_width_value(text, 0), "");
+    }
+
+    #[test]
+    fn 图片不渲染但给出说明与尺寸() {
+        let mut app = app_with(1);
+        app.apply(UiEvent::Preview {
+            name: "1759323998000-ab12cd34-9f3c1e77-0".to_string(),
+            result: Ok(Box::new(HistoryPreview {
+                position: 0,
+                kind: "image".to_string(),
+                text: None,
+                image: Some("1920x1080 PNG".to_string()),
+                truncated: false,
+                bytes: 4096,
+            })),
         });
-        let screen = render(&app, 100, 24);
-        assert!(has(&screen, "读取预览失败"), "{screen}");
-        assert!(has(&screen, "第 9 条不存在"), "{screen}");
+        let screen = render(&mut app, 130, 30);
+        assert!(has(&screen, "图片"), "{screen}");
+        assert!(has(&screen, "1920x1080"), "{screen}");
+        assert!(has(&screen, "按回车写回剪贴板"), "{screen}");
+    }
+
+    #[test]
+    fn 窄终端改成上下布局仍然可读() {
+        let mut app = app_with(3);
+        app.apply(loaded(0, "窄屏下也要能看到内容"));
+        let narrow = render(&mut app, 70, 30);
+        assert!(has(&narrow, "窄屏下也要能看到内容"), "{narrow}");
+        assert!(has(&narrow, "内容预览"), "{narrow}");
+        // 上下布局：标题在上半屏，预览在下半屏。
+        // 注意要比"去掉空白"之后的文本：TestBackend 给 CJK 宽字符插了占位空格，
+        // 直接 contains("历史") 是匹配不上的（这个坑踩过一次了）。
+        let lines: Vec<&str> = narrow.lines().collect();
+        let list_y = lines
+            .iter()
+            .position(|l| compact(l).contains("0=最新"))
+            .unwrap_or(0);
+        let preview_y = lines
+            .iter()
+            .position(|l| compact(l).contains("内容预览"))
+            .unwrap_or(0);
+        assert!(preview_y > list_y, "窄屏应当是上下排列：\n{narrow}");
+    }
+
+    #[test]
+    fn 宽终端保持左右布局() {
+        let mut app = app_with(3);
+        let screen = render(&mut app, 140, 30);
+        let lines: Vec<&str> = screen.lines().collect();
+        let list_y = lines
+            .iter()
+            .position(|l| compact(l).contains("0=最新"))
+            .unwrap_or(99);
+        let preview_y = lines
+            .iter()
+            .position(|l| compact(l).contains("内容预览"))
+            .unwrap_or(99);
+        assert_eq!(list_y, preview_y, "宽屏应当左右并排：\n{screen}");
+    }
+
+    #[test]
+    fn 预览滚动后标题显示偏移量与回位提示() {
+        let mut app = app_with(1);
+        let long: String = (1..=200).map(|i| format!("第 {i} 行\n")).collect();
+        app.apply(loaded(0, &long));
+        app.set_viewport_rows(5);
+        app.preview_scroll_by(3);
+        let screen = render(&mut app, 130, 30);
+        assert!(has(&screen, "已下滚 3 行"), "{screen}");
+        assert!(has(&screen, "0 回到开头"), "{screen}");
     }
 
     #[test]
     fn 帮助页列出全部快捷键() {
-        let mut app = App::new();
+        let mut app = app_with(1);
         app.show_help = true;
-        let screen = render(&app, 100, 30);
-        for expected in [
+        let screen = render(&mut app, 130, 40);
+        for needle in [
             "快捷键",
             "回车",
             "空格",
-            "立即发布本机剪贴板",
-            "重新读取配置",
-            "只读控制套接字",
+            "PgUp",
+            "过滤",
+            "Ctrl+D",
+            "暂停",
+            "退出",
         ] {
-            assert!(has(&screen, expected), "帮助页应包含 {expected}：{screen}");
+            assert!(has(&screen, needle), "帮助页缺少 {needle}：\n{screen}");
         }
+        assert!(has(&screen, "按需加载"), "应当说明过滤的局限：{screen}");
     }
 
     #[test]
     fn 小终端也不会崩() {
-        let mut app = App::new();
-        app.apply(UiEvent::Status(Box::new(status(false))));
-        app.apply(UiEvent::History(vec![item(0, "local")]));
-        // 20x6 是能跑 TUI 的下限，这里确保不 panic
-        let screen = render(&app, 20, 6);
-        assert!(!screen.is_empty());
+        for (width, height) in [(20u16, 6u16), (40, 8), (60, 10), (200, 60)] {
+            let mut app = app_with(5);
+            let _ = render(&mut app, width, height);
+        }
     }
 
     #[test]
     fn 空历史时不会_panic() {
-        let app = App::new();
-        let screen = render(&app, 80, 20);
-        assert!(has(&screen, "历史（0 条"), "{screen}");
+        let mut app = App::new();
+        let screen = render(&mut app, 100, 20);
+        assert!(has(&screen, "0/0"), "{screen}");
     }
 }

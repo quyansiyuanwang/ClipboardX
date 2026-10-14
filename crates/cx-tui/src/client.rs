@@ -22,8 +22,14 @@ pub enum UiEvent {
     Status(Box<StatusReport>),
     /// 历史列表。
     History(Vec<HistorySummary>),
-    /// 某条内容的完整预览。
-    Preview(HistoryPreview),
+    /// 某条内容的完整预览。按**对象名**回传：位置会随新内容漂移（0 永远是最新），
+    /// 名字不会，界面因此能把结果稳定贴到某一行上。
+    Preview {
+        /// 对象名。
+        name: String,
+        /// 预览结果（失败时给出原因，界面在那一行上就地标出来）。
+        result: Result<Box<HistoryPreview>, String>,
+    },
     /// 某个请求失败。
     Failure {
         /// 命令名（便于界面区分是"拉预览失败"还是别的）。
@@ -42,7 +48,10 @@ pub enum UiEvent {
 enum Request {
     Status,
     History(usize),
-    Preview(usize),
+    Preview {
+        position: usize,
+        name: String,
+    },
     Copy(usize),
     Push,
     Simple(&'static str),
@@ -99,8 +108,10 @@ impl DaemonClient {
     }
 
     /// 请求某条内容的完整预览。
-    pub fn request_preview(&self, position: usize) {
-        let _ = self.tx.send(Request::Preview(position));
+    ///
+    /// `name` 是这次请求对应的对象名，会原样回传——界面用它把结果贴到正确的行上。
+    pub fn request_preview(&self, position: usize, name: String) {
+        let _ = self.tx.send(Request::Preview { position, name });
     }
 
     /// 请求把某条写回剪贴板。
@@ -205,28 +216,18 @@ fn worker(
                     }
                 }
             }
-            Request::Preview(position) => {
+            Request::Preview { position, name } => {
                 let mut args = Map::new();
                 args.insert("position".to_string(), json!(position));
-                match client.request(commands::HISTORY_SHOW, args) {
-                    Ok(value) => match serde_json::from_value::<HistoryPreview>(value) {
-                        Ok(preview) => {
-                            let _ = events.send(UiEvent::Preview(preview));
-                        }
-                        Err(err) => {
-                            let _ = events.send(UiEvent::Failure {
-                                command: "history.show".to_string(),
-                                message: format!("预览字段解析失败：{err}"),
-                            });
-                        }
-                    },
-                    Err(err) => {
-                        let _ = events.send(UiEvent::Failure {
-                            command: "history.show".to_string(),
-                            message: err.to_string(),
-                        });
-                    }
-                }
+                let result = match client.request(commands::HISTORY_SHOW, args) {
+                    Ok(value) => serde_json::from_value::<HistoryPreview>(value)
+                        .map(Box::new)
+                        .map_err(|err| format!("预览字段解析失败：{err}")),
+                    Err(err) => Err(err.to_string()),
+                };
+                // 按对象名回传：位置会随新内容漂移（0 永远是最新），名字不会，
+                // 界面因此可以把结果稳定地贴到某一行上。
+                let _ = events.send(UiEvent::Preview { name, result });
             }
             Request::Copy(position) => {
                 let mut args = Map::new();
