@@ -1,0 +1,217 @@
+name: Nightly
+
+# 每天构建一次"能装能跑"的测试包，发布成 **draft**：只有仓库协作者看得见，
+# 用来在真机上装 nightly 验证，不等于正式发布。
+#
+# 版本号用 `0.1.<一年中的第几天>`：MSI / pkg / deb 三家的版本号都只接受数字段
+# （semver 预发布后缀喂不进 MSI 的 ProductVersion），按天递增既合法又能区分每一天，
+# 也方便"装今天的覆盖昨天的"这种升级测试。它与正式版 0.1.0 的关系：nightly 版本更大，
+# 因此从 nightly 装回正式版时 apt 会提示降级——这是预期的。
+on:
+  schedule:
+    # 每天 03:00（北京时间）跑一次。GitHub 的 cron 用 UTC，UTC 19:00 是北京次日 03:00。
+    - cron: '0 19 * * *'
+  # 手动触发时**无条件**按当前 main 最新提交构建：这是"我要一份最新的测试包"的动作，
+  # 不该被下面的"24 小时无提交就跳过"挡住。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一时间只跑一个 nightly；新的顶掉旧的（draft 本来就是滚动覆盖）
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: 计算 nightly 版本
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.calc.outputs.build }}
+      version: ${{ steps.calc.outputs.version }}
+      date: ${{ steps.calc.outputs.date }}
+      sha: ${{ steps.calc.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 判断是否需要构建并计算版本
+        id: calc
+        shell: bash
+        run: |
+          set -euo pipefail
+          date="$(date -u +%Y%m%d)"
+          # %j 会补前导零（001），去掉后当作数字段
+          doy="$(date -u +%j | sed 's/^0*//')"
+          base="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          major_minor="$(echo "$base" | cut -d. -f1,2)"
+          version="$major_minor.$doy"
+          sha="$(git rev-parse --short HEAD)"
+
+          # 定时任务在"最近 24 小时没有任何提交"时跳过：那种情况下打出来的包和昨天
+          # 完全一样，只会白白占一个版本号。手动触发不走这条（见文件头部的说明）。
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            recent="$(git log --since='24 hours ago' --oneline | wc -l)"
+            if [ "$recent" -eq 0 ]; then
+              echo "最近 24 小时没有新提交，跳过本次定时构建（可在 Actions 页手动触发）"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "手动触发：按当前 main 的最新提交构建"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "将构建 nightly $version（来自 Cargo.toml $base，提交 $sha）"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows MSI（nightly）
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装 WiX（版本锁定在仓库内）
+        run: dotnet tool restore
+
+      # 与正式发布同一条构建路径，只是版本号不同——nightly 的价值就在于
+      # "和正式版一样的产物，只是没经过人工验收"，所以脚本不另起一套。
+      - name: 构建 MSI
+        shell: pwsh
+        run: ./scripts/build-msi.ps1 -Version ${{ needs.prepare.outputs.version }}
+
+      - name: 安装验收（真实安装 → 断言 → 卸载）
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem dist/ClipboardX-*-x64.msi | Select-Object -First 1
+          ./scripts/verify-msi.ps1 -Msi $msi.FullName
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-windows
+          path: dist/ClipboardX-${{ needs.prepare.outputs.version }}-x64.msi
+          if-no-files-found: error
+
+  macos:
+    name: macOS DMG（nightly）
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建 DMG
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash packaging/macos/build-dmg.sh
+
+      - name: 挂载验收
+        shell: bash
+        run: sudo bash packaging/macos/verify-dmg.sh "$(ls dist/*.dmg | head -n1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  linux:
+    name: Linux deb（nightly）
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装验收所需依赖（Xvfb 冒烟用）
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb dbus-x11 xclip
+
+      - name: 构建 deb
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash packaging/linux/build-deb.sh
+
+      - name: 安装验收（安装 → 冒烟 → 卸载）
+        shell: bash
+        run: sudo bash packaging/linux/verify-deb.sh "$(ls dist/*.deb | head -n1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-linux
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    name: 发布 draft
+    needs: [prepare, windows, macos, linux]
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 归拢产物并生成 SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \) -exec cp -v {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          count=$(find . -maxdepth 1 -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \) | wc -l)
+          test "$count" -eq 3 || { echo "::error::预期 3 个产物，实际 $count"; exit 1; }
+
+      - name: 写 nightly 说明
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 注意：这里是有变量展开的 heredoc，正文里不要出现反引号
+          # （反引号会被 bash 当命令替换执行掉，正文会变成一堆空行）
+          cat > notes.md <<EOF
+          ## Nightly 测试包（draft，每次覆盖上一份）
+
+          这是给测试人员用的滚动包：每天（或手动触发时）按 main 的**最新提交**重新构建，
+          覆盖同一个 nightly 标签下的旧包，因此这里永远只有最新的一份。
+
+          - 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')
+          - 来源提交：${{ needs.prepare.outputs.sha }}
+          - 包版本：${{ needs.prepare.outputs.version }}（nightly 用 0.1.<一年中的第几天>，
+            按天递增，便于"今天的覆盖昨天的"这种升级测试；它大于正式版 0.1.0，
+            因此从 nightly 装回正式版时 apt 会提示降级，这是预期的）
+
+          三个产物都跑过与正式发布相同的安装验收（装得上、能运行、卸得干净），
+          但未经过完整人工验收，不要当正式版分发；draft 状态也只对仓库协作者可见。
+
+          未签名（仓库没有配证书时）：Windows 首次安装点"更多信息 → 仍要运行"，
+          macOS 右键"打开"，绕过步骤见各平台安装说明。
+
+          验证校验和：sha256sum -c SHA256SUMS（macOS 用 shasum -a 256 -c SHA256SUMS）
+          EOF
+          cat notes.md
+
+      - name: 建 draft Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # draft 是滚动的：每天覆盖同一个 tag，避免 draft 堆成一片
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create nightly \
+            --draft \
+            --prerelease \
+            --target main \
+            --title "Nightly ${{ needs.prepare.outputs.date }} (${{ needs.prepare.outputs.sha }})" \
+            --notes-file notes.md \
+            release/*.msi release/*.dmg release/*.deb release/SHA256SUMS
