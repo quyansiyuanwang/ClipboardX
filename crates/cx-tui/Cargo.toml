@@ -7,3 +7,14 @@ license.workspace = true
 description = "ClipboardX 终端界面（ratatui + crossterm），控制套接字客户端"
 
 [dependencies]
+cx-core.workspace = true
+cx-daemon.workspace = true
+cx-proto.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# 关掉默认特性：只要 crossterm 后端，不要日历等用不到的 widget（二进制要小）
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+crossterm = "0.29"

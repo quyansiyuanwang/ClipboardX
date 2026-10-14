@@ -1,8 +1,206 @@
-//! 终端界面。
+//! 终端界面（ratatui + crossterm）。
 //!
-//! 仅通过控制套接字与守护进程通信（`subscribe` 事件流 + 请求/响应），
-//! 不直接访问剪贴板与网络，也不读取守护进程的私有状态文件。
-//! 这样后续替换前端（或其他语言的前端）无需改动核心。
+//! 设计约束（与 CLI 同源）：**只通过控制套接字与守护进程通信**——不直接读剪贴板、
+//! 不直接访问网络、不读守护进程的私有状态文件。因此 TUI 可以随时换成别的前端，
+//! 而能力集合完全一致。
+//!
+//! 线程模型：UI 线程只做"画一帧 + 读键盘"，所有 IO（连接、请求、订阅事件）
+//! 都在一个后台线程里做，结果通过 channel 送回。这样网络卡住时界面不会僵死，
+//! 退出也不会被一个挂着读 socket 的线程拖住。
+//!
+//! 可测性：渲染逻辑与终端解耦（`ui::draw` 接受任意 `Backend`），因此可以用
+//! ratatui 的 `TestBackend` 在无终端环境下断言"画面上有什么"；
+//! `cx tui --snapshot` 更是直接把一帧打到 stdout，便于端到端脚本验证。
+
+mod app;
+mod client;
+mod error;
+mod ui;
+
+pub use app::{App, KeyOutcome};
+pub use client::{DaemonClient, UiEvent};
+pub use error::TuiError;
+
+use cx_core::Paths;
+use cx_proto::control::HistoryPreview;
+use std::io::Write;
+use std::time::Duration;
 
 /// TUI 事件流默认刷新间隔（毫秒）——仅用于兜底重绘，实时更新依赖守护进程推送。
 pub const DEFAULT_REDRAW_MS: u64 = 1000;
+
+/// 历史列表一次取多少条。
+pub const HISTORY_LIMIT: usize = 500;
+
+/// 进入全屏 TUI。
+pub fn run(paths: &Paths) -> Result<(), TuiError> {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+        .map_err(|err| TuiError::Io(format!("无法初始化终端：{err}")))?;
+    enable_raw_mode().map_err(|err| TuiError::Io(format!("无法进入 raw 模式：{err}")))?;
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+
+    let result = run_loop(&mut terminal, paths);
+
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = terminal.show_cursor();
+    result
+}
+
+fn run_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    paths: &Paths,
+) -> Result<(), TuiError> {
+    use crossterm::event::{self, Event as TermEvent, KeyEventKind};
+
+    let mut app = App::new();
+    let mut client = DaemonClient::start(paths.clone());
+    app.note("正在连接守护进程…");
+
+    let tick = Duration::from_millis(DEFAULT_REDRAW_MS);
+    let mut last_preview_request: Option<usize> = None;
+
+    loop {
+        // 1) 处理后台线程送来的消息
+        while let Ok(event) = client.try_recv() {
+            app.apply(event);
+        }
+
+        // 2) 列表变化时按需拉取选中项的完整内容
+        if app.selected_position() != last_preview_request
+            && let Some(position) = app.selected_position()
+        {
+            client.request_preview(position);
+            last_preview_request = Some(position);
+        }
+
+        // 3) 画一帧
+        terminal
+            .draw(|frame| ui::draw(frame, &app))
+            .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
+
+        // 4) 等键盘（最多等一个刷新间隔）
+        if event::poll(tick).map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))? {
+            let event = event::read().map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))?;
+            if let TermEvent::Key(key) = event {
+                // Windows 上按键会同时报 Press 与 Release，只处理按下
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match app.on_key(key) {
+                    KeyOutcome::None => {}
+                    KeyOutcome::Quit => break,
+                    KeyOutcome::Copy(position) => client.request_copy(position),
+                    KeyOutcome::Pause => client.request("pause"),
+                    KeyOutcome::Resume => client.request("resume"),
+                    KeyOutcome::Refresh => {
+                        client.request_status();
+                        client.request_history(HISTORY_LIMIT);
+                        last_preview_request = None;
+                    }
+                    KeyOutcome::Push => client.request_push(),
+                    KeyOutcome::Reload => client.request("reload"),
+                }
+            }
+        }
+
+        if !app.running {
+            break;
+        }
+    }
+
+    client.shutdown();
+    Ok(())
+}
+
+/// 渲染一帧到 stdout（不需要终端，便于脚本与 CI 校验）。
+///
+/// 这是"TUI 到底读到了什么"的可验证出口：真实连接守护进程，取状态与历史，
+/// 画一帧，然后把画面里的文字按行打印出来。
+pub fn snapshot(paths: &Paths, width: u16, height: u16) -> Result<String, TuiError> {
+    let mut client = DaemonClient::start(paths.clone());
+    let mut app = App::new();
+    client.request_status();
+    client.request_history(HISTORY_LIMIT);
+
+    // 等首轮数据（最多 2 秒），拿到就不再等
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        while let Ok(event) = client.try_recv() {
+            app.apply(event);
+        }
+        if app.status.is_some() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 选中项的预览也拉一次（列表里展示的是预览摘要）
+    if let Some(position) = app.selected_position() {
+        client.request_preview(position);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let before = app.preview.is_some();
+            while let Ok(event) = client.try_recv() {
+                app.apply(event);
+            }
+            if app.preview.is_some() && !before {
+                break;
+            }
+            if app.preview_error.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    client.shutdown();
+
+    let backend = ratatui::backend::TestBackend::new(width.max(20), height.max(6));
+    let mut terminal = ratatui::Terminal::new(backend)
+        .map_err(|err| TuiError::Io(format!("无法创建测试终端：{err}")))?;
+    terminal
+        .draw(|frame| ui::draw(frame, &app))
+        .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
+
+    let buffer = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buffer.area.height {
+        let mut line = String::new();
+        for x in 0..buffer.area.width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// 把快照打到标准输出（给 `cx tui --snapshot` 用）。
+pub fn print_snapshot(paths: &Paths) -> Result<(), TuiError> {
+    let text = snapshot(paths, 100, 30)?;
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(text.as_bytes())
+        .map_err(|err| TuiError::Io(format!("写入标准输出失败：{err}")))?;
+    Ok(())
+}
+
+/// 供测试与调用方判断"守护进程给的是哪种内容"。
+pub fn preview_kind(preview: &HistoryPreview) -> &'static str {
+    if preview.text.is_some() {
+        "文本"
+    }
+    else if preview.image.is_some() {
+        "图片"
+    }
+    else {
+        "未知"
+    }
+}
