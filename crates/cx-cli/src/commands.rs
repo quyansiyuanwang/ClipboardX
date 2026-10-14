@@ -963,6 +963,19 @@ fn add_backend_from_draft(
     }
 
     config.backends.push(section);
+    // 与 CLI 的 `cx backend add` 保持一致：先整体校验再落盘，
+    // 否则界面可能写进一份连 `cx config check` 都通不过的配置。
+    let problems = config.problems();
+    if !problems.is_empty() {
+        // 校验失败就把刚写下的凭据清掉，别留下"配置没有、密钥还在"的残渣
+        for path in written {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(DaemonError::Protocol(format!(
+            "配置有问题，未保存：{}",
+            problems.join("；")
+        )));
+    }
     config.save(paths)?;
     println!("已添加后端 {name}（凭据写入 secrets/，权限 0600）");
 
