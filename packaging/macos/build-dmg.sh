@@ -62,6 +62,16 @@ else
 fi
 chmod 755 "$CLI_ROOT/usr/local/bin/cx"
 
+# 断言：通用二进制确实生成了。这一步曾经静默产出一个空 payload（22 KB 的 DMG），
+# 导致安装"成功"但 /usr/local/bin/cx 不存在，所以必须在打包前硬断言。
+BIN_SIZE="$(stat -f%z "$CLI_ROOT/usr/local/bin/cx" 2>/dev/null || echo 0)"
+BIN_ARCHS="$(lipo -archs "$CLI_ROOT/usr/local/bin/cx" 2>/dev/null || echo 未知)"
+echo "    cx 二进制：$BIN_SIZE 字节，架构 $BIN_ARCHS"
+if [ "$BIN_SIZE" -lt 100000 ]; then
+  echo "错误：cx 二进制仅 $BIN_SIZE 字节，构建产物异常，终止打包" >&2
+  exit 1
+fi
+
 echo "==> LaunchAgent 与安装脚本"
 cp packaging/macos/com.clipboardx.agent.plist "$AGENT_ROOT/Library/LaunchAgents/"
 cp packaging/macos/scripts/postinstall "$AGENT_SCRIPTS/postinstall"
@@ -87,6 +97,20 @@ productbuild --distribution packaging/macos/Distribution.xml \
   --resources packaging/macos/resources \
   "$STAGE/ClipboardX.pkg"
 
+# 校验：产品包必须内含组件包的 payload，否则装完什么都没有
+echo "==> 校验包内容"
+for p in "$STAGE/cli.pkg" "$STAGE/agent.pkg" "$STAGE/ClipboardX.pkg"; do
+  echo "    $(basename "$p")：$(du -h "$p" | cut -f1)"
+done
+CLI_PAYLOAD="$(pkgutil --payload-files "$STAGE/cli.pkg" 2>&1 || true)"
+echo "$CLI_PAYLOAD" | sed 's/^/        cli.pkg: /'
+if ! printf '%s' "$CLI_PAYLOAD" | grep -q 'usr/local/bin/cx'; then
+  echo "错误：cli.pkg 的 payload 中没有 usr/local/bin/cx" >&2
+  exit 1
+fi
+AGENT_PAYLOAD="$(pkgutil --payload-files "$STAGE/agent.pkg" 2>&1 || true)"
+printf '%s\n' "$AGENT_PAYLOAD" | sed 's/^/        agent.pkg: /'
+
 FINAL_PKG="$STAGE/ClipboardX.pkg"
 if [ -n "${SIGN_ID:-}" ]; then
   echo "==> productsign（$SIGN_ID）"
@@ -108,6 +132,14 @@ OUT="$DIST/ClipboardX-$VERSION-universal.dmg"
 rm -f "$OUT"
 echo "==> hdiutil create -> $OUT"
 hdiutil create -volname "ClipboardX $VERSION" -srcfolder "$DMGROOT" -ov -format UDZO "$OUT"
+
+# 断言 DMG 体积合理：内含通用二进制 + pkg，绝不可能小于 200 KB
+OUT_SIZE="$(stat -f%z "$OUT")"
+if [ "$OUT_SIZE" -lt 200000 ]; then
+  echo "错误：DMG 仅 $OUT_SIZE 字节，说明 payload 为空（安装后会找不到 cx）" >&2
+  exit 1
+fi
+echo "    DMG 体积：$OUT_SIZE 字节"
 
 if [ "${NOTARIZE:-0}" = "1" ]; then
   : "${APPLE_ID:?公证需要 APPLE_ID}" 

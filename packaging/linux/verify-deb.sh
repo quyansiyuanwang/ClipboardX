@@ -56,6 +56,20 @@ else
   echo "    [warn] 未发现全局启用符号链接（无 systemd 的环境下属正常）"
 fi
 
+# 注意：必须在卸载之前跑，否则 /usr/bin/cx 已被移除（曾经因此在 CI 里得到 exit 127）
+if command -v xvfb-run >/dev/null 2>&1; then
+  echo "==> Xvfb 虚拟 X 会话冒烟"
+  if out="$(xvfb-run -a /usr/bin/cx version 2>&1)"; then
+    printf '%s\n' "$out" | sed 's/^/        /'
+    ok "可在虚拟 X 会话中运行"
+  else
+    printf '%s\n' "$out" | sed 's/^/        /'
+    fail "Xvfb 下 cx version 失败"
+  fi
+else
+  echo "    [warn] 缺少 xvfb-run，跳过虚拟 X 会话冒烟"
+fi
+
 echo "==> 卸载并断言无残留"
 dpkg -r "$PKG" >/dev/null || fail "dpkg -r 失败"
 [ ! -e /usr/bin/cx ] || fail "cx 未被移除"

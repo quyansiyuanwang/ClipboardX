@@ -42,6 +42,17 @@ installer -pkg "$MOUNT_POINT/ClipboardX.pkg" -target / -showChoicesXML >/dev/nul
 echo "==> 安装 pkg"
 installer -pkg "$MOUNT_POINT/ClipboardX.pkg" -target / -verboseR
 
+# 先打印现场证据，再断言——断言失败时也需要看到"到底装了什么"
+echo "==> 安装现场证据"
+echo "    --- /usr/local/bin ---"
+ls -l /usr/local/bin 2>&1 | sed 's/^/        /' | head -n 12
+echo "    --- /Library/LaunchAgents ---"
+ls -l /Library/LaunchAgents 2>&1 | sed 's/^/        /' | head -n 12
+echo "    --- 收据 ---"
+pkgutil --pkgs 2>&1 | grep -i clipboardx | sed 's/^/        /' || echo "        （没有 clipboardx 收据）"
+pkgutil --files com.clipboardx.cli 2>&1 | sed 's/^/        cli 收据: /' | head -n 10
+pkgutil --files com.clipboardx.agent 2>&1 | sed 's/^/        agent 收据: /' | head -n 10
+
 [ -x /usr/local/bin/cx ] || fail "/usr/local/bin/cx 未安装或不可执行"
 [ -f /Library/LaunchAgents/com.clipboardx.agent.plist ] || fail "LaunchAgent 未安装"
 echo "    [ok] 二进制与 LaunchAgent 均已落位"

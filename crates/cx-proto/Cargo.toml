@@ -7,3 +7,9 @@ license.workspace = true
 description = "ClipboardX 线协议与落盘格式：item 容器、manifest、控制协议"
 
 [dependencies]
+blake3.workspace = true
+hex.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

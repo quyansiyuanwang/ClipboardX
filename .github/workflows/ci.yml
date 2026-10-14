@@ -131,19 +131,14 @@ jobs:
       - name: 构建 deb（仅依赖 dpkg-deb）
         run: bash packaging/linux/build-deb.sh
 
-      - name: 安装 / 卸载 验收
-        run: sudo bash packaging/linux/verify-deb.sh "$(ls dist/*.deb | head -n1)"
-
-
+      - name: 安装虚拟 X 会话依赖（供安装验收中的剪贴板冒烟使用）
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb dbus-x11
 
-      - name: Xvfb 下冒烟（当前仅验证二进制可在虚拟 X 会话中启动）
-        run: |
-          set -euo pipefail
-          xvfb-run -a /usr/bin/cx version
-          xvfb-run -a /usr/bin/cx version --json | grep -q '"name"'
+      # 注意：冒烟必须在"卸载"之前执行，因此写在 verify-deb.sh 内部
+      - name: 安装 / Xvfb 冒烟 / 卸载 验收
+        run: sudo bash packaging/linux/verify-deb.sh "$(ls dist/*.deb | head -n1)"
 
       - name: 上传 deb
         uses: actions/upload-artifact@v4

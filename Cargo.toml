@@ -27,12 +27,21 @@ repository = "https://github.com/quyansiyuanwang/ClipboardX"
 [workspace.dependencies]
 # 第三方
 anyhow = "1.0"
+argon2 = { version = "0.6", features = ["kdf"] }
+blake3 = "1.8"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 clap = { version = "4.6", features = ["derive"] }
-directories = "6.0"
+crossbeam-channel = "0.5"
+getrandom = "0.4"
+hex = "0.4"
 log = "0.4"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+subtle = "2"
 thiserror = "2.0"
+toml = "1.1"
+zeroize = { version = "1.9", features = ["derive"] }
 
 # 内部 crate
 cx-backend = { path = "crates/cx-backend" }

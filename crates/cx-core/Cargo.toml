@@ -7,3 +7,13 @@ license.workspace = true
 description = "ClipboardX 核心领域层：配置、设备身份、空间密钥、历史存储与同步状态机"
 
 [dependencies]
+cx-crypto.workspace = true
+cx-proto.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+zeroize.workspace = true
