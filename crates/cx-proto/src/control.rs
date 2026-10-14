@@ -230,6 +230,10 @@ pub struct BackendStatus {
     pub published: u64,
     /// 已应用条数。
     pub applied: u64,
+    /// 一句话标识（地址 / 桶 @ 端点 / 空间），用于在界面上区分同类型的多个后端。
+    /// `#[serde(default)]`：对端不发这个字段时也不会解析失败。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// `status` 的返回体。
@@ -364,6 +368,8 @@ pub fn backend_status(
         next_attempt_ms: state.next_attempt_ms,
         published: state.published,
         applied: state.applied,
+        // 由引擎按配置回填（这里不知道配置）
+        detail: None,
     }
 }
 
@@ -454,6 +460,7 @@ mod tests {
                 next_attempt_ms: 6,
                 published: 2,
                 applied: 3,
+                detail: Some("http://127.0.0.1:8688 · 空间 aa11bb22".to_string()),
             }],
             history_len: 4,
             seen_len: 5,

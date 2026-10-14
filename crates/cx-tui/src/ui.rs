@@ -778,6 +778,14 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(format!("{:<8}", backend.kind), Style::default()),
+                    // 地址 / 桶 @ 端点 / 空间：配了两个同类后端时才分得清谁是谁
+                    match &backend.detail {
+                        Some(detail) if !detail.is_empty() => Span::styled(
+                            format!("{} ", clamp_width_value(detail.clone(), 28)),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        _ => Span::raw(""),
+                    },
                     Span::raw(format!(
                         "发布 {:<5} 接收 {:<5} ",
                         backend.published, backend.applied
@@ -1535,6 +1543,58 @@ mod tests {
             display_width(&source)
         );
     }
+    #[test]
+    fn 面板里显示后端的标识以便区分同类型后端() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": [
+                    { "name": "oss-a", "kind": "s3", "enabled": true, "failures": 0,
+                      "next_attempt_ms": 0, "published": 1, "applied": 1,
+                      "detail": "bucket-a @ https://oss-cn-hangzhou.aliyuncs.com" },
+                    { "name": "oss-b", "kind": "s3", "enabled": true, "failures": 0,
+                      "next_attempt_ms": 0, "published": 2, "applied": 2,
+                      "detail": "bucket-b @ https://oss-cn-beijing.aliyuncs.com" }
+                ],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        app.show_panel = true;
+        let screen = render(&mut app, 140, 30);
+        // 两个同类后端能靠标识区分开——这正是加 detail 的目的。
+        // 标识在面板里会被截断到 28 列，因此断言到"足以区分"的前缀为止。
+        assert!(has(&screen, "bucket-a"), "{screen}");
+        assert!(has(&screen, "bucket-b"), "{screen}");
+        assert!(has(&screen, "oss-cn-h"), "端点前缀应当可见：{screen}");
+        assert!(has(&screen, "oss-cn-b"), "两个后端的端点要能区分：{screen}");
+
+        // 老版本守护进程不发 detail 时也不能崩、不能显示占位垃圾
+        let mut old = App::new();
+        old.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": [ { "name": "home", "kind": "server", "enabled": true,
+                                "failures": 0, "next_attempt_ms": 0, "published": 0, "applied": 0 } ],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("缺少 detail 的状态也应当能反序列化"),
+        )));
+        old.show_panel = true;
+        let screen = render(&mut old, 140, 30);
+        assert!(has(&screen, "home"), "{screen}");
+        assert!(has(&screen, "后端与连接"), "{screen}");
+    }
+
     #[test]
     fn 面板里选中后端有标记且移除确认说明影响范围() {
         let mut app = App::new();

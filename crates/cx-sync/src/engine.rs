@@ -765,7 +765,7 @@ impl Engine {
 
     /// 状态骨架（守护进程会补齐 pid、剪贴板描述等字段）。
     fn status_skeleton(&self) -> StatusReport {
-        let backends = self
+        let mut backends: Vec<cx_proto::control::BackendStatus> = self
             .config
             .backends
             .iter()
@@ -789,6 +789,35 @@ impl Engine {
                 cx_proto::control::backend_status(&backend.name, backend.kind.as_str(), &view)
             })
             .collect();
+        // 给每个后端补一句"它是哪个"：界面上配了两个同类后端时，光看名字分不清。
+        // 就地回填而不是另加自由函数——上一轮正是因为函数插入位置搞错而作废。
+        for status in &mut backends {
+            let Some(section) = self
+                .config
+                .backends
+                .iter()
+                .find(|section| section.name == status.name)
+            else {
+                continue;
+            };
+            status.detail = match section.kind {
+                cx_core::config::BackendKind::Server => {
+                    section.url.clone().map(|url| match &section.space {
+                        Some(space) => format!("{url} · 空间 {space}"),
+                        None => url,
+                    })
+                }
+                cx_core::config::BackendKind::Webdav => section.url.clone(),
+                cx_core::config::BackendKind::S3 => Some(format!(
+                    "{} @ {}",
+                    section.bucket.clone().unwrap_or_default(),
+                    section
+                        .endpoint
+                        .clone()
+                        .unwrap_or_else(|| "AWS 官方".to_string())
+                )),
+            };
+        }
 
         StatusReport {
             version: env!("CARGO_PKG_VERSION").to_string(),
