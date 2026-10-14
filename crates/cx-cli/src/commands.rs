@@ -899,7 +899,23 @@ fn add_backend_from_draft(
                 section.space = Some(draft.get("空间 id").trim().to_string());
                 let secret = draft.get("注册密钥").trim();
                 if !secret.is_empty() {
-                    section.token_file = Some(save_secret("token", secret)?);
+                    // 注册密钥 ≠ 设备令牌：它要用去向服务端自助注册、换回一台设备的令牌。
+                    // 直接把注册密钥当令牌写进去，同步时会认证失败——这正是这里要避免的。
+                    let identity = Identity::load_or_create(paths, None)?;
+                    let url = draft.get("服务端地址").trim();
+                    let space = draft.get("空间 id").trim();
+                    let token = cx_backend::enroll(
+                        url,
+                        space,
+                        secret,
+                        &identity.name,
+                        None,
+                        false,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .map_err(|err| DaemonError::Protocol(format!("自助注册失败：{err}")))?;
+                    println!("自助注册成功，已获取设备令牌");
+                    section.token_file = Some(save_secret("token", &token)?);
                 }
             }
             WizardKind::Webdav => {
@@ -1419,6 +1435,32 @@ mod backend_tests {
         assert!(err.to_string().contains("没有名为 nope"), "{err}");
         let _ = std::fs::remove_dir_all(&paths.data_dir);
     }
+    #[test]
+    fn 表单添加服务端会真的去自助注册而不是把密钥当令牌() {
+        use cx_tui::{BackendDraft, WizardKind};
+        let paths = temp_paths("draft-server");
+        let draft = BackendDraft {
+            kind: WizardKind::Server,
+            values: vec![
+                "home".to_string(),
+                // 不可达地址：注册必然失败，正好用来证明"确实去注册了"
+                "http://127.0.0.1:1".to_string(),
+                "space-1".to_string(),
+                "SECRET-abc".to_string(),
+            ],
+        };
+        let err = super::add_backend_from_draft(&paths, &draft).unwrap_err();
+        assert!(
+            err.to_string().contains("自助注册失败"),
+            "应当去自助注册并把它失败的原因报出来，而不是把注册密钥当令牌存下：{err}"
+        );
+        assert!(
+            Config::load(&paths).unwrap().backends.is_empty(),
+            "注册失败不该留下半截后端配置"
+        );
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap_or(&paths.data_dir));
+    }
+
     #[test]
     fn 后端描述覆盖三种种类() {
         let mut webdav = empty_section("dav".to_string(), cx_core::BackendKind::Webdav);
