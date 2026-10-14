@@ -476,18 +476,71 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))),
         Some(status) if status.backends.is_empty() => {
             lines.push(Line::from(Span::styled(
-                "没有配置任何同步后端：内容只留在本机历史里。",
+                "还没有配置同步后端：内容只留在本机历史里。",
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::from(""));
-            lines.push(Line::from("  添加一个，例如："));
+            lines.push(Line::from(Span::styled(
+                " 1) 选一种落地方式",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
             lines.push(Line::from(
-                "    cx backend add server home http://<主机>:8688 --space <空间 id>",
+                "    server  自建服务端 cx-server（自己完全掌控）",
             ));
-            lines.push(Line::from("    cx backend add webdav dav https://… "));
+            lines.push(Line::from("    webdav  WebDAV（Nextcloud 等）"));
             lines.push(Line::from(
-                "    cx backend add s3 oss --bucket <桶> --endpoint <地址>",
+                "    s3      S3 兼容（AWS / MinIO / R2 / 阿里云 OSS）",
             ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " 2) 准备凭据（密钥走标准输入，不进命令行历史）",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from("    s3      AccessKeyId + SecretAccessKey"));
+            lines.push(Line::from(
+                "            阿里云：RAM 控制台创建，只给该桶的读写权限",
+            ));
+            lines.push(Line::from(
+                "    webdav  用户名 + 口令（建议用应用专用密码）",
+            ));
+            lines.push(Line::from(
+                "    server  空间 id + 注册密钥（cx-server token issue 生成）",
+            ));
+            lines.push(Line::from(
+                "    例：printf '%s' '<SecretAccessKey>' | cx backend add s3 …",
+            ));
+            lines.push(Line::from(Span::styled(
+                "    凭据落在 secrets/ 下（权限 0600），不会写进 config.toml",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " 3) 填字段并添加",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from("    s3      桶名、端点、区域、前缀"));
+            lines.push(Line::from(Span::styled(
+                "            区域必须与端点同区域：阿里云杭州 = oss-cn-hangzhou.aliyuncs.com + cn-hangzhou",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from("    webdav  URL、用户名、口令"));
+            lines.push(Line::from("    server  服务端地址、空间 id、注册密钥"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " 4) 加完先自测，再让守护进程用上它",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(
+                "    cx backend test <名字>     # 不依赖守护进程",
+            ));
+            lines.push(Line::from(
+                "    cx stop && cx start       # 新增后端需要重启",
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "界面内的配置向导（字段引导 + 密文输入 + 保存前自测）正在开发。",
+                Style::default().fg(Color::Cyan),
+            )));
         }
         Some(status) => {
             for backend in &status.backends {
@@ -574,14 +627,16 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  b / Esc 关闭　（面板里的错误信息来自各后端最近一次失败）",
+        "  b / Esc 关闭　J/K 或 PgUp/PgDn 滚动　0 回到开头",
         Style::default().fg(Color::DarkGray),
     )));
 
+    // 引导内容是长文，小终端一屏放不下，因此面板可滚动
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::default().borders(Borders::ALL).title(" 后端与连接 "))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((app.panel_scroll(), 0)),
         popup,
     );
 }
@@ -1343,7 +1398,7 @@ mod tests {
         let mut app = app_with(1);
         app.show_panel = true;
         let screen = render(&mut app, 120, 30);
-        assert!(has(&screen, "没有配置任何同步后端"), "{screen}");
+        assert!(has(&screen, "还没有配置同步后端"), "{screen}");
         assert!(
             has(&screen, "cx backend add"),
             "要给出可执行的命令：{screen}"
