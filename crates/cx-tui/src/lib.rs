@@ -47,6 +47,8 @@ pub enum TuiExit {
     AddBackend(Box<BackendDraft>),
     /// 用户在面板里确认移除某个后端，交给调用方去改配置。
     RemoveBackend(String),
+    /// 用户在面板里停用 / 启用某个后端。
+    ToggleBackend(String),
 }
 
 /// 进入全屏 TUI。
@@ -167,6 +169,10 @@ fn run_loop(
                     // 面板里确认移除后端：同样退出界面交给命令层处理
                     KeyOutcome::RemoveBackend(name) => {
                         exit = TuiExit::RemoveBackend(name);
+                        break;
+                    }
+                    KeyOutcome::ToggleBackend(name) => {
+                        exit = TuiExit::ToggleBackend(name);
                         break;
                     }
                     KeyOutcome::Delete(position) => {
