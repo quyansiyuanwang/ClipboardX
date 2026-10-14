@@ -160,7 +160,15 @@ use_mdns = false
         }
         else {
             $mode = if ($IsMacOS) { (stat -f '%Lp' $path) } else { (stat -c '%a' $path) }
-            Assert-True ("$mode".Trim() -eq '600') "$(Split-Path $path -Leaf)：权限 $mode（应为 600）"
+            # 正确的不变量是"组与其他位为 0"：文件 600、目录 700 都满足。
+            # 一开始写的是精确等于 600，于是 secrets/ 这个**目录**（700）被误报——
+            # 断言写错了，不是权限有问题（只有 CI 上跑 Unix 分支才会暴露）。
+            $value = [Convert]::ToInt32("$mode".Trim(), 8)
+            $others = $value -band 63   # 0o077：组 rwx + 其他 rwx
+            $isDir = Test-Path -PathType Container $path
+            $kind = if ($isDir) { '目录' } else { '文件' }
+            $expect = if ($isDir) { '700' } else { '600' }
+            Assert-True ($others -eq 0) "$(Split-Path $path -Leaf)（$kind）：权限 $mode（应为 $expect，组/其他位必须为 0）"
         }
     }
 
