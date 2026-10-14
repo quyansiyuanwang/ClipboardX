@@ -90,12 +90,17 @@ cx space init --passphrase-stdin && cx space publish home
 # WebDAV（Nextcloud 等）
 cx backend add webdav dav https://cloud.example.com/remote.php/dav/files/<用户>/clipboardx --username <用户> --password-stdin
 
-# S3 兼容（AWS / MinIO / R2 / OSS）
+# S3 兼容（AWS / MinIO / R2 / 阿里云 OSS）
 cx backend add s3 oss --bucket clipboardx --endpoint http://127.0.0.1:9000 --access-key-id <AK> --secret-stdin --path-style
+# 阿里云 OSS：region 必须与端点一致，密钥走 stdin（不进命令行历史）
+printf '%s' '<SecretAccessKey>' | cx backend add s3 oss --bucket <桶> --endpoint https://oss-cn-hangzhou.aliyuncs.com --region cn-hangzhou --prefix clipboardx --access-key-id <AccessKeyId> --secret-stdin
 
-cx backend list          # 查看已配置后端
+cx backend list          # 查看已配置后端（可配置多个，会同时生效）
 cx backend test <名字>    # 直连测一次（不需要守护进程在运行）
 ```
+
+> **注意**：新增或删除后端后需要**重启守护进程**（`cx stop && cx start`）才能生效——
+> `cx reload` 目前只重载引擎侧配置，后端 worker 线程是启动时创建的（这一项正在改进）。
 
 局域网直连（不经过服务端）：
 
