@@ -701,7 +701,7 @@ fn session_loop(
     // 让读端不那么紧张：设置读超时，循环里同时检查"要发的东西"
     session.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
-
+    // 本地已有的条目名（用于判断对端有哪些是我这边缺的）
     let mine: std::collections::BTreeSet<&str> = local_offer
         .iter()
         .map(|entry| entry.name.as_str())

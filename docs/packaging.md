@@ -116,8 +116,9 @@ sudo bash packaging/linux/verify-deb.sh dist/ClipboardX_0.1.0_amd64.deb
 
 事实与坑（都已解决，写下来避免重踩）：
 
-
-   （无 `candle`/`light`），`windows-latest` 预装 WiX v3。结论：MSI 走自写 WiX v4 源 + 仓库内 dotnet tool。
+1. **`cargo-dist` 的 msi 走 WiX v3**，且明确不支持 WiX v4+。若开发机装的是 WiX v7
+   （只有 `wix.exe`，没有 `candle`/`light`），这条路同样走不通。结论：MSI 用自写的 WiX v4 源 +
+   仓库内 dotnet tool 固定版本（`.config/dotnet-tools.json`）。
 2. **WiX 扩展的 flavor 目录与版本强绑定**：4.x 落在 `wixext4`，7.x 落在 `wixext7`。
    用 `-ext WixToolset.UI.wixext`（不带版本）会解析到扩展缓存里的**最高版本**（7.0.0），
    再用当前工具的 flavor 去找目录 ⇒ `WIX0144 The extension could not be found`。
