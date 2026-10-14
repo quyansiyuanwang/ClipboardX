@@ -1112,6 +1112,21 @@ fn backend_target(backend: &cx_core::BackendSection) -> String {
 
 /// 添加后端。
 fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonError> {
+    // 名字会成为凭据文件名，而下面每个分支都会**先写凭据**、末尾才整体校验配置，
+    // 因此必须先在这里把名字校验掉：含路径分隔符或 `..` 的名字可能把凭据写到
+    // secrets/ 之外（表单路径已经有同样的前置校验，两处规则一致）。
+    let pending_name = match &kind {
+        BackendAddCommand::Webdav { name, .. }
+        | BackendAddCommand::Server { name, .. }
+        | BackendAddCommand::S3 { name, .. } => name.trim().to_string(),
+    };
+    if pending_name.is_empty() || pending_name.contains(['/', '\\']) || pending_name.contains("..")
+    {
+        return Err(DaemonError::Protocol(format!(
+            "后端名不合法（不能为空，也不能含路径分隔符或 ..）：{pending_name}"
+        )));
+    }
+
     let mut config = Config::load_or_create(paths)?;
     let section = match kind {
         BackendAddCommand::Webdav {
@@ -1452,6 +1467,36 @@ mod backend_tests {
         assert!(err.to_string().contains("没有名为 nope"), "{err}");
         let _ = std::fs::remove_dir_all(&paths.data_dir);
     }
+    #[test]
+    fn 命令行添加也会先拒绝会写到_secrets_之外的名字() {
+        let paths = temp_paths("cli-bad-name");
+        // secret_stdin: true —— 名字校验如果没被提到读 stdin 之前，这个测试会挂住，
+        // 所以它同时验证了顺序。
+        let err = super::add_backend(
+            &paths,
+            BackendAddCommand::S3 {
+                name: "../escape".to_string(),
+                bucket: "b".to_string(),
+                endpoint: Some("http://127.0.0.1:1".to_string()),
+                region: Some("cn-hangzhou".to_string()),
+                prefix: None,
+                access_key_id: "AK".to_string(),
+                secret_stdin: true,
+                path_style: false,
+                ca_file: None,
+                insecure: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("后端名不合法"), "{err}");
+
+        let lingering = std::fs::read_dir(paths.secrets_dir())
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(lingering, 0, "被拒绝的名字不该留下任何凭据文件");
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap_or(&paths.data_dir));
+    }
+
     #[test]
     fn 表单会拒绝会写到_secrets_之外的后端名() {
         use cx_tui::{BackendDraft, WizardKind};
