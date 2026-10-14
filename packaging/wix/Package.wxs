@@ -28,9 +28,13 @@
         Description="ClipboardX —— 极度轻量的三端剪贴板同步（守护进程 + TUI）"
         Manufacturer="ClipboardX contributors" />
 
-    <MajorUpgrade
-        AllowSameVersionUpgrades="yes"
-        DowngradeErrorMessage="已安装更高版本的 ClipboardX，请先卸载后再安装。" />
+    <!-- 允许降级安装：nightly 的版本号是 0.1.<一年中的第几天>.<构建序号>，数字上大于
+         正式版 0.1.0，若不允许降级，"装过 nightly 之后装正式版"会被直接拒绝
+         （报"已安装更高版本"）。允许降级时 MSI 会先移除旧产品再装当前版本，
+         对使用者来说就是"我要这个版本，装它"——比拒绝更符合预期。
+         注意：AllowDowngrades="yes" 与 AllowSameVersionUpgrades、DowngradeErrorMessage
+         互斥（WiX 会直接报错），它本身已涵盖"同版本重装"与"降级覆盖"两种情况。 -->
+    <MajorUpgrade AllowDowngrades="yes" />
 
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
