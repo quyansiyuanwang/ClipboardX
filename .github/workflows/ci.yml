@@ -181,6 +181,27 @@ jobs:
         shell: pwsh
         run: ./scripts/e2e-lan.ps1 -NoClipboard
 
+  hardening:
+    name: 加固验收（体积/权限/泄漏/空闲）${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 把"应该很轻、应该安全"变成可测量的断言：体积预算、密钥 0600 权限（Unix）、
+      # 加密内容不落到数据目录与日志、以及空闲 CPU/内存的实测阈值。
+      - name: 加固验收脚本
+        shell: pwsh
+        run: ./scripts/e2e-hardening.ps1
+
   msi:
     name: Windows MSI 构建与安装验收
     runs-on: windows-latest
