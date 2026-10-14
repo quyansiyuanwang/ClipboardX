@@ -181,16 +181,21 @@ jobs:
         with:
           path: dist
 
-      - name: 生成 SHA256SUMS
+      - name: 归拢产物并生成 SHA256SUMS
         shell: bash
         run: |
           set -euo pipefail
-          cd dist
-          find . -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \) -print0 \
-            | xargs -0 sha256sum > SHA256SUMS
-          echo "--- 产物 ---"
+          # download-artifact 会把每个 artifact 放进各自的子目录（dist/windows/、dist/macos/…），
+          # 这里先平铺到一个目录，校验和里就是干净的文件名，发布时也不用猜路径。
+          mkdir -p release
+          find dist -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \) -exec cp -v {} release/ \;
+          ls -l release
+          cd release
+          sha256sum * > SHA256SUMS
+          echo "--- 产物与校验和 ---"
           cat SHA256SUMS
-          test -s SHA256SUMS || { echo "::error::没有收集到任何产物"; exit 1; }
+          count=$(find . -maxdepth 1 -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \) | wc -l)
+          test "$count" -eq 3 || { echo "::error::预期 3 个产物，实际 $count"; exit 1; }
 
       - name: 建 Release
         env:
@@ -210,5 +215,5 @@ jobs:
           gh release create "$tag" \
             --title "ClipboardX $version" \
             --notes-file docs/release-notes.md \
-            "${extra[@]}" \
-            dist/*.msi dist/*.dmg dist/*.deb dist/SHA256SUMS
+            ${extra[@]+"${extra[@]}"} \
+            release/*.msi release/*.dmg release/*.deb release/SHA256SUMS
