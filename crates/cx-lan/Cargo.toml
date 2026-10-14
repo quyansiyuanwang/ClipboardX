@@ -1,0 +1,26 @@
+[package]
+name = "cx-lan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 局域网直连：mDNS 发现 + Noise XX/PSK 会话"
+
+[dependencies]
+blake3.workspace = true
+crossbeam-channel.workspace = true
+curve25519-dalek.workspace = true
+cx-core.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+log.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Noise 协议框架：同步实现、无 async 运行时。自己拼 Curve25519/ChaCha20 的状态机
+# 极易写错，而写错的密码学比不加密更危险。
+snow = "0.10"
+# mDNS/DNS-SD 发现
+mdns-sd = "0.21"

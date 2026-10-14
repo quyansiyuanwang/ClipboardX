@@ -10,6 +10,7 @@ description = "ClipboardX 守护进程运行时：线程装配、控制套接字
 cx-backend.workspace = true
 cx-clip.workspace = true
 cx-core.workspace = true
+cx-lan.workspace = true
 cx-crypto.workspace = true
 cx-proto.workspace = true
 cx-sync.workspace = true

@@ -159,6 +159,28 @@ jobs:
         shell: pwsh
         run: ./scripts/e2e-server.ps1
 
+  e2e-lan:
+    name: 端到端（局域网直连）${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 局域网直连：两台守护进程不配任何后端，只靠 Noise 会话互推内容。
+      # 脚本里关掉了 mDNS（CI 与容器里多播常被禁），改用显式对端地址；
+      # 顺带断言"配对码不同的设备连不上也收不到"。
+      - name: 端到端脚本（局域网）
+        shell: pwsh
+        run: ./scripts/e2e-lan.ps1 -NoClipboard
+
   msi:
     name: Windows MSI 构建与安装验收
     runs-on: windows-latest

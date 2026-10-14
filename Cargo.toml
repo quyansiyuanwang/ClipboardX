@@ -11,6 +11,7 @@ members = [
     "crates/cx-cli",
     "crates/cx-tui",
     "crates/cx-server",
+    "crates/cx-lan",
     "bin/cx",
     "bin/cx-server",
 ]
@@ -33,6 +34,8 @@ blake3 = "1.8"
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
+# snow 已依赖它；这里直接用它的 X25519 基点乘法，从私钥推出公钥
+curve25519-dalek = { version = "4.1", default-features = false }
 fs2 = "0.4"
 getrandom = "0.4"
 hex = "0.4"
@@ -58,6 +61,7 @@ cx-crypto = { path = "crates/cx-crypto" }
 cx-daemon = { path = "crates/cx-daemon" }
 cx-proto = { path = "crates/cx-proto" }
 cx-server = { path = "crates/cx-server" }
+cx-lan = { path = "crates/cx-lan" }
 cx-sync = { path = "crates/cx-sync" }
 cx-tui = { path = "crates/cx-tui" }
 

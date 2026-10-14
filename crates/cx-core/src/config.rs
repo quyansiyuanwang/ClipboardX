@@ -38,6 +38,9 @@ pub struct Config {
     /// 同步行为。
     #[serde(default)]
     pub sync: SyncSection,
+    /// 局域网直连（同一网段内不经服务端直接同步）。
+    #[serde(default)]
+    pub lan: LanSection,
     /// 同步后端（可多个，同时生效）。
     #[serde(default, rename = "backend")]
     pub backends: Vec<BackendSection>,
@@ -149,6 +152,50 @@ impl Default for SyncSection {
             normalize_newlines: false,
             ignore_blank_text: true,
             ignore_globs: Vec::new(),
+        }
+    }
+}
+
+/// `[lan]`：局域网直连。
+///
+/// 与后端的关系：后端负责"跨网络、离线可达"，局域网负责"同一个 Wi-Fi 下更快、
+/// 不经过服务器"。两者可以同时启用——同一份内容可能既走局域网也走后端，
+/// 由引擎的已处理集合去重，不会重复应用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanSection {
+    /// 是否启用。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 监听端口（同时也是 mDNS 通告的端口）。
+    #[serde(default = "default_lan_port")]
+    pub port: u16,
+    /// 配对码：未加密空间（没有空间密钥）时用它派生局域网 PSK。
+    ///
+    /// 有空间密钥时不需要——PSK 由空间密钥派生，只有同一空间的设备能连上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_code: Option<String>,
+    /// 显式对端地址（`host:port`）。mDNS 被禁的网络里靠它，
+    /// 也可以用来先把两台机器连起来。
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// 是否用 mDNS 自动发现（默认开；禁掉多播的网络里设 false）。
+    #[serde(default = "default_true")]
+    pub use_mdns: bool,
+}
+
+/// 默认局域网端口。
+pub fn default_lan_port() -> u16 {
+    8699
+}
+
+impl Default for LanSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_lan_port(),
+            pairing_code: None,
+            peers: Vec::new(),
+            use_mdns: true,
         }
     }
 }
@@ -274,6 +321,7 @@ impl Default for Config {
             device: DeviceSection::default(),
             space: SpaceSection::default(),
             sync: SyncSection::default(),
+            lan: LanSection::default(),
             backends: Vec::new(),
         }
     }

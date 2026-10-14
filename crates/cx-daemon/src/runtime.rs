@@ -24,6 +24,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use cx_backend::build_backend;
 use cx_clip::{ChangeNotifier, ClipBackend, ClipContent, SystemClipboard};
 use cx_core::{Config, Identity, LocalSpace, Paths};
+use cx_lan::{LanConfig, LanEvent, LanIdentity, LanService, PeerBook};
 use cx_proto::ManifestEntry;
 use cx_proto::control::{
     DoctorCheck, Event as ControlEvent, Reply, Request, cmd as commands, errcode, event as events,
@@ -33,9 +34,12 @@ use cx_sync::{
     RetentionLimits,
 };
 use serde_json::{Value, json};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// 局域网补齐清单的条数上限（太多会把 Manifest 撑大）。
+const LAN_OFFER_LIMIT: usize = 500;
 
 /// 等待引擎响应的上限。
 const ENGINE_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -76,6 +80,17 @@ struct SharedMeta {
     watch: String,
     no_clipboard: bool,
     max_item_bytes: u64,
+    /// 局域网直连的实时状态（`cx doctor` 里展示）。
+    lan: Option<Arc<Mutex<LanStatus>>>,
+}
+
+/// 局域网直连的可观测状态。
+#[derive(Debug, Default)]
+struct LanStatus {
+    /// 监听端口。
+    port: u16,
+    /// 当前对端（设备 id, 设备名）。
+    peers: Vec<(String, String)>,
 }
 
 /// 守护进程实例。
@@ -185,6 +200,12 @@ impl Daemon {
         )?;
         let (engine_tx, engine_rx) = unbounded::<EngineMsg>();
         let broadcaster = Broadcaster::new();
+        // 局域网状态：由 start_lan 的线程实时更新，doctor 里展示
+        let lan_status: Option<Arc<Mutex<LanStatus>>> = self
+            .config
+            .lan
+            .enabled
+            .then(|| Arc::new(Mutex::new(LanStatus::default())));
         let meta = Arc::new(SharedMeta {
             pid: std::process::id(),
             started_ms,
@@ -193,6 +214,7 @@ impl Daemon {
             watch: watch_desc,
             no_clipboard: self.options.no_clipboard,
             max_item_bytes: self.config.sync.max_item_bytes,
+            lan: lan_status.clone(),
         });
 
         // ---- 控制服务端 ----
@@ -324,11 +346,31 @@ impl Daemon {
             }
         }
 
+        // ---- 局域网直连 ----
+        // 放在引擎线程之前：要把"我有哪些内容"的清单交给它做补齐，
+        // 而那份清单来自引擎的历史索引。
+        let lan = start_lan(
+            &self.config,
+            &self.identity,
+            &paths,
+            &engine_tx,
+            engine.recent_entries(LAN_OFFER_LIMIT),
+            lan_status.clone(),
+        )?;
+        if let Some(service) = &lan {
+            log::info!(
+                "局域网直连已就绪（设备 id {}），当前对端 {} 个",
+                service.device_id(),
+                service.peer_count()
+            );
+        }
+
         // ---- 引擎线程 ----
         let engine_thread = {
             let engine_broadcaster = broadcaster.clone();
             let mut engine = engine;
             let mut clip_write = write_clip.take();
+            let lan = lan.clone();
             std::thread::Builder::new()
                 .name("cx-engine".to_string())
                 .spawn(move || {
@@ -344,6 +386,7 @@ impl Daemon {
                                     clip: &mut clip_write,
                                     broadcaster: &engine_broadcaster,
                                     publishers: &publishers,
+                                    lan: lan.as_ref(),
                                 };
                                 let _ = runner.run_all(actions);
                             }
@@ -355,6 +398,7 @@ impl Daemon {
                                     clip: &mut clip_write,
                                     broadcaster: &engine_broadcaster,
                                     publishers: &publishers,
+                                    lan: lan.as_ref(),
                                 };
                                 let payloads = runner.run_all(actions);
                                 for payload in payloads {
@@ -459,7 +503,14 @@ impl Daemon {
         }
 
         broadcaster.send(ControlEvent::new(events::SHUTTING_DOWN, json!({})));
+        // 先让局域网收工：它有自己的线程，早点通知就不用在最后等
+        if let Some(service) = &lan {
+            service.shutdown();
+        }
         let _ = engine_thread.join();
+        if let Some(service) = lan {
+            service.join();
+        }
         // 引擎线程退出时会 Drop 掉发布队列的发送端，worker 随即收到 Disconnected 而退出
         for handle in worker_threads {
             let _ = handle.join();
@@ -483,6 +534,181 @@ struct PublishJob {
     bytes: Arc<[u8]>,
 }
 
+/// 记录/移除对端（供 `cx doctor` 展示）。
+fn remember_peer(
+    status: &Option<Arc<Mutex<LanStatus>>>,
+    device_id: &str,
+    device_name: &str,
+    added: bool,
+) {
+    let Some(status) = status else {
+        return;
+    };
+    let mut guard = status.lock().expect("局域网状态锁中毒");
+    if added {
+        if !guard.peers.iter().any(|(id, _)| id == device_id) {
+            guard
+                .peers
+                .push((device_id.to_string(), device_name.to_string()));
+        }
+    } else {
+        guard.peers.retain(|(id, _)| id != device_id);
+    }
+}
+
+/// 把局域网状态汇报给引擎，让 `cx status` 里能看到它（与后端用同一条通道）。
+fn report_lan(engine_tx: &Sender<EngineMsg>, service: &LanService) {
+    let _ = engine_tx.send(EngineMsg::Event(EngineEvent::Command(
+        EngineCommand::BackendReport {
+            name: "lan".to_string(),
+            cursors: Default::default(),
+            published: service.received(),
+            applied: service.received(),
+            error: None,
+        },
+    )));
+}
+
+/// 启动局域网直连（未启用或缺少 PSK 来源时返回 `None`）。
+///
+/// PSK 的来源有两种：有空间密钥时由空间密钥派生（只有同一空间的设备能连上）；
+/// 未加密空间则要求用户配一个配对码。两者都没有就不启动——宁可不同步，
+/// 也不要在一个"谁都能连"的网段上裸奔。
+fn start_lan(
+    config: &Config,
+    identity: &Identity,
+    paths: &Paths,
+    engine_tx: &Sender<EngineMsg>,
+    offer: Vec<ManifestEntry>,
+    status: Option<Arc<Mutex<LanStatus>>>,
+) -> Result<Option<Arc<LanService>>, DaemonError> {
+    if !config.lan.enabled {
+        return Ok(None);
+    }
+
+    let space = cx_core::LocalSpace::load(paths).ok();
+    let (psk_hex, space_id) = match (&space, config.lan.pairing_code.as_deref()) {
+        (Some(space), _) if space.cipher.space_key().is_some() => (
+            cx_lan::derive_psk(
+                &space
+                    .cipher
+                    .space_key()
+                    .map(|key| key.to_hex())
+                    .unwrap_or_default(),
+                None,
+            ),
+            Some(space.meta.space_id.clone()),
+        ),
+        (_, Some(code)) if !code.trim().is_empty() => (cx_lan::derive_psk("", Some(code)), None),
+        _ => {
+            log::warn!(
+                "局域网已启用，但既没有空间密钥也没有配对码：跳过。\
+                 （请先 `cx space init/join`，或在 [lan] 配置 pairing_code）"
+            );
+            return Ok(None);
+        }
+    };
+
+    let peers: Vec<std::net::SocketAddr> = config
+        .lan
+        .peers
+        .iter()
+        .filter_map(|text| match text.parse() {
+            Ok(addr) => Some(addr),
+            Err(err) => {
+                log::warn!("局域网对端地址 {text} 无法解析：{err}");
+                None
+            }
+        })
+        .collect();
+
+    let lan_config = LanConfig {
+        enabled: true,
+        port: config.lan.port,
+        space_id,
+        psk_hex,
+        peers,
+        use_mdns: config.lan.use_mdns,
+        device_name: identity.name.clone(),
+        device_id: identity.device_id.clone(),
+    };
+    let lan_identity = LanIdentity::load_or_create(&paths.config_dir, &identity.device_id)
+        .map_err(|err| {
+            DaemonError::Core(cx_core::CoreError::malformed("lan.key", err.to_string()))
+        })?;
+    let book = PeerBook::open(paths.data_dir.join("lan-peers.json")).map_err(|err| {
+        DaemonError::Core(cx_core::CoreError::malformed(
+            "lan-peers.json",
+            err.to_string(),
+        ))
+    })?;
+
+    let (service, events) = LanService::start(lan_config, lan_identity, book)
+        .map_err(|err| DaemonError::Core(cx_core::CoreError::malformed("lan", err.to_string())))?;
+
+    // 告诉服务"我有哪些内容"，对端连上来时会用它做补齐
+    service.set_offer(
+        offer
+            .into_iter()
+            .map(|entry| cx_lan::proto::OfferEntry {
+                name: entry.name,
+                created_ms: entry.created_ms,
+                size: entry.size,
+                kind: entry.kind.as_str().to_string(),
+            })
+            .collect(),
+    );
+
+    let service = Arc::new(service);
+    let engine_tx = engine_tx.clone();
+    let service_for_thread = service.clone();
+    if let Some(status) = &status {
+        status.lock().expect("局域网状态锁中毒").port = config.lan.port;
+    }
+    std::thread::Builder::new()
+        .name("cx-lan-events".to_string())
+        .spawn(move || {
+            while let Ok(event) = events.recv() {
+                match event {
+                    LanEvent::Item { from, name, bytes } => match cx_proto::Item::decode(&bytes) {
+                        Ok(item) => {
+                            let _ = engine_tx.send(EngineMsg::Event(EngineEvent::Command(
+                                EngineCommand::ApplyRemote {
+                                    backend: "lan".to_string(),
+                                    name,
+                                    item: Box::new(item),
+                                },
+                            )));
+                            log::info!("局域网收到来自 {from} 的内容");
+                            report_lan(&engine_tx, &service_for_thread);
+                        }
+                        Err(err) => log::warn!("局域网内容解码失败（来自 {from}）：{err}"),
+                    },
+                    LanEvent::PeerUp {
+                        device_id,
+                        device_name,
+                        addr,
+                    } => {
+                        log::info!("局域网对端已连接：{device_name}（{device_id} @ {addr}）");
+                        remember_peer(&status, &device_id, &device_name, true);
+                        report_lan(&engine_tx, &service_for_thread);
+                    }
+                    LanEvent::PeerDown { device_id } => {
+                        log::info!("局域网对端已断开：{device_id}");
+                        remember_peer(&status, &device_id, "", false);
+                        report_lan(&engine_tx, &service_for_thread);
+                    }
+                    LanEvent::Log { level, message } => {
+                        logging::log_line(level, &format!("[lan] {message}"));
+                    }
+                }
+            }
+            log::debug!("局域网事件线程已停止");
+        })
+        .map_err(DaemonError::io)?;
+
+    Ok(Some(service))
+}
 /// 后端 worker 线程的主循环。
 ///
 /// 一个后端一个线程，只做两件事：把引擎产出的对象写上去、按 manifest 增量把别人的
@@ -584,6 +810,8 @@ struct ActionRunner<'a> {
     broadcaster: &'a Broadcaster,
     /// 各后端 worker 的发布队列（顺序与配置里的启用后端一致）。
     publishers: &'a [Sender<PublishJob>],
+    /// 局域网直连服务（启用时才有）。
+    lan: Option<&'a Arc<LanService>>,
 }
 
 /// 重读剪贴板的最大嵌套深度。
@@ -614,13 +842,33 @@ impl ActionRunner<'_> {
                 None
             }
             Action::Publish { name, entry, bytes } => {
+                // 局域网直连：优先走它（同一网段里最快，且不经过服务器）。
+                // 注意这里必须在"没有后端就返回"之前——局域网与后端是两条独立通路，
+                // 只用局域网（不配后端）是完全正常的用法。
+                if let Some(lan) = self.lan {
+                    let delivered = lan.publish(&name, &bytes);
+                    if delivered > 0 {
+                        // 用 INFO：这条路径出问题时，用户第一时间就会看日志
+                        log::info!("已通过局域网推给 {delivered} 个对端：{name}");
+                    } else {
+                        log::debug!("局域网当前没有对端，{name} 等对端连上后由清单补齐");
+                    }
+                    lan.add_offer(cx_lan::proto::OfferEntry {
+                        name: name.clone(),
+                        created_ms: entry.created_ms,
+                        size: entry.size,
+                        kind: entry.kind.as_str().to_string(),
+                    });
+                }
+
                 if self.publishers.is_empty() {
                     log::debug!(
-                        "已生成对象 {name}（{} 字节）但没有启用任何后端",
+                        "已生成对象 {name}（{} 字节）：没有配置后端，仅记录本机历史",
                         bytes.len()
                     );
                     return None;
                 }
+
                 // 一次分配，多后端共享（Arc<[u8]>）
                 let shared: Arc<[u8]> = Arc::from(bytes);
                 let hash = entry.hash.chars().take(8).collect::<String>();
@@ -775,6 +1023,26 @@ fn payload_to_reply(payload: ReplyPayload, meta: &SharedMeta) -> Reply {
                 ok: !meta.no_clipboard,
                 detail: meta.watch.clone(),
             });
+            // 局域网不是"后端"（不走对象存储），但它是另一条同步通路，
+            // 状态放在 doctor 里最自然：配了没有、连上几个。
+            if let Some(lan) = &meta.lan {
+                let status = lan.lock().expect("局域网状态锁中毒");
+                let peers = if status.peers.is_empty() {
+                    "当前没有对端".to_string()
+                } else {
+                    status
+                        .peers
+                        .iter()
+                        .map(|(id, name)| format!("{name}（{}）", &id[..8.min(id.len())]))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                };
+                report.checks.push(DoctorCheck {
+                    name: "局域网".to_string(),
+                    ok: !status.peers.is_empty(),
+                    detail: format!("已启用（端口 {}），{}", status.port, peers),
+                });
+            }
             Reply::ok(id, to_value(&*report))
         }
         ReplyPayload::Done { id } => Reply::done(id),

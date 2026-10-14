@@ -979,6 +979,26 @@ impl Engine {
             .collect()
     }
 
+    /// 最近的历史条目（供局域网直连做"我有哪些内容"的清单）。
+    ///
+    /// 返回 `ManifestEntry` 而不是局域网自己的类型：这样 cx-sync 不需要依赖 cx-lan，
+    /// 由守护进程做一次转换即可。
+    pub fn recent_entries(&self, limit: usize) -> Vec<ManifestEntry> {
+        self.history
+            .newest_first(limit)
+            .into_iter()
+            .map(|entry| ManifestEntry {
+                name: entry.name.clone(),
+                day: cx_proto::civil::day_from_ms(entry.created_ms),
+                size: entry.frame_len as u64,
+                hash: entry.plain_hash.clone(),
+                kind: entry.kind,
+                created_ms: entry.created_ms,
+                mime: None,
+            })
+            .collect()
+    }
+
     /// 已处理集合长度（测试与状态展示用）。
     pub fn seen_len(&self) -> usize {
         self.seen.len()
