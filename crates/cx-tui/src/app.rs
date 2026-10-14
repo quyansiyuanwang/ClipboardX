@@ -146,6 +146,8 @@ pub struct App {
     pub pending_delete: Option<usize>,
     /// 后台线程是否还在跑。
     pub running: bool,
+    /// 是否已连上守护进程（断线时界面继续留在屏幕上重试，而不是退出）。
+    pub connected: bool,
 }
 
 impl App {
@@ -178,6 +180,7 @@ impl App {
         match event {
             UiEvent::Status(report) => {
                 self.status = Some(*report);
+                self.connected = true;
             }
             UiEvent::History(items) => {
                 self.items = items;
@@ -201,8 +204,10 @@ impl App {
                 self.doctor = Some(*report);
             }
             UiEvent::Disconnected => {
-                self.running = false;
-                self.warn("与守护进程的连接已断开");
+                // 不结束界面：让用户看得见发生了什么，连上了会自动恢复。
+                // （早先这里直接退出，从快捷方式启动时表现为"黑窗一闪而过"。）
+                self.connected = false;
+                self.warn("未连上守护进程，正在自动重试…（q 退出）");
             }
             UiEvent::Info(text) => self.note(text),
         }
@@ -1136,11 +1141,23 @@ mod tests {
     }
 
     #[test]
-    fn 连接断开会结束界面() {
+    fn 连接断开不会结束界面而是留在屏幕上重试() {
         let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status(false))));
+        assert!(app.connected);
         app.apply(UiEvent::Disconnected);
-        assert!(!app.running);
-        assert!(app.notice.as_ref().unwrap().is_error);
+        assert!(
+            app.running,
+            "断线不该结束界面：从快捷方式启动时守护进程可能还没起来，退出会让窗口一闪而过"
+        );
+        assert!(!app.connected);
+        let notice = app.notice.as_ref().unwrap();
+        assert!(notice.is_error);
+        assert!(
+            notice.text.contains("重试"),
+            "要告诉用户在重试：{}",
+            notice.text
+        );
     }
 
     /// 带后端的诊断状态：用 JSON 构造，字段增删时测试不会碎。

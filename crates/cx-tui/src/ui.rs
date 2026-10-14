@@ -237,20 +237,48 @@ fn row_text(item: &HistorySummary, app: &App, width: usize) -> Line<'static> {
         }
     };
 
+    // 来源设备名只给"来自别的设备"的条目看：
+    // - 本机产生的条目占多数，每行都写自己的设备名是噪音（标记 ↑ 已经说明了）；
+    // - 但"这条是从哪台机器来的"在多设备场景下正是要看的东西。
+    // 列表窄到一定程度就整体不显示，免得把内容摘要挤没。
+    let source = match (marker, width) {
+        ("↑", _) => None,
+        (_, width) if width < MIN_SOURCE_WIDTH => None,
+        _ => Some(format!("{} ", clamp_width_value(origin_name(item), 12))),
+    };
+    let source_len = source.as_ref().map(|text| display_width(text)).unwrap_or(0);
+
     let head = format!(
         "{marker} {} {kind} {} ",
         relative_time(item.created_ms),
         human_bytes(item.bytes as u64)
     );
-    let used = display_width(&head) + 2; // 高亮符号 "▶ " 占两列
+    let used = display_width(&head) + source_len + 2; // 高亮符号 "▶ " 占两列
     let room = width.saturating_sub(used);
     if room == 0 {
         return Line::from(Span::raw(head.trim_end().to_string()));
     }
-    Line::from(vec![
-        Span::raw(head),
-        Span::styled(clamp_width_value(summary, room), summary_style),
-    ])
+    let mut spans = vec![Span::raw(head)];
+    if let Some(source) = source {
+        spans.push(Span::styled(source, Style::default().fg(Color::Magenta)));
+    }
+    spans.push(Span::styled(
+        clamp_width_value(summary, room),
+        summary_style,
+    ));
+    Line::from(spans)
+}
+
+/// 行内显示来源设备名所需的最小列宽（再窄就只剩下标记与摘要）。
+const MIN_SOURCE_WIDTH: usize = 40;
+
+/// 来源设备名（名称为空时退回短设备 id）。
+fn origin_name(item: &HistorySummary) -> String {
+    if item.origin.trim().is_empty() {
+        crate::app::short(&item.origin_device)
+    } else {
+        item.origin.trim().to_string()
+    }
 }
 
 /// 单行化：把换行/制表符折成空格，便于列表里一眼看全。
@@ -1154,6 +1182,81 @@ mod tests {
         assert!(
             app.cursor <= before,
             "点屏幕上第一行应当选中它（滚动过之后它就是可见范围的第一条）"
+        );
+    }
+    #[test]
+    fn 列表行显示远端条目的来源设备_本机的则不显示() {
+        let mut app = app_with(2);
+        app.apply(loaded(0, "远端来的内容"));
+        app.apply(loaded(1, "本机的内容"));
+
+        // 把第 0 条改成"来自别的设备"，第 1 条保持本机
+        let device_id = app.status.as_ref().unwrap().device_id.clone();
+        let mut remote = item(0, "ALEXLAPTOP");
+        remote.name = "1759323998000-ab12cd34-9f3c1e77-0".to_string();
+        remote.origin_device = "ffffffffffffffff".to_string();
+        let mut mine = item(1, "ALEXLAPTOP");
+        mine.name = "1759323998000-ab12cd34-9f3c1e77-1".to_string();
+        mine.origin_device = device_id;
+        app.apply(UiEvent::History(vec![remote, mine]));
+
+        let screen = render(&mut app, 140, 30);
+        assert!(has(&screen, "远端来的内容"), "{screen}");
+        // 设备名出现在行里（远端那条）
+        assert!(
+            has(&screen, "ALEXLAPTOP"),
+            "远端条目应当显示来源设备名：{screen}"
+        );
+    }
+
+    #[test]
+    fn 列表太窄时不显示来源设备名() {
+        let mut app = app_with(1);
+        let mut remote = item(0, "ALEXLAPTOP");
+        remote.origin_device = "ffffffffffffffff".to_string();
+        app.apply(UiEvent::History(vec![remote]));
+        app.apply(loaded(0, "内容"));
+
+        // 列表内容宽 = 终端宽 - 4，因此 40 列的终端才真正低于阈值。
+        // 断言要看**列表那一行**：预览面板本来就会显示来源设备名，
+        // 断言整屏会把预览里的也算上（第一版就是这么错的）。
+        let screen = render(&mut app, 40, 30);
+        let row = screen
+            .lines()
+            .find(|line| compact(line).contains("内容"))
+            .unwrap_or_default();
+        assert!(
+            !compact(row).contains("ALEXLAPTOP"),
+            "窄屏下列表行不该显示设备名：{row:?}\n{screen}"
+        );
+        assert!(compact(row).contains("内容"), "内容摘要仍要看得见：{row:?}");
+    }
+
+    #[test]
+    fn 设备名过长时截断且不超宽() {
+        let mut app = app_with(1);
+        let mut remote = item(0, "一台名字特别长的设备某某某某某某");
+        remote.origin_device = "ffffffffffffffff".to_string();
+        app.apply(UiEvent::History(vec![remote.clone()]));
+        app.apply(loaded(0, "内容"));
+
+        // 直接量这一行（不经过屏幕抓行：抓行会抓错面板，第一版就是这么错的）
+        let line = row_text(&remote, &app, 80);
+        let width = line.width();
+        assert!(width <= 80, "行宽 {width} 超了 80");
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(text.contains('…'), "长设备名应当被截断：{text}");
+        // 设备名按**显示列**截断到 12 列（12 列 = 6 个汉字），不是按字符数
+        assert!(text.contains("一台名字特"), "{text}");
+        let source = line.spans[1].content.to_string();
+        assert!(
+            display_width(&source) <= 13,
+            "设备名占了 {} 列",
+            display_width(&source)
         );
     }
     #[test]

@@ -170,17 +170,40 @@ fn worker(
     request_tx: Sender<Request>,
     events: Sender<UiEvent>,
 ) {
-    let mut client = match ControlClient::connect(&paths) {
-        Ok(client) => client,
-        Err(err) => {
-            let _ = events.send(UiEvent::Failure {
-                command: "connect".to_string(),
-                message: err.to_string(),
-            });
-            let _ = events.send(UiEvent::Disconnected);
-            return;
+    // 连不上守护进程时**不要退出**：从快捷方式启动时守护进程往往还没起来，
+    // 一退出控制台窗口就瞬间关闭，用户只看到黑窗一闪（实测反馈就是这个）。
+    // 这里持续重试，界面留在屏幕上显示"未连接"，连上后自动刷新。
+    let mut attempts = 0u32; // 最多重试 20 次（约 20 秒）
+    let mut client = loop {
+        match ControlClient::connect(&paths) {
+            Ok(client) => break client,
+            Err(err) => {
+                let _ = events.send(UiEvent::Failure {
+                    command: "connect".to_string(),
+                    message: format!("{err}（正在自动重试…）"),
+                });
+                let _ = events.send(UiEvent::Disconnected);
+                // 等待下一轮，但**可被打断**：退出请求（界面的 Stop、或句柄被丢弃）
+                // 会立刻结束线程。用 sleep 轮询的话，shutdown() 得等满一轮——
+                // 实测让一个单元测试白等 90 秒，无守护进程时的快照也要等 20 秒。
+                match requests.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                    Ok(Request::Stop) => return,
+                    // 重试期间界面还可能发别的请求，一律忽略（等连上再说）
+                    _ => {}
+                }
+                attempts += 1;
+                if attempts >= 20 {
+                    return;
+                }
+            }
         }
     };
+
+    // 连上了：让界面把"未连接"的提示换成实时状态
+    let _ = events.send(UiEvent::Info("已连接守护进程".to_string()));
+    let _ = request_tx.send(Request::Status);
+    let _ = request_tx.send(Request::History(crate::HISTORY_LIMIT));
 
     // 事件流单独一条连接：任何事件都触发一次刷新，界面因此"跟着守护进程动"
     spawn_event_pump(paths.clone(), request_tx.clone());
