@@ -629,6 +629,12 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                 .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?
             {
                 cx_tui::TuiExit::Quit => Ok(ExitCode::SUCCESS),
+                cx_tui::TuiExit::RemoveBackend(name) => {
+                    remove_backend(paths, &name)?;
+                    println!("已移除后端 {name}（已上传的对象不在本机，未做删除）");
+                    restart_daemon(paths)?;
+                    Ok(ExitCode::SUCCESS)
+                }
                 cx_tui::TuiExit::AddBackend(draft) => {
                     // 界面只负责收集，落盘与自测在这里做（同一进程内的库调用）
                     add_backend_from_draft(paths, &draft)?;
@@ -761,6 +767,27 @@ fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<
 ///
 /// 已经连得上就直接返回；连不上就按 `cx start` 的方式拉起一个后台守护进程，
 /// 最多等 5 秒等它开始监听。
+/// 从配置里移除一个后端（界面里移除后端的落地口）。
+fn remove_backend(paths: &Paths, name: &str) -> Result<(), DaemonError> {
+    let mut config = Config::load_or_create(paths)?;
+    let before = config.backends.len();
+    config.backends.retain(|backend| backend.name != name);
+    if config.backends.len() == before {
+        return Err(DaemonError::Protocol(format!("没有名为 {name} 的后端")));
+    }
+    config.save(paths)?;
+    Ok(())
+}
+
+/// 重启守护进程（后端 worker 是启动时创建的，改配置后必须重启才生效）。
+fn restart_daemon(paths: &Paths) -> Result<(), DaemonError> {
+    if cx_daemon::stop_running(paths)? {
+        println!("已重启守护进程以应用改动");
+    }
+    let _ = cx_daemon::spawn_background(paths, false);
+    Ok(())
+}
+
 /// 把 TUI 表单收集到的草稿落成配置（界面里添加后端的落地口）。
 ///
 /// 与 `cx backend add` 走同一套核心逻辑：写 `secrets/` 下的凭据文件 + 追加
@@ -894,10 +921,7 @@ fn add_backend_from_draft(
     }
 
     // 后端 worker 是启动时创建的，因此新增后端要重启守护进程才生效
-    if cx_daemon::stop_running(paths)? {
-        println!("已重启守护进程以启用新后端");
-    }
-    let _ = cx_daemon::spawn_background(paths, false);
+    restart_daemon(paths)?;
     Ok(())
 }
 fn ensure_daemon_running(paths: &Paths) -> Result<(), DaemonError> {
@@ -1258,6 +1282,47 @@ mod backend_tests {
         paths
     }
 
+    #[test]
+    fn 界面移除后端会写回配置且重复移除报错() {
+        use cx_core::config::{BackendKind, BackendSection};
+        let paths = temp_paths("remove-backend");
+        let mut config = Config::load_or_create(&paths).unwrap();
+        config.backends.push(BackendSection {
+            name: "home".to_string(),
+            kind: BackendKind::Server,
+            enabled: true,
+            url: Some("http://127.0.0.1:8688".to_string()),
+            space: Some("space-1".to_string()),
+            token_file: None,
+            username: None,
+            password_file: None,
+            password_env: None,
+            ca_file: None,
+            insecure: false,
+            bucket: None,
+            prefix: None,
+            region: None,
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key_file: None,
+            secret_access_key_env: None,
+            path_style: None,
+            poll_interval_ms: None,
+        });
+        config.save(&paths).unwrap();
+
+        super::remove_backend(&paths, "home").unwrap();
+        let after = Config::load(&paths).unwrap();
+        assert!(
+            !after.backends.iter().any(|backend| backend.name == "home"),
+            "移除后配置里不该还有它"
+        );
+
+        // 再移除一次应当明确报错，而不是静默成功
+        let err = super::remove_backend(&paths, "home").unwrap_err();
+        assert!(err.to_string().contains("没有名为 home"), "{err}");
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
+    }
     #[test]
     fn 后端描述覆盖三种种类() {
         let mut webdav = empty_section("dav".to_string(), cx_core::BackendKind::Webdav);

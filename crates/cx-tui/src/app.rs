@@ -47,6 +47,8 @@ pub enum KeyOutcome {
     Delete(usize),
     /// 表单填完了：交给命令层去落盘与自测。
     AddBackend(Box<BackendDraft>),
+    /// 移除某个后端（面板里确认后）。
+    RemoveBackend(String),
 }
 
 /// 一条提示信息。
@@ -147,6 +149,10 @@ pub struct App {
     pub wizard: Option<Wizard>,
     /// 面板的滚动偏移（面板里有配置引导，小终端放不下）。
     panel_scroll: u16,
+    /// 面板里选中的后端下标（用于移除）。
+    panel_backend: usize,
+    /// 等待确认移除的后端名。
+    pub pending_backend_remove: Option<String>,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
     pub doctor: Option<DoctorReport>,
     /// 等待确认的删除位置（删除是破坏性操作，必须先确认一次）。
@@ -333,6 +339,40 @@ impl App {
         self.viewport_rows = rows.max(1);
     }
 
+    /// 面板里列出的后端名（顺序与 status 一致）。
+    pub fn backend_names(&self) -> Vec<String> {
+        self.status
+            .as_ref()
+            .map(|status| {
+                status
+                    .backends
+                    .iter()
+                    .map(|backend| backend.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 面板里选中的后端名。
+    pub fn selected_backend(&self) -> Option<String> {
+        self.backend_names().get(self.panel_backend).cloned()
+    }
+
+    /// 面板选中的后端下标。
+    pub fn panel_backend(&self) -> usize {
+        self.panel_backend
+    }
+
+    /// 打开面板时把选中项夹回范围内（后端数量会变）。
+    pub fn clamp_panel_selection(&mut self) {
+        let count = self.backend_names().len();
+        if count == 0 {
+            self.panel_backend = 0;
+        } else if self.panel_backend >= count {
+            self.panel_backend = count - 1;
+        }
+    }
+
     /// 面板滚动偏移。
     pub fn panel_scroll(&self) -> u16 {
         self.panel_scroll
@@ -513,6 +553,19 @@ impl App {
             return KeyOutcome::None;
         }
 
+        // 移除后端的确认：只有 y/回车 才真的移除
+        if let Some(name) = self.pending_backend_remove.take() {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    KeyOutcome::RemoveBackend(name)
+                }
+                _ => {
+                    self.note("已取消移除");
+                    KeyOutcome::None
+                }
+            };
+        }
+
         // 表单态：键盘全部交给表单（否则打字会触发退出/复制等命令）
         if self.wizard.is_some() {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -633,6 +686,30 @@ impl App {
             return match key.code {
                 KeyCode::Char('q') => KeyOutcome::Quit,
                 // 滚动键不关闭面板：引导内容在小终端上放不下，得能翻
+                // ↑↓ 在面板里选后端（要移除谁）
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.panel_backend = self.panel_backend.saturating_sub(1);
+                    KeyOutcome::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let count = self.backend_names().len();
+                    if self.panel_backend + 1 < count {
+                        self.panel_backend += 1;
+                    }
+                    KeyOutcome::None
+                }
+                // 移除选中后端：先进确认，避免误删
+                KeyCode::Char('x') | KeyCode::Char('d') if !ctrl => match self.selected_backend() {
+                    Some(name) => {
+                        self.pending_backend_remove = Some(name);
+                        KeyOutcome::None
+                    }
+                    None => {
+                        self.warn("没有可移除的后端");
+                        KeyOutcome::None
+                    }
+                },
+                // 逐行滚动（J/K）与翻页（PgUp/PgDn）分开：面板里的引导很长，两种都需要
                 KeyCode::Char('J') => {
                     self.panel_scroll = self.panel_scroll.saturating_add(1);
                     KeyOutcome::None
@@ -649,6 +726,7 @@ impl App {
                     self.panel_scroll = self.panel_scroll.saturating_sub(10);
                     KeyOutcome::None
                 }
+
                 KeyCode::Char('d') if ctrl => {
                     self.panel_scroll = self.panel_scroll.saturating_add(10);
                     KeyOutcome::None
@@ -1404,9 +1482,10 @@ mod tests {
         let mut app = app_with(2);
         assert_eq!(app.on_key(key(KeyCode::Char('b'))), KeyOutcome::Doctor);
         assert!(app.show_panel);
-        // 面板里任意键关闭；q 直接退出（与帮助页一致，别把人困住）
-        assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
-        assert!(!app.show_panel);
+        // q 直接退出；面板里现在有专门的交互键（↑↓ 选后端、x 移除、J/K 滚动），
+        // 其余键才关闭面板
+        assert_eq!(app.on_key(key(KeyCode::Char('z'))), KeyOutcome::None);
+        assert!(!app.show_panel, "非交互键应当关闭面板");
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(app.on_key(key(KeyCode::Char('q'))), KeyOutcome::Quit);
     }
@@ -1416,10 +1495,13 @@ mod tests {
         let mut app = app_with(3);
         assert_eq!(app.on_key(key(KeyCode::Char('b'))), KeyOutcome::Doctor);
         assert!(app.show_panel);
-        // 面板开着时 j 不该移动列表光标
+        // 面板开着时 j 是"选后端"，不该移动列表光标
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.cursor, 0, "面板打开时 j 不该移动列表光标");
-        assert!(!app.show_panel, "任意键应当关掉面板");
+        assert!(app.show_panel, "j 是面板内的交互键，不该关掉面板");
+        // 非交互键才关闭
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(!app.show_panel, "非交互键应当关掉面板");
 
         // b 是开关：再按一次直接关闭（而不是"被任意键关掉后又被它打开"）
         app.on_key(key(KeyCode::Char('b')));
@@ -1608,8 +1690,8 @@ mod tests {
         app.on_key(key(KeyCode::Char('K')));
         assert_eq!(app.panel_scroll(), 0);
 
-        // 仍然是"b / Esc 关闭，其他键关闭"
-        app.on_key(key(KeyCode::Char('x')));
+        // 非交互键仍然关闭面板（x 现在是"移除选中"，不再承担关闭职责）
+        app.on_key(key(KeyCode::Char('z')));
         assert!(!app.show_panel);
     }
 
@@ -1623,6 +1705,86 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(app.panel_scroll(), 0, "重新打开不该停在上一半截");
+    }
+    #[test]
+    fn 面板里可以选后端并确认移除() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([
+                backend("home", true, 0, None),
+                backend("oss", true, 0, None),
+            ]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.selected_backend().as_deref(), Some("home"));
+
+        // ↓ 选到第二个；到底不再越界
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.selected_backend().as_deref(), Some("oss"));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.selected_backend().as_deref(),
+            Some("oss"),
+            "到底不该越界"
+        );
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(app.selected_backend().as_deref(), Some("home"));
+        app.on_key(key(KeyCode::Char('k')));
+        assert_eq!(
+            app.selected_backend().as_deref(),
+            Some("home"),
+            "到顶不该越界"
+        );
+
+        // x 只是进入确认，不立刻移除
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
+        assert_eq!(app.pending_backend_remove.as_deref(), Some("home"));
+        // 取消
+        assert_eq!(app.on_key(key(KeyCode::Char('n'))), KeyOutcome::None);
+        assert!(app.pending_backend_remove.is_none());
+        assert!(!app.notice.as_ref().unwrap().is_error);
+
+        // y 确认
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('y'))),
+            KeyOutcome::RemoveBackend("home".to_string())
+        );
+        // 回车也算确认
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            KeyOutcome::RemoveBackend("home".to_string())
+        );
+    }
+
+    #[test]
+    fn 面板没有后端时移除给出提示() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status(false))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
+        assert!(app.pending_backend_remove.is_none());
+        assert!(app.notice.as_ref().unwrap().text.contains("没有可移除"));
+    }
+
+    #[test]
+    fn 面板里_ctrl_d_仍然滚动而不是触发移除() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("home", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.panel_scroll(), 10, "Ctrl+D 应当滚面板");
+        assert!(
+            app.pending_backend_remove.is_none(),
+            "Ctrl+D 不该被当成移除后端"
+        );
+        app.on_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(app.panel_scroll(), 0);
     }
     #[test]
     fn 状态行包含关键信息() {

@@ -45,6 +45,8 @@ pub enum TuiExit {
     Quit,
     /// 表单填完了，交给调用方去添加后端。
     AddBackend(Box<BackendDraft>),
+    /// 用户在面板里确认移除某个后端，交给调用方去改配置。
+    RemoveBackend(String),
 }
 
 /// 进入全屏 TUI。
@@ -146,6 +148,11 @@ fn run_loop(
                     // 表单填完：退出界面，把草稿交回命令层
                     KeyOutcome::AddBackend(draft) => {
                         exit = TuiExit::AddBackend(draft);
+                        break;
+                    }
+                    // 面板里确认移除后端：同样退出界面交给命令层处理
+                    KeyOutcome::RemoveBackend(name) => {
+                        exit = TuiExit::RemoveBackend(name);
                         break;
                     }
                     KeyOutcome::Delete(position) => {
