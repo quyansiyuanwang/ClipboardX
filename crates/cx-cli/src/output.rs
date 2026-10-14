@@ -97,7 +97,9 @@ pub fn status(data: &Value, json: bool) -> Result<ExitCode, cx_daemon::DaemonErr
     }
 
     if report.backends.is_empty() {
-        println!("后端       未配置（当前只记录本机历史）");
+        // 别只说"只记录本机历史"：局域网直连不配后端也能同步，
+        // 这句话会让人误判成"同步根本没在跑"。
+        println!("后端       未配置（内容只留在本机；局域网直连若已启用仍然生效，cx doctor 可查）");
     } else {
         println!("后端：");
         for backend in &report.backends {
