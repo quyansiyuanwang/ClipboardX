@@ -49,6 +49,8 @@ pub enum KeyOutcome {
     AddBackend(Box<BackendDraft>),
     /// 移除某个后端（面板里确认后）。
     RemoveBackend(String),
+    /// 停用 / 启用某个后端（面板里按 t）。
+    ToggleBackend(String),
 }
 
 /// 一条提示信息。
@@ -726,6 +728,14 @@ impl App {
                     }
                     KeyOutcome::None
                 }
+                // t 是"停用/启用"：可逆操作，不需要确认
+                KeyCode::Char('t') => match self.selected_backend() {
+                    Some(name) => KeyOutcome::ToggleBackend(name),
+                    None => {
+                        self.warn("没有可切换的后端");
+                        KeyOutcome::None
+                    }
+                },
                 // 移除选中后端：先进确认，避免误删
                 KeyCode::Char('x') | KeyCode::Char('d') if !ctrl => match self.selected_backend() {
                     Some(name) => {
@@ -1872,6 +1882,27 @@ mod tests {
                 "焦点在按钮上时粘贴不该写进字段 {index}"
             );
         }
+    }
+    #[test]
+    fn 面板里_t_切换选中后端的启用状态() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("home", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('t'))),
+            KeyOutcome::ToggleBackend("home".to_string()),
+            "t 应当针对选中的后端"
+        );
+
+        // 没有后端时给出提示而不是静默
+        let mut empty = App::new();
+        empty.apply(UiEvent::Status(Box::new(status(false))));
+        empty.on_key(key(KeyCode::Char('b')));
+        assert_eq!(empty.on_key(key(KeyCode::Char('t'))), KeyOutcome::None);
+        assert!(empty.notice.as_ref().unwrap().text.contains("没有可切换"));
     }
     #[test]
     fn 状态行包含关键信息() {

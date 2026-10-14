@@ -847,7 +847,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  ↑↓ 选后端　x 移除选中　b/Esc 关闭　J/K 或 PgUp/PgDn 滚动　0 回到开头",
+        "  ↑↓ 选后端　t 停用/启用　x 移除　b/Esc 关闭　J/K、PgUp/PgDn 滚动　0 回开头",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1557,7 +1557,8 @@ mod tests {
         let screen = render(&mut app, 120, 30);
         assert!(has(&screen, "▶"), "选中的后端要有标记：{screen}");
         assert!(has(&screen, "↑↓ 选后端"), "页脚要说明怎么选：{screen}");
-        assert!(has(&screen, "x 移除选中"), "{screen}");
+        assert!(has(&screen, "x 移除"), "{screen}");
+        assert!(has(&screen, "t 停用/启用"), "要告诉用户能停用：{screen}");
 
         // 确认浮层
         app.pending_backend_remove = Some("home".to_string());

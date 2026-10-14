@@ -629,6 +629,18 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                 .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?
             {
                 cx_tui::TuiExit::Quit => Ok(ExitCode::SUCCESS),
+                cx_tui::TuiExit::ToggleBackend(name) => {
+                    let enabled = set_backend_enabled(paths, &name)?;
+                    let state = if enabled { "已启用" } else { "已停用" };
+                    println!("后端 {name} {state}");
+                    if enabled {
+                        println!("（内容会重新同步到它；首次同步可能拉取较多历史）");
+                    } else {
+                        println!("（已上传到它的对象不会被删除；其他后端不受影响）");
+                    }
+                    restart_daemon(paths)?;
+                    Ok(ExitCode::SUCCESS)
+                }
                 cx_tui::TuiExit::RemoveBackend(name) => {
                     remove_backend(paths, &name)?;
                     println!("已移除后端 {name}（已上传的对象不在本机，未做删除）");
@@ -767,6 +779,25 @@ fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<
 ///
 /// 已经连得上就直接返回；连不上就按 `cx start` 的方式拉起一个后台守护进程，
 /// 最多等 5 秒等它开始监听。
+/// 翻转某个后端的启用状态，返回新状态。
+///
+/// 停用只是不在这次运行里为它起 worker：已上传的对象不动、其他后端不受影响，
+/// 想恢复按同一个键即可，所以不需要"确认"这一层。
+fn set_backend_enabled(paths: &Paths, name: &str) -> Result<bool, DaemonError> {
+    let mut config = Config::load_or_create(paths)?;
+    let Some(backend) = config
+        .backends
+        .iter_mut()
+        .find(|backend| backend.name == name)
+    else {
+        return Err(DaemonError::Protocol(format!("没有名为 {name} 的后端")));
+    };
+    backend.enabled = !backend.enabled;
+    let enabled = backend.enabled;
+    config.save(paths)?;
+    Ok(enabled)
+}
+
 /// 从配置里移除一个后端（界面里移除后端的落地口）。
 fn remove_backend(paths: &Paths, name: &str) -> Result<(), DaemonError> {
     let mut config = Config::load_or_create(paths)?;
@@ -1321,6 +1352,51 @@ mod backend_tests {
         // 再移除一次应当明确报错，而不是静默成功
         let err = super::remove_backend(&paths, "home").unwrap_err();
         assert!(err.to_string().contains("没有名为 home"), "{err}");
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
+    }
+    #[test]
+    fn 停用启用后端会翻转并写回配置() {
+        use cx_core::config::{BackendKind, BackendSection};
+        let paths = temp_paths("toggle-backend");
+        let mut config = Config::load_or_create(&paths).unwrap();
+        config.backends.push(BackendSection {
+            name: "home".to_string(),
+            kind: BackendKind::Server,
+            enabled: true,
+            url: Some("http://127.0.0.1:8688".to_string()),
+            space: Some("space-1".to_string()),
+            token_file: None,
+            username: None,
+            password_file: None,
+            password_env: None,
+            ca_file: None,
+            insecure: false,
+            bucket: None,
+            prefix: None,
+            region: None,
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key_file: None,
+            secret_access_key_env: None,
+            path_style: None,
+            poll_interval_ms: None,
+        });
+        config.save(&paths).unwrap();
+
+        assert!(
+            !super::set_backend_enabled(&paths, "home").unwrap(),
+            "第一次应当停用"
+        );
+        let after = Config::load(&paths).unwrap();
+        assert!(!after.backends[0].enabled);
+        assert!(
+            super::set_backend_enabled(&paths, "home").unwrap(),
+            "再按一次应当启用"
+        );
+        assert!(Config::load(&paths).unwrap().backends[0].enabled);
+
+        let err = super::set_backend_enabled(&paths, "nope").unwrap_err();
+        assert!(err.to_string().contains("没有名为 nope"), "{err}");
         let _ = std::fs::remove_dir_all(&paths.data_dir);
     }
     #[test]
