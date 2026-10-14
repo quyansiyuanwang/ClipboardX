@@ -1,0 +1,206 @@
+# 发布流水线：打 tag（vX.Y.Z）→ 构建三端产物 → 真机验收 → 生成校验和 → 建 GitHub Release
+#
+# 设计要点：
+# 1. **tag 必须与 Cargo.toml 的版本一致**（第一个 job 就校验），否则会出现
+#    "Release 写着 0.2.0，装出来的却是 0.1.0"这种最难查的问题；
+# 2. 每个产物都**先验收再上传**：MSI 走 install→断言→uninstall，DMG 走挂载→断言→卸载，
+#    deb 走安装→冒烟→卸载；验收不过就没有 Release；
+# 3. Windows 上另外跑一遍**升级验收**（装旧版 → 装新版 → 只留一份 → 卸载干净）；
+# 4. 签名与公证是**可选步骤**：配了 secrets 就自动签，没配就跳过并在日志里写清楚，
+#    这样"首版不签名"与"补上证书"之间不需要改流程（见 docs/packaging.md §4）；
+# 5. 产物附带 SHA256SUMS，Release 说明里给出安装与校验方法。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本（形如 0.1.0；用于手动重跑）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: 校验版本一致性
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验 tag 与 Cargo.toml
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(grep -m1 -E '^\s*version\s*=\s*"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag_version="${{ inputs.version }}"
+          else
+            tag_version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "Cargo.toml=$cargo_version tag=$tag_version"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::tag（$tag_version）与 Cargo.toml 的版本（$cargo_version）不一致"
+            exit 1
+          fi
+          # 顺带确认 tag 指向的提交就在 main 上（防止从分支随手打 tag 发布）
+          git fetch --no-tags --depth=1 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::tag 指向的提交不在 main 上"
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows MSI
+    needs: version
+    runs-on: windows-latest
+    env:
+      # secrets 不能直接写在 step 的 if 里，先转成 job 级 env 再判断
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装 WiX（版本锁定在仓库内）
+        run: dotnet tool restore
+
+      - name: 构建 MSI
+        shell: pwsh
+        run: ./scripts/build-msi.ps1 -Version ${{ needs.version.outputs.version }}
+
+      - name: 签名（配了证书才执行）
+        if: env.HAS_WINDOWS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $msi = Get-ChildItem dist/ClipboardX-*-x64.msi | Select-Object -First 1
+          signtool sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $msi.FullName
+
+      - name: 安装验收（真实安装 → 断言 → 卸载）
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem dist/ClipboardX-*-x64.msi | Select-Object -First 1
+          ./scripts/verify-msi.ps1 -Msi $msi.FullName
+
+      - name: 升级验收（装旧版 → 装新版 → 只留一份 → 卸载干净）
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem dist/ClipboardX-*-x64.msi | Select-Object -First 1
+          $new = ($msi.BaseName -replace '^ClipboardX-', '') -replace '-x64$', ''
+          ./scripts/verify-msi-upgrade.ps1 -OldVersion 0.0.9 -NewVersion $new -SkipBuild
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/ClipboardX-*-x64.msi
+          if-no-files-found: error
+
+  macos:
+    name: macOS DMG
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建 DMG（配了证书就签名并公证）
+        shell: bash
+        env:
+          CX_VERSION: ${{ needs.version.outputs.version }}
+          SIGN_ID: ${{ secrets.APPLE_SIGN_ID }}
+          NOTARIZE: ${{ secrets.APPLE_ID != '' && '1' || '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$SIGN_ID" ]; then
+            echo "::notice::没有配置 APPLE_SIGN_ID，本次构建不签名（安装说明里已写明绕过步骤）"
+          fi
+          bash packaging/macos/build-dmg.sh
+
+      - name: 挂载验收
+        shell: bash
+        run: bash packaging/macos/verify-dmg.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  linux:
+    name: Linux deb
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装验收所需依赖
+        run: sudo apt-get update && sudo apt-get install -y xvfb dbus-x11 xclip
+
+      - name: 构建 deb
+        shell: bash
+        env:
+          CX_VERSION: ${{ needs.version.outputs.version }}
+        run: bash packaging/linux/build-deb.sh
+
+      - name: 安装验收（安装 → 冒烟 → 卸载）
+        shell: bash
+        run: bash packaging/linux/verify-deb.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    name: 汇总并发布
+    needs: [version, windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: 生成 SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \) -print0 \
+            | xargs -0 sha256sum > SHA256SUMS
+          echo "--- 产物 ---"
+          cat SHA256SUMS
+          test -s SHA256SUMS || { echo "::error::没有收集到任何产物"; exit 1; }
+
+      - name: 建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 && gh release delete "$tag" --yes || true
+          gh release create "$tag" \
+            --title "ClipboardX $version" \
+            --notes-file docs/release-notes.md \
+            dist/*.msi dist/*.dmg dist/*.deb dist/SHA256SUMS

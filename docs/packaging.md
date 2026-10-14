@@ -188,3 +188,30 @@ Unix 侧用 `setsid` 新建会话，fd 由调用方的 CLOEXEC 语义保证不�
 | pkg 安装后 `cx` 命令找不到 | 新开终端（PATH 由 pkg 写入 `/usr/local/bin`）；确认 `/usr/local/bin` 在 PATH 中 |
 | LaunchAgent 未生效 | `launchctl print gui/$(id -u)/com.clipboardx.agent`；确认是 agent 在用户会话内而非 daemon |
 | Linux 守护进程报会话缺失 | 无 DISPLAY/WAYLAND_DISPLAY；桌面登录后再启动，或用 `cx daemon --no-clipboard` 做纯中继 |
+
+## 6. 发布流程
+
+打一个与 `Cargo.toml` 版本一致的 tag 即可：
+
+```bash
+# 先把版本号改好（Cargo.toml）并提交
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`Release` 流水线（`.github/workflows/release.yml`）会：
+
+1. **校验 tag 与 Cargo.toml 的版本一致**，且 tag 指向的提交在 `main` 上（防止从分支随手发版）；
+2. 三端各自构建产物并**先验收再上传**：MSI 走 安装→断言→卸载，DMG 走 挂载→断言→卸载，
+   deb 走 安装→冒烟→卸载；Windows 上额外跑一遍**升级验收**（装旧版→装新版→只留一份→卸干净）；
+3. 配了证书就自动签名/公证（Windows 用 `signtool`，macOS 用 `codesign`+`notarytool`），
+   没配就跳过并在日志里写明——两种状态都不需要改流程；
+4. 汇总产物、生成 `SHA256SUMS`，用它建 GitHub Release（说明取 `docs/release-notes.md`）。
+
+本地对应命令：
+
+```powershell
+pwsh scripts/verify-msi.ps1 -Msi dist\ClipboardX-0.1.0-x64.msi
+pwsh scripts/verify-msi-upgrade.ps1            # 升级验收（自动构建 0.0.9 与 0.1.0）
+bash packaging/linux/verify-deb.sh
+bash packaging/macos/verify-dmg.sh
+```
