@@ -855,7 +855,9 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  ↑↓ 选后端　t 停用/启用　x 移除　b/Esc 关闭　J/K、PgUp/PgDn 滚动　0 回开头",
+        // 面板里也要说明怎么"再加一个"：空状态里提了 a，但已经有一个后端之后
+        // 就没有任何提示了，想配第二个后端的人只能猜。
+        "  ↑↓ 选后端　t 停用/启用　x 移除　a 添加　b/Esc 关闭　J/K、PgUp/PgDn 滚动　0 回开头",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1617,6 +1619,10 @@ mod tests {
         let screen = render(&mut app, 120, 30);
         assert!(has(&screen, "▶"), "选中的后端要有标记：{screen}");
         assert!(has(&screen, "↑↓ 选后端"), "页脚要说明怎么选：{screen}");
+        assert!(
+            has(&screen, "a 添加"),
+            "已经有一个后端时也要说明怎么再加一个：{screen}"
+        );
         assert!(has(&screen, "x 移除"), "{screen}");
         assert!(has(&screen, "t 停用/启用"), "要告诉用户能停用：{screen}");
 
