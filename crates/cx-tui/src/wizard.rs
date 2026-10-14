@@ -33,7 +33,10 @@ const SERVER_FIELDS: [Field; 4] = [
         "（cx space init 输出的那个）",
         "要同步到服务端上的哪个空间",
     ),
-    Field::secret("注册密钥", "cx-server token issue 生成；密文输入，不回显"),
+    Field::secret(
+        "注册密钥",
+        "cx-server 生成的注册密钥；保存时用它自助注册换取设备令牌（密文输入，不回显）",
+    ),
 ];
 
 const WEBDAV_FIELDS: [Field; 4] = [
