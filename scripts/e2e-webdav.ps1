@@ -98,21 +98,6 @@ try {
     else { Join-Path $repo 'target/release/cx' }
     Assert-True (Test-Path $script:cx) '二进制就绪'
 
-    # ---- 剪贴板可用性探测 ----
-    $clipboardOk = -not $NoClipboard
-    if ($clipboardOk) {
-        try {
-            $originalClipboard = Get-Clipboard -Raw
-            Set-Clipboard -Value 'cx-e2e-probe'
-            $clipboardOk = (Get-Clipboard -Raw) -eq 'cx-e2e-probe'
-        }
-        catch {
-            $clipboardOk = $false
-            $originalClipboard = $null
-        }
-    }
-    Write-Host ("剪贴板路径：" + $(if ($clipboardOk) { '真实剪贴板' } else { '无（用 cx push 与历史断言代替）' })) -ForegroundColor DarkGray
-
     Step '准备真实 WebDAV 服务端（wsgidav）'
     New-Item -ItemType Directory -Force -Path $davRoot | Out-Null
     & python -m venv $venv 2>&1 | Select-Object -Last 1
@@ -147,9 +132,31 @@ try {
     $checkNames = ($report.checks | ForEach-Object { $_.name }) -join ','
     Assert-True ($checkNames -match '配置') "本地诊断包含配置检查（$checkNames）"
 
+    # ---- 剪贴板能力：以 `cx doctor` 的判断为准 ----
+    # 不要用 PowerShell 的 Get/Set-Clipboard 探测：那是"脚本能不能动剪贴板"，
+    # 与"守护进程能不能动剪贴板"是两件事（Linux runner 上脚本那侧可能可用，
+    # 但守护进程没有 X 会话，必须以 --no-clipboard 运行）。
+    $clipboardCheck = $report.checks | Where-Object { $_.name -eq '剪贴板' } | Select-Object -First 1
+    $daemonClipboard = (-not $NoClipboard) -and ($null -ne $clipboardCheck) -and $clipboardCheck.ok
+
+    $scriptClipboard = $false
+    if ($daemonClipboard) {
+        try {
+            $originalClipboard = Get-Clipboard -Raw
+            Set-Clipboard -Value 'cx-e2e-probe'
+            $scriptClipboard = (Get-Clipboard -Raw) -eq 'cx-e2e-probe'
+        }
+        catch {
+            $scriptClipboard = $false
+            $originalClipboard = $null
+        }
+    }
+    Write-Host ("守护进程剪贴板：" + $(if ($daemonClipboard) { '可用' } elseif ($NoClipboard) { '被 -NoClipboard 强制关闭' } else { "不可用（$($clipboardCheck.detail)）" })) -ForegroundColor DarkGray
+    Write-Host ("脚本剪贴板：" + $(if ($scriptClipboard) { '可用' } else { '不可用' })) -ForegroundColor DarkGray
+
     Step '启动两台守护进程'
     # 无图形会话时剪贴板不可用，两台都以纯中继模式运行
-    $relayArgs = if ($clipboardOk) { @() } else { @('--no-clipboard') }
+    $relayArgs = if ($daemonClipboard) { @() } else { @('--no-clipboard') }
     $procA = Start-Hidden $script:cx (@('daemon', '--foreground', '--quiet') + $relayArgs) @{
         CX_CONFIG_DIR = $deviceA.Config; CX_DATA_DIR = $deviceA.Data; CX_CACHE_DIR = $deviceA.Cache; CX_LOG = 'debug'
     }
@@ -167,7 +174,7 @@ try {
 
     # ---------- A → B ----------
     $textA = "来自 A 的内容 " + (Get-Random)
-    if ($clipboardOk) {
+    if ($scriptClipboard) {
         Step "A 复制到剪贴板（等守护进程采集）：$textA"
         Set-Clipboard -Value $textA
     }
@@ -203,7 +210,7 @@ try {
     $applied = $false
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Seconds 2
-        if ($clipboardOk) {
+        if ($scriptClipboard) {
             if ((Get-Clipboard -Raw) -eq $textB) { $applied = $true; break }
         }
         else {
@@ -211,7 +218,7 @@ try {
             if ($preview.text -eq $textB) { $applied = $true; break }
         }
     }
-    $where = if ($clipboardOk) { 'A 的剪贴板' } else { 'A 的历史' }
+    $where = if ($scriptClipboard) { 'A 的剪贴板' } else { 'A 的历史' }
     Assert-True $applied "$where 已变成本地 B 的内容（等待 $($i * 2) 秒）"
 
     Step '两边都不产生重复上传（防回环）'
