@@ -98,6 +98,7 @@ sudo bash packaging/linux/verify-deb.sh dist/ClipboardX_0.1.0_amd64.deb
 | Job | Runner | 内容 |
 |---|---|---|
 | `test` | ubuntu / windows / macos 三平台矩阵 | `cargo fmt --check`、`clippy -D warnings`、`cargo test`、release 构建、**二进制体积预算断言** |
+| `e2e` | ubuntu / windows / macos 三平台矩阵 | `scripts/e2e-local.ps1 -NoClipboard`：`cx start` 分离进程 + start/stop/status/history/push/pause/resume/doctor/reload 全链路断言 |
 | `msi` | windows-latest | 构建 MSI → `msiexec /i /qn` → 断言文件/PATH/Run 键/`cx version` → `msiexec /x /qn` → 断言无残留 |
 | `dmg` | macos-latest | 构建通用二进制 → pkg → dmg → 挂载 → `installer -pkg` → `lipo -archs` 校验 → 卸载 |
 | `deb` | ubuntu-latest | 构建 deb → `dpkg -i` → 断言 → `dpkg -r` → Xvfb 下启动冒烟 |
@@ -147,6 +148,32 @@ installer 装了一个空产品。最终处理方式：**放弃 productbuild**�
 
 
 打包流水线必须在断言里检查"该出现的文件确实出现了"。
+
+## 6.2 守护进程与句柄继承（Windows 上会让脚本挂起）
+
+`cx start` 需要在后台挂载守护进程，而"分离进程"在 Windows 上有一个隐蔽的坑：
+
+**Rust 标准库的 `Command` 始终允许句柄继承（`bInheritHandles = TRUE`）。**
+如果调用方的 stdout 是管道或重定向文件（shell 脚本、CI runner、编辑器任务都在这么干），
+守护进程会把这个句柄一起继承走；只要守护进程活着，那个管道就不会关闭，
+于是**调用方会一直挂住**。实测三种写法全部复现：
+
+1. `cx start`（PowerShell 管道捕获输出）→ 挂起；
+2. `cx start *> file`（重定向到文件）→ 挂起；
+3. `Start-Process -Wait`（连 `-Wait` 都等不到返回）→ 挂起。
+
+注意 `cx start` 自己其实**已经返回了**（`daemon.json` 已写出、守护进程已就绪），
+挂住的是调用方对管道 EOF 的等待——这正是它难以排查的原因。
+
+**修法**：Windows 下不用 `Command`，直接 `CreateProcessW(..., bInheritHandles = FALSE, CREATE_NO_WINDOW)`，
+不给守护进程任何可继承句柄（见 `crates/cx-daemon/src/runtime.rs::spawn_detached_windows`）。
+Unix 侧用 `setsid` 新建会话，fd 由调用方的 CLOEXEC 语义保证不被带过去。
+
+顺带一提：`--quiet` 是后台启动时固定加上的，因为"无句柄环境"里写 stderr 没有意义；
+守护进程的日志一律进 `logs/daemon.log`。
+
+回归覆盖：`scripts/e2e-local.ps1` 与 CI 的 `e2e` job 都直接跑 `cx start`，
+再断言进程活着、`cx status` 能连上、`cx stop` 能停掉——挂起会立刻表现为 CI 超时。
 
 ## 7. 常见故障排查
 

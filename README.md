@@ -42,8 +42,23 @@ cargo build --release --bin cx
 cargo test
 cargo clippy --workspace --all-targets -- -D warnings
 
+.\scripts\check.ps1            # 提交前门禁：fmt + clippy + test
+.\scripts\e2e-local.ps1        # 端到端：守护进程 + CLI + 真实剪贴板（会临时改写剪贴板并恢复）
+.\scripts\e2e-local.ps1 -NoClipboard   # 无头版本（CI 用）
 .\scripts\build-msi.ps1        # 产出 dist\ClipboardX-<v>-x64.msi（WiX v4，版本锁定在仓库内）
 .\scripts\verify-msi.ps1 -Msi dist\ClipboardX-0.1.0-x64.msi
+```
+
+日常用法：
+
+```powershell
+cx start            # 后台挂载守护进程（登录自启用 cx service install）
+cx status           # 设备、后端、历史、计数
+cx history --limit 20
+cx copy 0           # 把最新一条写回剪贴板
+cx pause / cx resume
+cx doctor           # 守护进程起不来时也能跑（本地回退检查）
+cx stop
 ```
 
 ```bash

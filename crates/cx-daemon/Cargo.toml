@@ -7,3 +7,26 @@ license.workspace = true
 description = "ClipboardX 守护进程运行时：线程装配、控制套接字、后台挂载与自启注册"
 
 [dependencies]
+cx-clip.workspace = true
+cx-core.workspace = true
+cx-crypto.workspace = true
+cx-proto.workspace = true
+cx-sync.workspace = true
+crossbeam-channel.workspace = true
+fs2.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Windows 后台挂载需要 CreateProcessW 的 bInheritHandles=FALSE 语义：
+# Rust std 的 Command 始终允许句柄继承，会把调用方的管道/文件句柄带进守护进程，
+# 导致脚本与 CI 在守护进程存活期间挂起（详见 runtime.rs 的说明）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

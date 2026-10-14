@@ -1,0 +1,805 @@
+//! 守护进程运行时：装配线程、执行引擎动作、维持控制套接字。
+//!
+//! 线程模型（都不使用 async 运行时）：
+//!
+//! | 线程 | 职责 |
+//! |---|---|
+//! | 主线程 | 等退出信号，然后按顺序收尾（停服务端 → 停引擎并落盘 → 清理 daemon.json） |
+//! | `watcher` | 等平台事件（或轮询兜底）→ 读剪贴板 → 送引擎 |
+//! | `engine` | 唯一持有引擎状态；执行动作（写剪贴板、落盘、回复、广播事件） |
+//! | `control` | 接受回环连接；每条连接一个短生命周期线程 |
+//!
+//! 空闲时所有线程都阻塞在 channel/socket 上：CPU 近 0，不需要忙等待。
+
+use crate::control::{
+    Broadcaster, ControlServer, DAEMON_INFO_VERSION, DaemonInfo, Dispatcher, SubscribeFactory,
+    ensure_control_token,
+};
+use crate::error::DaemonError;
+use crate::lock::InstanceLock;
+use crate::logging;
+use crate::service;
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use cx_clip::{ChangeNotifier, ClipBackend, ClipContent, SystemClipboard};
+use cx_core::{Config, Identity, LocalSpace, Paths};
+use cx_proto::control::{
+    DoctorCheck, Event as ControlEvent, Reply, Request, cmd as commands, errcode, event as events,
+};
+use cx_sync::{Action, Command as EngineCommand, Engine, Event as EngineEvent, ReplyPayload};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// 等待引擎响应的上限。
+const ENGINE_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 运行参数。
+#[derive(Debug, Clone, Default)]
+pub struct DaemonOptions {
+    /// 纯中继模式：不读写本机剪贴板（用于无图形会话的服务器）。
+    pub no_clipboard: bool,
+    /// 日志同时输出到 stderr（前台调试用）。
+    pub stderr_logs: bool,
+    /// 覆盖轮询间隔（毫秒）。
+    pub poll_interval_ms: Option<u64>,
+}
+
+/// 引擎消息。
+enum EngineMsg {
+    /// 事件（fire-and-forget）。
+    Event(EngineEvent),
+    /// 控制命令，需要把响应送回发起者。
+    Request {
+        /// 命令。
+        command: EngineCommand,
+        /// 响应通道。
+        reply: Sender<ReplyPayload>,
+    },
+    /// 优雅退出。
+    Shutdown(Sender<()>),
+}
+
+/// 守护进程对外的静态信息（供补齐 status/doctor 用）。
+#[derive(Debug)]
+struct SharedMeta {
+    pid: u32,
+    started_ms: u64,
+    version: String,
+    clipboard: String,
+    watch: String,
+    no_clipboard: bool,
+    max_item_bytes: u64,
+}
+
+/// 守护进程实例。
+pub struct Daemon {
+    paths: Paths,
+    config: Config,
+    identity: Identity,
+    space: Option<LocalSpace>,
+    options: DaemonOptions,
+}
+
+impl Daemon {
+    /// 构造（不启动）。
+    pub fn new(
+        paths: Paths,
+        config: Config,
+        identity: Identity,
+        space: Option<LocalSpace>,
+        options: DaemonOptions,
+    ) -> Self {
+        Self {
+            paths,
+            config,
+            identity,
+            space,
+            options,
+        }
+    }
+
+    /// 启动并阻塞直到退出。返回进程退出码。
+    pub fn run(self) -> Result<i32, DaemonError> {
+        let paths = self.paths.clone();
+        paths.ensure()?;
+
+        // 单实例：抢不到锁直接退出（两个进程同时写历史/状态会互相破坏）
+        let _lock = InstanceLock::acquire(&paths)?;
+
+        logging::init(&paths, None, self.options.stderr_logs)?;
+        log::info!(
+            "ClipboardX {} 启动（pid {}，{}）",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            if self.options.no_clipboard {
+                "纯中继模式"
+            } else {
+                "剪贴板模式"
+            }
+        );
+
+        let started_ms = cx_core::now_ms();
+
+        // ---- 剪贴板后端 ----
+        // 读侧给 watcher、写侧给引擎线程：两个独立的句柄，互不阻塞。
+        let (mut read_clip, mut write_clip, notifier, clipboard_desc, watch_desc): (
+            Option<SystemClipboard>,
+            Option<SystemClipboard>,
+            Option<ChangeNotifier>,
+            String,
+            String,
+        ) = if self.options.no_clipboard {
+            (
+                None,
+                None,
+                None,
+                "已禁用（--no-clipboard）".to_string(),
+                "已禁用".to_string(),
+            )
+        } else {
+            match (SystemClipboard::new(), SystemClipboard::new()) {
+                (Ok(read), Ok(write)) => {
+                    let caps = read.capabilities();
+                    let notifier = match ChangeNotifier::spawn() {
+                        Ok(notifier) => Some(notifier),
+                        Err(err) => {
+                            log::warn!("平台变更通知不可用（{err}），改用轮询");
+                            None
+                        }
+                    };
+                    let interval = self
+                        .options
+                        .poll_interval_ms
+                        .unwrap_or(self.config.sync.watch_interval_ms);
+                    let watch = if notifier.is_some() {
+                        format!("平台事件 + {interval} ms 兜底轮询")
+                    } else {
+                        format!("纯轮询（{interval} ms）")
+                    };
+                    (Some(read), Some(write), notifier, caps.note, watch)
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    return Err(DaemonError::Core(cx_core::CoreError::Clip(err.to_string())));
+                }
+            }
+        };
+
+        if write_clip.is_none() {
+            // 纯中继模式下没有写侧，引擎的应用动作会被跳过
+            write_clip = None;
+        }
+
+        // ---- 引擎 ----
+        let engine = Engine::new(
+            &paths,
+            self.config.clone(),
+            self.identity.clone(),
+            self.space.clone(),
+        )?;
+        let (engine_tx, engine_rx) = unbounded::<EngineMsg>();
+        let broadcaster = Broadcaster::new();
+        let meta = Arc::new(SharedMeta {
+            pid: std::process::id(),
+            started_ms,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            clipboard: clipboard_desc,
+            watch: watch_desc,
+            no_clipboard: self.options.no_clipboard,
+            max_item_bytes: self.config.sync.max_item_bytes,
+        });
+
+        // ---- 控制服务端 ----
+        let token = ensure_control_token(&paths)?;
+        let server = ControlServer::bind(token)?;
+        let port = server.port()?;
+        let server_shutdown = server.shutdown_flag();
+
+        let info = DaemonInfo {
+            v: DAEMON_INFO_VERSION,
+            pid: std::process::id(),
+            port,
+            started_ms,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            control_protocol: cx_proto::control::CONTROL_PROTOCOL_VERSION,
+        };
+        info.save(&paths)?;
+        log::info!("控制套接字已就绪：127.0.0.1:{port}");
+
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
+
+        // 分发器：请求 → 引擎命令 → 响应
+        let dispatch_tx = engine_tx.clone();
+        let dispatch_meta = meta.clone();
+        let dispatch_paths = paths.clone();
+        let dispatch_shutdown = server_shutdown.clone();
+        let dispatch_signal = shutdown_tx.clone();
+        let dispatcher: Dispatcher = Arc::new(move |request: Request| {
+            let id = request.id;
+
+            // `shutdown` 由运行时直接处理，不进引擎
+            if request.cmd == commands::SHUTDOWN {
+                dispatch_shutdown.store(true, Ordering::Relaxed);
+                let _ = dispatch_signal.try_send(());
+                return Reply::done(id);
+            }
+
+            let command = match to_command(&request, &dispatch_meta, &dispatch_paths) {
+                Ok(command) => command,
+                Err(message) => return Reply::err(id, errcode::BAD_ARGS, message),
+            };
+
+            let (reply_tx, reply_rx) = bounded::<ReplyPayload>(1);
+            if dispatch_tx
+                .send(EngineMsg::Request {
+                    command,
+                    reply: reply_tx,
+                })
+                .is_err()
+            {
+                return Reply::err(id, errcode::INTERNAL, "引擎已停止");
+            }
+
+            match reply_rx.recv_timeout(ENGINE_REPLY_TIMEOUT) {
+                Ok(payload) => payload_to_reply(payload, &dispatch_meta),
+                Err(_) => Reply::err(id, errcode::INTERNAL, "引擎响应超时"),
+            }
+        });
+
+        let subscriber = broadcaster.clone();
+        let subscribe: SubscribeFactory = Arc::new(move || subscriber.subscribe());
+        let server_thread = server.serve(dispatcher, subscribe);
+
+        // ---- 引擎线程 ----
+        let engine_thread = {
+            let engine_broadcaster = broadcaster.clone();
+            let mut engine = engine;
+            let mut clip_write = write_clip.take();
+            std::thread::Builder::new()
+                .name("cx-engine".to_string())
+                .spawn(move || {
+                    loop {
+                        let Ok(message) = engine_rx.recv() else {
+                            break;
+                        };
+                        match message {
+                            EngineMsg::Event(event) => {
+                                let actions = engine.handle(cx_core::now_ms(), event);
+                                let mut runner = ActionRunner {
+                                    engine: &mut engine,
+                                    clip: &mut clip_write,
+                                    broadcaster: &engine_broadcaster,
+                                };
+                                let _ = runner.run_all(actions);
+                            }
+                            EngineMsg::Request { command, reply } => {
+                                let actions =
+                                    engine.handle(cx_core::now_ms(), EngineEvent::Command(command));
+                                let mut runner = ActionRunner {
+                                    engine: &mut engine,
+                                    clip: &mut clip_write,
+                                    broadcaster: &engine_broadcaster,
+                                };
+                                let payloads = runner.run_all(actions);
+                                for payload in payloads {
+                                    let _ = reply.send(payload);
+                                }
+                            }
+                            EngineMsg::Shutdown(ack) => {
+                                if let Err(err) = engine.flush_state() {
+                                    log::warn!("退出前状态落盘失败：{err}");
+                                }
+                                let _ = ack.send(());
+                                break;
+                            }
+                        }
+                    }
+                    log::debug!("引擎线程已停止");
+                })
+                .map_err(DaemonError::io)?
+        };
+
+        // ---- 监听线程 ----
+        let watcher_shutdown = Arc::new(AtomicBool::new(false));
+        let watcher_thread = match (read_clip.take(), self.options.no_clipboard) {
+            (Some(mut clip), false) => {
+                let tx = engine_tx.clone();
+                let flag = watcher_shutdown.clone();
+                let interval = Duration::from_millis(
+                    self.options
+                        .poll_interval_ms
+                        .unwrap_or(self.config.sync.watch_interval_ms),
+                );
+                let debounce = Duration::from_millis(self.config.sync.debounce_ms);
+                Some(
+                    std::thread::Builder::new()
+                        .name("cx-watcher".to_string())
+                        .spawn(move || {
+                            // 预热：记录当前剪贴板内容但不发布
+                            match clip.read() {
+                                Ok(content) => {
+                                    let _ = tx.send(EngineMsg::Event(EngineEvent::Prime(content)));
+                                }
+                                Err(err) => log::warn!("启动时读取剪贴板失败：{err}"),
+                            }
+
+                            loop {
+                                if flag.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                // 有平台事件就立刻醒，否则等一个轮询间隔（兜底）
+                                let notified = match &notifier {
+                                    Some(notifier) => notifier.wait(interval),
+                                    None => {
+                                        std::thread::sleep(interval);
+                                        false
+                                    }
+                                };
+
+                                let mut content = match clip.read() {
+                                    Ok(content) => content,
+                                    Err(err) => {
+                                        log::debug!("读取剪贴板失败（{err}），等待下次机会");
+                                        continue;
+                                    }
+                                };
+
+                                // 复制动作往往连续触发事件：等去抖时间后再取一次最终内容
+                                if notified && !debounce.is_zero() {
+                                    std::thread::sleep(debounce);
+                                    match clip.read() {
+                                        Ok(again) => content = again,
+                                        Err(err) => log::debug!("去抖后重读失败：{err}"),
+                                    }
+                                }
+
+                                if tx
+                                    .send(EngineMsg::Event(EngineEvent::ClipboardChanged(content)))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            log::debug!("监听线程已停止");
+                        })
+                        .map_err(DaemonError::io)?,
+                )
+            }
+            _ => None,
+        };
+
+        // ---- 等退出信号 ----
+        let _ = shutdown_rx.recv();
+        log::info!("收到退出信号，开始收尾");
+        server_shutdown.store(true, Ordering::Relaxed);
+        watcher_shutdown.store(true, Ordering::Relaxed);
+        // 监听线程最多等一个轮询间隔就会看到标志并退出，随后由它自己 Drop 掉通知器
+
+        let (ack_tx, ack_rx) = bounded::<()>(1);
+        let _ = engine_tx.send(EngineMsg::Shutdown(ack_tx));
+        if ack_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            log::warn!("引擎未在 5 秒内确认退出，继续收尾");
+        }
+
+        broadcaster.send(ControlEvent::new(events::SHUTTING_DOWN, json!({})));
+        let _ = engine_thread.join();
+        if let Some(thread) = watcher_thread {
+            let _ = thread.join();
+        }
+        let _ = server_thread.join();
+        DaemonInfo::remove(&paths);
+        log::info!("已停止");
+        Ok(0)
+    }
+}
+
+/// 动作执行器：把引擎输出的动作落成实际副作用。
+///
+/// 单独抽成结构体（而不是内联闭包或宏）有两个原因：
+/// 1. `RecheckClipboard` 需要回头**再驱动一次引擎**，宏展开会直接撞上递归限制；
+/// 2. 显式传入 `depth` 上限，比"祈祷不会形成环"可靠（例如 pause/resume 与
+///    push 交错时有可能连续重读）。
+struct ActionRunner<'a> {
+    engine: &'a mut Engine,
+    clip: &'a mut Option<SystemClipboard>,
+    broadcaster: &'a Broadcaster,
+}
+
+/// 重读剪贴板的最大嵌套深度。
+const MAX_RECHECK_DEPTH: u32 = 3;
+
+impl ActionRunner<'_> {
+    /// 执行一批动作，返回其中需要回给客户端响应（`Reply`）。
+    fn run_all(&mut self, actions: Vec<Action>) -> Vec<ReplyPayload> {
+        let mut replies = Vec::new();
+        for action in actions {
+            if let Some(payload) = self.run(action, 0) {
+                replies.push(payload);
+            }
+        }
+        replies
+    }
+
+    fn run(&mut self, action: Action, depth: u32) -> Option<ReplyPayload> {
+        match action {
+            Action::ApplyToClipboard(content) => {
+                match self.clip.as_mut() {
+                    Some(clip) => match clip.write(&content) {
+                        Ok(()) => log::debug!("已把内容写入剪贴板（{}）", content.describe()),
+                        Err(err) => log::warn!("写入剪贴板失败：{err}"),
+                    },
+                    None => log::debug!("纯中继模式：跳过写入剪贴板（{}）", content.describe()),
+                }
+                None
+            }
+            Action::Publish { name, bytes } => {
+
+                log::info!(
+                    "已生成对象 {name}（{} 字节）；当前没有启用后端",
+                    bytes.len()
+                );
+                None
+            }
+            Action::Reply(payload) => Some(payload),
+            Action::Notify(event) => {
+                self.broadcaster.send(event);
+                None
+            }
+            Action::PollNow => {
+
+                None
+            }
+            Action::RecheckClipboard => {
+                self.recheck(depth);
+                None
+            }
+            Action::SaveState => {
+                if let Err(err) = self.engine.flush_state() {
+                    log::warn!("状态落盘失败：{err}");
+                }
+                None
+            }
+            Action::Log { level, message } => {
+                logging::log_line(level, &message);
+                None
+            }
+        }
+    }
+
+    /// 重新读取剪贴板并送回引擎（`resume` / `push` 用）。
+    fn recheck(&mut self, depth: u32) {
+        if depth >= MAX_RECHECK_DEPTH {
+            log::debug!("重读剪贴板达到深度上限，停止");
+            return;
+        }
+        let Some(clip) = self.clip.as_mut() else {
+            return;
+        };
+        match clip.read() {
+            Ok(content) => {
+                let actions = self
+                    .engine
+                    .handle(cx_core::now_ms(), EngineEvent::ClipboardChanged(content));
+                for action in actions {
+                    // 重读触发的动作不应再产生响应（没有客户端在等）
+                    let _ = self.run(action, depth + 1);
+                }
+            }
+            Err(err) => log::debug!("重读剪贴板失败：{err}"),
+        }
+    }
+}
+
+/// 把请求翻译成引擎命令。
+fn to_command(
+    request: &Request,
+    meta: &SharedMeta,
+    paths: &Paths,
+) -> Result<EngineCommand, String> {
+    let id = request.id;
+    match request.cmd.as_str() {
+        commands::STATUS => Ok(EngineCommand::Status { id }),
+        commands::PAUSE => Ok(EngineCommand::Pause { id }),
+        commands::RESUME => Ok(EngineCommand::Resume { id }),
+        commands::HISTORY_LIST => Ok(EngineCommand::HistoryList {
+            id,
+            limit: request.arg_u64("limit").unwrap_or(20).min(10_000) as usize,
+        }),
+        commands::HISTORY_SHOW => Ok(EngineCommand::HistoryShow {
+            id,
+            position: request.arg_u64("position").unwrap_or(0) as usize,
+            max_chars: request.arg_u64("max_chars").unwrap_or(2_000).min(1_000_000) as usize,
+        }),
+        commands::COPY => {
+            let position = request
+                .arg_u64("position")
+                .ok_or_else(|| "copy 需要 position 参数".to_string())?;
+            Ok(EngineCommand::Copy {
+                id,
+                position: position as usize,
+            })
+        }
+        commands::PUSH => {
+            let content = match request.arg_str("text") {
+                Some(text) => {
+                    if text.len() as u64 > meta.max_item_bytes {
+                        return Err(format!(
+                            "内容 {} 字节超过上限 {} 字节",
+                            text.len(),
+                            meta.max_item_bytes
+                        ));
+                    }
+                    Some(ClipContent::Text(text.to_string()))
+                }
+                None => None,
+            };
+            Ok(EngineCommand::Push {
+                id,
+                content,
+                force: request.arg_bool("force").unwrap_or(false),
+            })
+        }
+        commands::PULL => Ok(EngineCommand::Pull { id }),
+        commands::DOCTOR => Ok(EngineCommand::Doctor { id }),
+        commands::RELOAD => {
+            let config = Config::load(paths).map_err(|err| err.to_string())?;
+            Ok(EngineCommand::Reload {
+                id,
+                config: Box::new(config),
+            })
+        }
+        other => Err(format!("未知命令：{other}")),
+    }
+}
+
+/// 把类型化响应转成线协议响应，并补齐守护进程才知道的字段。
+fn payload_to_reply(payload: ReplyPayload, meta: &SharedMeta) -> Reply {
+    match payload {
+        ReplyPayload::Status { id, mut report } => {
+            report.pid = meta.pid;
+            report.started_ms = meta.started_ms;
+            report.version = meta.version.clone();
+            report.clipboard = meta.clipboard.clone();
+            report.watch = meta.watch.clone();
+            report.no_clipboard = meta.no_clipboard;
+            Reply::ok(id, to_value(&*report))
+        }
+        ReplyPayload::HistoryList { id, items } => Reply::ok(id, to_value(&items)),
+        ReplyPayload::HistoryShow { id, preview } => Reply::ok(id, to_value(&*preview)),
+        ReplyPayload::Doctor { id, mut report } => {
+            report.checks.push(DoctorCheck {
+                name: "剪贴板".to_string(),
+                ok: !meta.no_clipboard,
+                detail: meta.clipboard.clone(),
+            });
+            report.checks.push(DoctorCheck {
+                name: "监听方式".to_string(),
+                ok: !meta.no_clipboard,
+                detail: meta.watch.clone(),
+            });
+            Reply::ok(id, to_value(&*report))
+        }
+        ReplyPayload::Done { id } => Reply::done(id),
+        ReplyPayload::Error { id, body } => Reply {
+            id,
+            ok: false,
+            data: None,
+            error: Some(body),
+        },
+    }
+}
+
+fn to_value<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+/// 后台挂载：把守护进程从当前终端分离出去。
+///
+/// **关键约束（Windows）**：必须用 `bInheritHandles = FALSE` 创建进程。
+/// Rust 标准库的 `Command` 一律允许句柄继承，于是守护进程会拿到调用方
+/// （shell 脚本、CI runner）的 stdout 管道/重定向文件句柄；只要守护进程活着，
+/// 那个管道就不会关闭，脚本与 CI 步骤就会一直挂住。实测三种写法全部复现：
+/// `cx start`、`cx start *> file`、甚至 `Start-Process -Wait`。
+/// 因此 Windows 下直接用 `CreateProcessW` 且不继承任何句柄。
+///
+/// - Windows：`CreateProcessW(bInheritHandles = FALSE, CREATE_NO_WINDOW)`
+/// - Unix：`setsid` 新建会话（fd 由调用方的 CLOEXEC 语义保证不被带过去），
+///   没有 `setsid` 时退化为新建进程组。
+pub fn spawn_background(paths: &Paths, no_clipboard: bool) -> Result<u32, DaemonError> {
+    // 已经有实例在跑就直接返回它
+    if let Some(info) = DaemonInfo::load(paths)
+        && info.is_alive()
+    {
+        return Ok(info.pid);
+    }
+
+    let exe = std::env::current_exe().map_err(DaemonError::io)?;
+    let mut args = vec!["daemon".to_string(), "--foreground".to_string()];
+    if no_clipboard {
+        args.push("--no-clipboard".to_string());
+    }
+    // 后台进程的 stderr 不可靠（可能被断开），日志统一写文件
+    args.push("--quiet".to_string());
+
+    #[cfg(windows)]
+    {
+        spawn_detached_windows(&exe, &args)?;
+    }
+
+    #[cfg(unix)]
+    {
+        spawn_detached_unix(&exe, &args)?;
+    }
+
+    wait_for_daemon(paths)
+}
+
+/// Windows：不继承任何句柄地创建分离进程。
+#[cfg(windows)]
+fn spawn_detached_windows(exe: &std::path::Path, args: &[String]) -> Result<(), DaemonError> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+
+    // 命令行需要自带 argv[0]，且路径含空格时必须加引号
+    let mut command_line = format!("\"{}\"", exe.display());
+    for arg in args {
+        // 我们的参数都是固定的 ASCII 开关，不会含空格
+        command_line.push(' ');
+        command_line.push_str(arg);
+    }
+    let mut command_line: Vec<u16> = OsStr::new(&command_line)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // SAFETY: 传入的都是本函数内有效且可写的缓冲区；command_line 以 NUL 结尾；
+    // 句柄不可继承（bInheritHandles = FALSE）正是本函数的目的。
+    let created = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // bInheritHandles = FALSE
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut info,
+        )
+    };
+
+    if created == 0 {
+        return Err(DaemonError::Detach(format!(
+            "CreateProcessW 失败：{}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // SAFETY: CreateProcessW 成功时这两个句柄由调用方负责关闭
+    unsafe {
+        CloseHandle(info.hThread);
+        CloseHandle(info.hProcess);
+    }
+    Ok(())
+}
+
+/// Unix：用 `setsid` 脱离会话；没有它时退化为新建进程组。
+#[cfg(unix)]
+fn spawn_detached_unix(exe: &std::path::Path, args: &[String]) -> Result<(), DaemonError> {
+    use std::process::{Command, Stdio};
+
+    // 优先 setsid（新会话，完全脱离控制终端）
+    if std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("setsid").is_file()))
+        .unwrap_or(false)
+    {
+        let mut command = Command::new("setsid");
+        command.arg(exe);
+        command.args(args);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.spawn().map_err(DaemonError::io)?;
+        return Ok(());
+    }
+
+    let mut command = Command::new(exe);
+    command.args(args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn().map_err(DaemonError::io)?;
+    Ok(())
+}
+
+/// 等 daemon.json 出现（最多 10 秒）。
+fn wait_for_daemon(paths: &Paths) -> Result<u32, DaemonError> {
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Some(info) = DaemonInfo::load(paths)
+            && info.is_alive()
+        {
+            return Ok(info.pid);
+        }
+    }
+    Err(DaemonError::Detach(
+        "后台进程未在 10 秒内就绪，请查看日志".to_string(),
+    ))
+}
+
+/// 便捷：让正在运行的守护进程退出并等待其消失。
+pub fn stop_running(paths: &Paths) -> Result<bool, DaemonError> {
+    let Some(info) = DaemonInfo::load(paths) else {
+        return Ok(false);
+    };
+    if !info.is_alive() {
+        DaemonInfo::remove(paths);
+        return Ok(false);
+    }
+
+    // 用控制套接字发退出命令；失败则清掉 stale 元信息
+    match crate::control::send_one_way(paths, commands::SHUTDOWN) {
+        Ok(()) => {}
+        Err(err) => {
+            log::warn!("发送退出命令失败：{err}");
+            DaemonInfo::remove(paths);
+            return Ok(false);
+        }
+    }
+
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if !DaemonInfo::load(paths)
+            .map(|info| info.is_alive())
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(true)
+}
+
+/// 自启注册（供 `cx service install` 使用）。
+pub fn install_autostart(paths: &Paths) -> Result<String, DaemonError> {
+    service::install(paths)
+}
+
+/// 取消自启。
+pub fn uninstall_autostart(paths: &Paths) -> Result<String, DaemonError> {
+    service::uninstall(paths)
+}
+
+/// 查询自启状态。
+pub fn autostart_status() -> String {
+    service::status()
+}
+
+/// 读取运行时状态里的 pid（若在运行）。
+pub fn running_pid(paths: &Paths) -> Option<u32> {
+    let info = DaemonInfo::load(paths)?;
+    if info.is_alive() {
+        Some(info.pid)
+    } else {
+        None
+    }
+}
+
+/// 未使用但保留：把接收端暴露给 TUI 的将来版本（订阅由控制层代理）。
+#[allow(dead_code)]
+fn _unused(_rx: Receiver<ControlEvent>) {}

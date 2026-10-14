@@ -44,6 +44,10 @@ pub enum CoreError {
     #[error(transparent)]
     Crypto(#[from] cx_crypto::CryptoError),
 
+    /// 剪贴板层错误（以字符串透传，避免 `cx-core` 反向依赖具体剪贴板实现）。
+    #[error("剪贴板错误：{0}")]
+    Clip(String),
+
     /// 协议编解码失败。
     #[error(transparent)]
     Proto(#[from] cx_proto::ProtoError),

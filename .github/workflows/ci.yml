@@ -63,6 +63,28 @@ jobs:
           done
           [ "$found" = 1 ] || { echo "::error::未找到构建产物"; exit 1; }
 
+  e2e:
+    name: 端到端（守护进程 + CLI）${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 用 --no-clipboard 在无桌面环境里跑完整链路：
+      # cx start（分离进程）→ start/stop/status/history/push/pause/resume/doctor/reload
+
+      - name: 端到端脚本（无头模式）
+        shell: pwsh
+        run: ./scripts/e2e-local.ps1 -NoClipboard
+
   msi:
     name: Windows MSI 构建与安装验收
     runs-on: windows-latest

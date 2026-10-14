@@ -5,16 +5,22 @@
 //! - [`item`]：不可变内容对象 `v1/items/<day>/<ts>-<dev8>-<hash8>.cxi` 的容器格式；
 //! - [`manifest`]：每个设备自己的变更清单 `v1/manifests/<device_id>.json`；
 //! - [`name`]：对象命名规则（不可变、可排序、同时充当加密 AAD）；
-//! - [`civil`]：毫秒时间戳与日期目录之间的换算（不依赖 chrono）。
+//! - [`civil`]：毫秒时间戳与日期目录之间的换算（不依赖 chrono）；
+//! - [`control`]：本机控制套接字的 JSON Lines 协议（CLI/TUI ↔ 守护进程）。
 //!
 //! 所有解码入口都必须满足：**任意输入返回 `Err` 而不是 panic**。
 
 pub mod civil;
+pub mod control;
 pub mod error;
 pub mod item;
 pub mod manifest;
 pub mod name;
 
+pub use control::{
+    BackendStateView, BackendStatus, CONTROL_PROTOCOL_VERSION, DoctorCheck, DoctorReport, Event,
+    HistoryPreview, HistorySummary, Reply, Request, StatusReport, cmd, errcode, event,
+};
 pub use error::ProtoError;
 pub use item::{
     CONTAINER_VERSION, Cipher, HASH_LEN, ID_LEN, Item, ItemMeta, Kind, MAGIC, NONCE_LEN, TAG_LEN,
