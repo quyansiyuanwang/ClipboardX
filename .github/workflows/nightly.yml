@@ -45,7 +45,11 @@ jobs:
           doy="$(date -u +%j | sed 's/^0*//')"
           base="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           major_minor="$(echo "$base" | cut -d. -f1,2)"
-          version="$major_minor.$doy"
+          # 第四段用提交数：同一天可能构建多次（手动触发），只用日期会让两次构建
+          # 拿到同一个版本号、内容却不同——安装包版本必须能区分。MSI 允许 4 段数字
+          # （每段 ≤ 65535），pkg 与 deb 也接受。
+          commits="$(git rev-list --count HEAD)"
+          version="$major_minor.$doy.$commits"
           sha="$(git rev-parse --short HEAD)"
 
           # 定时任务在"最近 24 小时没有任何提交"时跳过：那种情况下打出来的包和昨天
@@ -186,7 +190,7 @@ jobs:
 
           - 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')
           - 来源提交：${{ needs.prepare.outputs.sha }}
-          - 包版本：${{ needs.prepare.outputs.version }}（nightly 用 0.1.<一年中的第几天>，
+          - 包版本：${{ needs.prepare.outputs.version }}（nightly 用 0.1.<一年中的第几天>.<提交数>，
             按天递增，便于"今天的覆盖昨天的"这种升级测试；它大于正式版 0.1.0，
             因此从 nightly 装回正式版时 apt 会提示降级，这是预期的）
 
