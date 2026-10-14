@@ -13,6 +13,7 @@
 //!   都会平移，按位置缓存会张冠李戴。对象名是稳定的。
 
 use crate::client::UiEvent;
+use crate::wizard::{BackendDraft, Focus, Wizard};
 use cx_proto::control::{DoctorReport, HistoryPreview, HistorySummary, StatusReport};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,6 +45,8 @@ pub enum KeyOutcome {
     Doctor,
     /// 删除一条本机历史（位置 0 = 最新）。
     Delete(usize),
+    /// 表单填完了：交给命令层去落盘与自测。
+    AddBackend(Box<BackendDraft>),
 }
 
 /// 一条提示信息。
@@ -140,6 +143,8 @@ pub struct App {
     pub show_help: bool,
     /// 是否显示"后端与连接"面板。
     pub show_panel: bool,
+    /// 添加后端的表单（Some 表示正在填）。
+    pub wizard: Option<Wizard>,
     /// 面板的滚动偏移（面板里有配置引导，小终端放不下）。
     panel_scroll: u16,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
@@ -508,6 +513,106 @@ impl App {
             return KeyOutcome::None;
         }
 
+        // 表单态：键盘全部交给表单（否则打字会触发退出/复制等命令）
+        if self.wizard.is_some() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let outcome = match key.code {
+                KeyCode::Esc => {
+                    self.wizard = None;
+                    self.note("已取消，未做任何改动");
+                    KeyOutcome::None
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.focus_next();
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.focus_prev();
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Left => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        if form.focused_field().is_some() {
+                            form.backspace();
+                        } else {
+                            form.kind_left();
+                        }
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Right => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.kind_right();
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Backspace => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.backspace();
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Char('y') if ctrl => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.fill_sample();
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Char('l') if ctrl => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.clear_field();
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Char(ch) if !ctrl => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.push_char(ch);
+                    }
+                    KeyOutcome::None
+                }
+                // 回车：在 [保存] 上或任意字段上提交
+                KeyCode::Enter => {
+                    let submit = self
+                        .wizard
+                        .as_mut()
+                        .map(|form| form.submit())
+                        .unwrap_or(Err(Vec::new()));
+                    match submit {
+                        Ok(draft) => {
+                            self.wizard = None;
+                            KeyOutcome::AddBackend(Box::new(draft))
+                        }
+                        Err(_) => KeyOutcome::None,
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        match form.focus() {
+                            Focus::Save => {
+                                let submit = form.submit();
+                                if let Ok(draft) = submit {
+                                    self.wizard = None;
+                                    return KeyOutcome::AddBackend(Box::new(draft));
+                                }
+                            }
+                            Focus::Cancel => {
+                                self.wizard = None;
+                                self.note("已取消，未做任何改动");
+                            }
+                            _ => form.push_char(' '),
+                        }
+                    }
+                    KeyOutcome::None
+                }
+                _ => KeyOutcome::None,
+            };
+            return outcome;
+        }
+
         // 删除确认：只有 y/回车 才真的删，其他任何键都取消
         if let Some(position) = self.pending_delete {
             self.pending_delete = None;
@@ -594,6 +699,10 @@ impl App {
             }
             KeyCode::Char('?') | KeyCode::Char('h') => {
                 self.show_help = true;
+                KeyOutcome::None
+            }
+            KeyCode::Char('a') => {
+                self.wizard = Some(Wizard::new());
                 KeyOutcome::None
             }
             KeyCode::Char('b') => {
