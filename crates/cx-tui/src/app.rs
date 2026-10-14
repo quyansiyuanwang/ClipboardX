@@ -153,8 +153,7 @@ impl App {
     fn clamp(&mut self) {
         if self.items.is_empty() {
             self.cursor = 0;
-        }
-        else if self.cursor >= self.items.len() {
+        } else if self.cursor >= self.items.len() {
             self.cursor = self.items.len() - 1;
         }
     }
@@ -204,11 +203,14 @@ impl App {
                 }
             },
             KeyCode::Char(' ') => {
-                let paused = self.status.as_ref().map(|status| status.paused).unwrap_or(false);
+                let paused = self
+                    .status
+                    .as_ref()
+                    .map(|status| status.paused)
+                    .unwrap_or(false);
                 if paused {
                     KeyOutcome::Resume
-                }
-                else {
+                } else {
                     KeyOutcome::Pause
                 }
             }
@@ -224,11 +226,14 @@ impl App {
         match &self.status {
             None => "未连接守护进程".to_string(),
             Some(status) => {
-                let state = if status.paused { "已暂停" } else { "同步中" };
+                let state = if status.paused {
+                    "已暂停"
+                } else {
+                    "同步中"
+                };
                 let space = if status.encrypted {
                     status.space_id.as_deref().unwrap_or("-").to_string()
-                }
-                else {
+                } else {
                     "未加密".to_string()
                 };
                 format!(
@@ -351,7 +356,11 @@ mod tests {
 
         assert_eq!(app.on_key(key(KeyCode::Char('?'))), KeyOutcome::None);
         assert!(app.show_help);
-        assert_eq!(app.on_key(key(KeyCode::Char('q'))), KeyOutcome::Quit, "帮助页里 q 应直接退出");
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('q'))),
+            KeyOutcome::Quit,
+            "帮助页里 q 应直接退出"
+        );
     }
 
     #[test]

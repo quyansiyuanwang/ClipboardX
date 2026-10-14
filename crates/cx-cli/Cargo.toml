@@ -13,6 +13,7 @@ cx-core.workspace = true
 cx-daemon.workspace = true
 cx-proto.workspace = true
 cx-sync.workspace = true
+cx-tui.workspace = true
 clap.workspace = true
 log.workspace = true
 serde.workspace = true

@@ -40,8 +40,9 @@ pub fn run(paths: &Paths) -> Result<(), TuiError> {
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
 
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-        .map_err(|err| TuiError::Io(format!("无法初始化终端：{err}")))?;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+            .map_err(|err| TuiError::Io(format!("无法初始化终端：{err}")))?;
     enable_raw_mode().map_err(|err| TuiError::Io(format!("无法进入 raw 模式：{err}")))?;
     let mut stdout = std::io::stdout();
     let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
@@ -49,7 +50,11 @@ pub fn run(paths: &Paths) -> Result<(), TuiError> {
     let result = run_loop(&mut terminal, paths);
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let _ = terminal.show_cursor();
     result
 }
@@ -61,7 +66,7 @@ fn run_loop(
     use crossterm::event::{self, Event as TermEvent, KeyEventKind};
 
     let mut app = App::new();
-    let mut client = DaemonClient::start(paths.clone());
+    let client = DaemonClient::start(paths.clone());
     app.note("正在连接守护进程…");
 
     let tick = Duration::from_millis(DEFAULT_REDRAW_MS);
@@ -87,8 +92,10 @@ fn run_loop(
             .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
 
         // 4) 等键盘（最多等一个刷新间隔）
-        if event::poll(tick).map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))? {
-            let event = event::read().map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))?;
+        if event::poll(tick).map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))?
+        {
+            let event =
+                event::read().map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))?;
             if let TermEvent::Key(key) = event {
                 // Windows 上按键会同时报 Press 与 Release，只处理按下
                 if key.kind != KeyEventKind::Press {
@@ -125,7 +132,7 @@ fn run_loop(
 /// 这是"TUI 到底读到了什么"的可验证出口：真实连接守护进程，取状态与历史，
 /// 画一帧，然后把画面里的文字按行打印出来。
 pub fn snapshot(paths: &Paths, width: u16, height: u16) -> Result<String, TuiError> {
-    let mut client = DaemonClient::start(paths.clone());
+    let client = DaemonClient::start(paths.clone());
     let mut app = App::new();
     client.request_status();
     client.request_history(HISTORY_LIMIT);
@@ -196,11 +203,9 @@ pub fn print_snapshot(paths: &Paths) -> Result<(), TuiError> {
 pub fn preview_kind(preview: &HistoryPreview) -> &'static str {
     if preview.text.is_some() {
         "文本"
-    }
-    else if preview.image.is_some() {
+    } else if preview.image.is_some() {
         "图片"
-    }
-    else {
+    } else {
         "未知"
     }
 }

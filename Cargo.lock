@@ -539,6 +539,7 @@ dependencies = [
  "cx-daemon",
  "cx-proto",
  "cx-sync",
+ "cx-tui",
  "log",
  "serde",
  "serde_json",

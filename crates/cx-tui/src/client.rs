@@ -8,12 +8,10 @@
 //! 混在一条连接上会让"读事件"与"读响应"互相抢数据（都是 JSON Lines），
 //! 分成两条之后语义清晰，退出时也各自关闭。
 
-use crate::app::App;
-use crate::error::TuiError;
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use cx_core::Paths;
 use cx_daemon::ControlClient;
 use cx_proto::control::{HistoryPreview, HistorySummary, StatusReport, cmd as commands};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use serde_json::{Map, json};
 use std::time::{Duration, Instant};
 
@@ -161,11 +159,8 @@ fn worker(
     spawn_event_pump(paths.clone(), request_tx.clone());
 
     let mut last_refresh = Instant::now() - Duration::from_secs(1);
-    loop {
-        let request = match requests.recv() {
-            Ok(request) => request,
-            Err(_) => break,
-        };
+    // 通道关闭（界面退出）时循环自然结束
+    while let Ok(request) = requests.recv() {
         match request {
             Request::Stop => break,
             Request::Status => match client.simple(commands::STATUS) {
@@ -238,7 +233,8 @@ fn worker(
                 args.insert("position".to_string(), json!(position));
                 match client.request(commands::COPY, args) {
                     Ok(_) => {
-                        let _ = events.send(UiEvent::Info(format!("已把第 {position} 条写回剪贴板")));
+                        let _ =
+                            events.send(UiEvent::Info(format!("已把第 {position} 条写回剪贴板")));
                     }
                     Err(err) => {
                         let _ = events.send(UiEvent::Failure {
@@ -323,7 +319,6 @@ fn spawn_event_pump(paths: Paths, request_tx: Sender<Request>) {
         })
         .ok();
 }
-
 
 #[cfg(test)]
 mod tests {

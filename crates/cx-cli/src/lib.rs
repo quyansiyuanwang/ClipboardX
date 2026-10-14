@@ -12,7 +12,9 @@ mod commands;
 mod doctor;
 mod output;
 
-pub use commands::{Command, ConfigCommand, ServiceCommand, SpaceCommand, TuiFallback};
+pub use commands::{
+    BackendAddCommand, BackendCommand, Command, ConfigCommand, ServiceCommand, SpaceCommand,
+};
 
 use cx_core::{CoreError, Paths};
 use cx_daemon::DaemonError;

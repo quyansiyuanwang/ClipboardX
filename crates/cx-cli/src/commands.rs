@@ -8,10 +8,6 @@ use cx_proto::control::cmd as commands;
 use serde_json::{Map, json};
 use std::process::ExitCode;
 
-
-#[derive(Debug, Clone, Copy)]
-pub struct TuiFallback;
-
 /// 顶层子命令。
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
@@ -154,7 +150,11 @@ pub enum Command {
     },
 
     /// 打开终端界面
-    Tui,
+    Tui {
+        /// 只渲染一帧到标准输出后退出（不需要终端；给脚本与 CI 验证用）
+        #[arg(long)]
+        snapshot: bool,
+    },
 }
 
 /// `cx config` 的子命令。
@@ -596,11 +596,16 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             }
         },
 
-        Command::Tui => {
-            let _ = TuiFallback;
-
-            eprintln!("在此之前可以用：cx status / cx history / cx show / cx copy");
-            Ok(ExitCode::from(2))
+        Command::Tui { snapshot } => {
+            if snapshot {
+                // 不需要终端：渲染一帧到 stdout 就退出（脚本与 CI 用它验证界面读到了什么）
+                cx_tui::print_snapshot(paths)
+                    .map_err(|err| DaemonError::Protocol(format!("渲染快照失败：{err}")))?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            cx_tui::run(paths)
+                .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?;
+            Ok(ExitCode::SUCCESS)
         }
     }
 }

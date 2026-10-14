@@ -33,7 +33,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = Line::from(vec![
-        Span::styled(" ClipboardX ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ClipboardX ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::styled("（终端界面）", Style::default().fg(Color::DarkGray)),
     ]);
     let state = app.status_line();
@@ -48,8 +51,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             format!(" {}", notice.text),
             if notice.is_error {
                 Style::default().fg(Color::Red)
-            }
-            else {
+            } else {
                 Style::default().fg(Color::Cyan)
             },
         )));
@@ -73,7 +75,11 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .items
         .iter()
         .map(|item| {
-            let marker = if item.origin == "remote" { "↓" } else { "↑" };
+            let marker = if item.origin == "remote" {
+                "↓"
+            } else {
+                "↑"
+            };
             let text = format!(
                 "{} #{} {} {} {}",
                 marker,
@@ -109,15 +115,14 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
         None => " 内容预览 ".to_string(),
     };
     let text = match (&app.preview, &app.preview_error) {
-        (_, Some(err)) => Text::from(vec![
-            Line::from(Span::styled(
-                format!("读取预览失败：{err}"),
-                Style::default().fg(Color::Red),
-            )),
-        ]),
-        (None, None) => Text::from(vec![
-            Line::from(Span::styled("（正在读取…）", Style::default().fg(Color::DarkGray))),
-        ]),
+        (_, Some(err)) => Text::from(vec![Line::from(Span::styled(
+            format!("读取预览失败：{err}"),
+            Style::default().fg(Color::Red),
+        ))]),
+        (None, None) => Text::from(vec![Line::from(Span::styled(
+            "（正在读取…）",
+            Style::default().fg(Color::DarkGray),
+        ))]),
         (Some(preview), None) => {
             let mut lines = Vec::new();
             lines.push(Line::from(vec![
@@ -139,8 +144,7 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-            }
-            else if preview.image.is_some() {
+            } else if preview.image.is_some() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "这是一张图片。终端里不渲染图片，按回车即可写回剪贴板。",
@@ -160,8 +164,7 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let hint = if app.show_help {
         " 任意键返回　q 退出 "
-    }
-    else {
+    } else {
         " ↑↓/jk 选择　回车 写回剪贴板　空格 暂停/恢复　p 发布　r 刷新　R 重载配置　? 帮助　q 退出 "
     };
     frame.render_widget(
@@ -177,7 +180,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 60, 60);
     frame.render_widget(Clear, popup);
     let lines = vec![
-        Line::from(Span::styled("快捷键", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "快捷键",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from("  ↑ / k        上移"),
         Line::from("  ↓ / j        下移"),
@@ -244,11 +250,9 @@ fn human_time(ms: u64) -> String {
 fn human_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
-    }
-    else if bytes < 1024 * 1024 {
+    } else if bytes < 1024 * 1024 {
         format!("{:.1} KB", bytes as f64 / 1024.0)
-    }
-    else {
+    } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
