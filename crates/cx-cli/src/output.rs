@@ -110,9 +110,14 @@ pub fn status(data: &Value, json: bool) -> Result<ExitCode, cx_daemon::DaemonErr
             } else {
                 "待首次同步".to_string()
             };
+            // 标识（地址 / 桶 @ 端点 / 空间）：配了多个同类后端时靠它区分谁是谁
+            let target = match &backend.detail {
+                Some(detail) if !detail.is_empty() => format!("  {detail}"),
+                _ => String::new(),
+            };
             println!(
-                "  - {:<12} {:<7} {}；发送 {} / 接收 {}",
-                backend.name, backend.kind, state, backend.published, backend.applied
+                "  - {:<12} {:<7} {}{}；发送 {} / 接收 {}",
+                backend.name, backend.kind, state, target, backend.published, backend.applied
             );
         }
     }
