@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ClipboardX
+Name[zh_CN]=ClipboardX 剪贴板同步
+GenericName=Clipboard Sync
+GenericName[zh_CN]=剪贴板同步
+Comment=查看与管理跨设备剪贴板同步
+Comment[en]=View and manage cross-device clipboard sync
+Exec=cx tui
+Terminal=true
+Categories=Utility;
+Keywords=clipboard;sync;paste;剪贴板;
+StartupNotify=false

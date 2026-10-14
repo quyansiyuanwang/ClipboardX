@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cx-core",
+    "crates/cx-proto",
+    "crates/cx-crypto",
+    "crates/cx-backend",
+    "crates/cx-sync",
+    "crates/cx-clip",
+    "crates/cx-daemon",
+    "crates/cx-cli",
+    "crates/cx-tui",
+    "crates/cx-server",
+    "bin/cx",
+    "bin/cx-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+authors = ["ClipboardX contributors"]
+description = "极度轻量的三端剪贴板同步工具（守护进程 + TUI + 自建服务端 + WebDAV/S3 后端）"
+repository = "https://github.com/quyansiyuanwang/ClipboardX"
+
+[workspace.dependencies]
+# 第三方
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+directories = "6.0"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+# 内部 crate
+cx-backend = { path = "crates/cx-backend" }
+cx-cli = { path = "crates/cx-cli" }
+cx-clip = { path = "crates/cx-clip" }
+cx-core = { path = "crates/cx-core" }
+cx-crypto = { path = "crates/cx-crypto" }
+cx-daemon = { path = "crates/cx-daemon" }
+cx-proto = { path = "crates/cx-proto" }
+cx-server = { path = "crates/cx-server" }
+cx-sync = { path = "crates/cx-sync" }
+cx-tui = { path = "crates/cx-tui" }
+
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false

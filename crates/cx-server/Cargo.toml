@@ -1,0 +1,11 @@
+[package]
+name = "cx-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 可自建同步服务端：空间/设备令牌、对象存储、长轮询、配额与保留策略"
+
+[dependencies]
+cx-core.workspace = true
+clap.workspace = true

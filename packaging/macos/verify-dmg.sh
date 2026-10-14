@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# 在 macOS 上校验 DMG：挂载 -> 安装 pkg -> 断言 -> 卸载 -> 卸载挂载点
+#
+# 用法：sudo bash packaging/macos/verify-dmg.sh dist/ClipboardX-0.1.0-universal.dmg
+#
+# 说明：CI 的 macOS runner 是无图形会话的，所以这里只能验证「安装 + 二进制可运行 +
+
+set -euo pipefail
+
+DMG="${1:?用法: verify-dmg.sh <dmg 路径>}"
+DMG="$(cd "$(dirname "$DMG")" && pwd)/$(basename "$DMG")"
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "错误：本脚本只能在 macOS 上运行" >&2
+  exit 1
+fi
+if [ "$(id -u)" != "0" ]; then
+  echo "错误：需要 root（sudo）来执行 installer 与 launchctl 校验" >&2
+  exit 1
+fi
+
+MOUNT_POINT="$(mktemp -d)"
+fail() { echo "断言失败：$1" >&2; exit 1; }
+
+cleanup() {
+  hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true
+  rmdir "$MOUNT_POINT" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+echo "==> 挂载 $DMG"
+hdiutil attach "$DMG" -mountpoint "$MOUNT_POINT" -nobrowse -quiet
+[ -f "$MOUNT_POINT/ClipboardX.pkg" ] || fail "DMG 中缺少 ClipboardX.pkg"
+[ -f "$MOUNT_POINT/安装说明.txt" ] || fail "DMG 中缺少安装说明"
+echo "    [ok] DMG 内容正确（pkg + 说明）"
+
+echo "==> 校验 pkg 元数据"
+pkgutil --check-signature "$MOUNT_POINT/ClipboardX.pkg" || echo "    [warn] pkg 未签名（预期行为，除非提供了 SIGN_ID）"
+installer -pkg "$MOUNT_POINT/ClipboardX.pkg" -target / -showChoicesXML >/dev/null \
+  || fail "installer -showChoicesXML 失败"
+
+echo "==> 安装 pkg"
+installer -pkg "$MOUNT_POINT/ClipboardX.pkg" -target / -verboseR
+
+[ -x /usr/local/bin/cx ] || fail "/usr/local/bin/cx 未安装或不可执行"
+[ -f /Library/LaunchAgents/com.clipboardx.agent.plist ] || fail "LaunchAgent 未安装"
+echo "    [ok] 二进制与 LaunchAgent 均已落位"
+
+echo "==> 断言二进制可运行且是通用二进制"
+/usr/local/bin/cx version || fail "cx version 退出码非 0"
+ARCHS="$(lipo -archs /usr/local/bin/cx 2>/dev/null || echo unknown)"
+echo "    架构：$ARCHS"
+case "$ARCHS" in
+  *arm64*x86_64*|*x86_64*arm64*) echo "    [ok] 通用二进制（arm64 + x86_64）" ;;
+  *) echo "    [warn] 非通用二进制：$ARCHS" ;;
+esac
+
+JSON="$(/usr/local/bin/cx version --json)"
+echo "$JSON" | grep -q '"name": *"cx"' || fail "cx version --json 输出缺少 name"
+echo "    [ok] cx version --json 输出正常"
+
+echo "==> 断言 LaunchAgent 可被 launchd 解析"
+plutil -lint /Library/LaunchAgents/com.clipboardx.agent.plist >/dev/null || fail "LaunchAgent plist 格式非法"
+/usr/libexec/PlistBuddy -c 'Print :Label' /Library/LaunchAgents/com.clipboardx.agent.plist \
+  | grep -qx 'com.clipboardx.agent' || fail "LaunchAgent Label 不正确"
+echo "    [ok] LaunchAgent plist 合法且 Label 正确"
+
+echo "==> 卸载并断言无残留"
+launchctl bootout "gui/$(stat -f%u /dev/console)" /Library/LaunchAgents/com.clipboardx.agent.plist 2>/dev/null || true
+rm -f /Library/LaunchAgents/com.clipboardx.agent.plist /usr/local/bin/cx
+pkgutil --forget com.clipboardx.cli >/dev/null 2>&1 || true
+pkgutil --forget com.clipboardx.agent >/dev/null 2>&1 || true
+[ ! -e /usr/local/bin/cx ] || fail "cx 未被移除"
+[ ! -e /Library/LaunchAgents/com.clipboardx.agent.plist ] || fail "LaunchAgent 未被移除"
+echo "    [ok] 卸载干净"
+
+echo "==> DMG 校验全部通过"

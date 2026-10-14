@@ -1,0 +1,43 @@
+ClipboardX 安装说明（macOS）
+============================
+
+本 DMG 内含 ClipboardX.pkg，双击后按向导安装。
+
+安装内容
+--------
+1) /usr/local/bin/cx
+   命令行工具。安装后新开一个终端窗口即可使用：
+     cx version    确认安装成功
+     cx status     查看守护进程与后端状态
+     cx tui        打开终端界面
+
+2) /Library/LaunchAgents/com.clipboardx.agent.plist
+   登录后自动启动同步守护进程。剪贴板只能在登录用户会话中访问，
+   所以这里用 LaunchAgent 而不是 LaunchDaemon——后者运行在系统会话里，
+   读不到剪贴板。
+
+为什么没有可以拖进「应用程序」的图标
+------------------------------------
+ClipboardX 是终端程序（TUI），没有图形主窗口，因此以 pkg 形式安装命令行工具
+并注册后台代理，而不是打包成 .app。
+
+首次打开被拦截怎么办
+--------------------
+未签名的安装包会被 Gatekeeper 标记为「来自未识别开发者」：
+  - 右键点击安装包 → 选择「打开」→ 再次确认；或
+  - xattr -dr com.apple.quarantine ClipboardX.pkg
+
+安装时如果想跳过自启
+--------------------
+在安装向导的「自定」步骤里取消勾选「登录后自动后台同步」，
+之后随时可以用命令补上：cx service install
+
+卸载
+----
+运行 DMG 内的「卸载.command」，或手动执行：
+  launchctl bootout gui/$(id -u) /Library/LaunchAgents/com.clipboardx.agent.plist
+  sudo rm -f /Library/LaunchAgents/com.clipboardx.agent.plist /usr/local/bin/cx
+  sudo pkgutil --forget com.clipboardx.cli
+  sudo pkgutil --forget com.clipboardx.agent
+用户数据（配置、密钥、剪贴板历史）位于 ~/Library/Application Support/ClipboardX，
+默认保留，方便重装后免重新配对。

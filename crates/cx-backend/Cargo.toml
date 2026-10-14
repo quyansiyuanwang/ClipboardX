@@ -1,0 +1,9 @@
+[package]
+name = "cx-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 同步后端：RemoteBackend trait 与 server/WebDAV/S3/memory 实现"
+
+[dependencies]

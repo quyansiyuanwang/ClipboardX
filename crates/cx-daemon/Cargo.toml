@@ -1,0 +1,9 @@
+[package]
+name = "cx-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 守护进程运行时：线程装配、控制套接字、后台挂载与自启注册"
+
+[dependencies]

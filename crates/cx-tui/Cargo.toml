@@ -1,0 +1,9 @@
+[package]
+name = "cx-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 终端界面（ratatui + crossterm），控制套接字客户端"
+
+[dependencies]

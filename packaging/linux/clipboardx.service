@@ -1,0 +1,44 @@
+[Unit]
+Description=ClipboardX 剪贴板同步守护进程
+Documentation=https://github.com/quyansiyuanwang/ClipboardX
+# 剪贴板只能在图形会话内访问，因此随图形会话启动/停止，而不是 system 级服务
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cx daemon --foreground
+
+# 会话相关的环境变量（X11 / Wayland）
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS
+
+Restart=on-failure
+RestartSec=5s
+
+# 后台运行的礼貌性设置：低优先级 + 明确的资源上限
+Nice=5
+IOSchedulingClass=idle
+MemoryMax=256M
+CPUQuota=25%
+# 断网/后端不可用时不要刷屏重试
+StartLimitIntervalSec=0
+
+# 最小权限：只允许写自己的配置/数据/缓存目录
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=%h/.config/clipboardx %h/.local/share/clipboardx %h/.cache/clipboardx %h/.local/state/clipboardx
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clipboardx
+
+[Install]
+WantedBy=graphical-session.target

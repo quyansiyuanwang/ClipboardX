@@ -1,0 +1,39 @@
+#!/bin/sh
+# ClipboardX 的 LaunchAgent 安装后脚本：为当前控制台用户立即装载代理，
+# 无需等到下次登录。
+set -eu
+
+PLIST="/Library/LaunchAgents/com.clipboardx.agent.plist"
+
+if [ ! -f "$PLIST" ]; then
+  echo "clipboardx: 未找到 $PLIST，跳过装载"
+  exit 0
+fi
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  exit 0
+fi
+
+# 找出当前控制台登录用户的 uid（安装脚本以 root 运行）
+CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || echo root)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+  echo "clipboardx: 当前没有图形登录会话，LaunchAgent 将在下次登录时自动加载"
+  exit 0
+fi
+
+CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || echo '')"
+if [ -z "$CONSOLE_UID" ]; then
+  echo "clipboardx: 无法解析用户 $CONSOLE_USER 的 uid，跳过硬装载"
+  exit 0
+fi
+
+# 先卸载可能存在的旧实例，再装载（失败不阻塞安装）
+launchctl bootout "gui/$CONSOLE_UID" "$PLIST" 2>/dev/null || true
+if launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" 2>/dev/null; then
+  launchctl kickstart -k "gui/$CONSOLE_UID/com.clipboardx.agent" 2>/dev/null || true
+  echo "clipboardx: 已为用户 $CONSOLE_USER 装载 LaunchAgent"
+else
+  echo "clipboardx: 已安装 LaunchAgent，将在用户 $CONSOLE_USER 下次登录时自动加载"
+fi
+
+exit 0

@@ -1,0 +1,9 @@
+[package]
+name = "cx-clip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 剪贴板适配层：clipboard-rs 读写与变更监听，含测试替身"
+
+[dependencies]

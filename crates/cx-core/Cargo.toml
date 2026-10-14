@@ -1,0 +1,9 @@
+[package]
+name = "cx-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 核心领域层：配置、设备身份、空间密钥、历史存储与同步状态机"
+
+[dependencies]

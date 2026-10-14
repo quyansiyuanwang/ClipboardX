@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ClipboardX 的 Windows 安装包定义（WiX v4+ 架构，版本由 .config/dotnet-tools.json 固定）。
+
+  设计要点：
+  - Scope="perUser"：剪贴板只能在用户交互会话中访问，因此不做 per-machine 安装、
+    不注册 Windows 服务（Session 0 读不到剪贴板），安装过程不需要管理员权限。
+  - 自启写 HKCU 下的 Run 键，指向 cx.exe 的 start 子命令（静默模式）；
+    与 macOS LaunchAgent、Linux systemd user unit 语义一致。
+  - 卸载保留用户数据（%APPDATA%\ClipboardX），REMOVEUSERDATA=1 时才清除。
+
+  构建：pwsh scripts/build-msi.ps1
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package
+      Name="ClipboardX"
+      Manufacturer="ClipboardX contributors"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="FEA68C3B-3B6D-4D3D-8E08-856BECAA6EAB"
+      Scope="perUser"
+      Compressed="yes"
+      Codepage="936">
+
+    <SummaryInformation
+        Codepage="936"
+        Description="ClipboardX —— 极度轻量的三端剪贴板同步（守护进程 + TUI）"
+        Manufacturer="ClipboardX contributors" />
+
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="已安装更高版本的 ClipboardX，请先卸载后再安装。" />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPHELPLINK" Value="https://github.com/quyansiyuanwang/ClipboardX" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <!-- 卸载时是否连同配置/密钥/历史一起清除 -->
+    <Property Id="REMOVEUSERDATA" Secure="yes" />
+
+    <!-- 安装位置：%LOCALAPPDATA%\Programs\ClipboardX（per-user，无需提权） -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="CxProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="ClipboardX" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- 用户数据目录：%APPDATA%\ClipboardX -->
+    <StandardDirectory Id="AppDataFolder">
+      <Directory Id="CxUserDataFolder" Name="ClipboardX" />
+    </StandardDirectory>
+
+    <!-- 开始菜单 -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="CxMenuFolder" Name="ClipboardX" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="ClipboardX 核心" Level="1" AllowAbsent="no"
+             Description="守护进程与命令行（cx.exe）">
+      <ComponentGroupRef Id="CxBinaries" />
+      <ComponentRef Id="CxStartMenu" />
+    </Feature>
+
+    <Feature Id="PathEnv" Title="加入 PATH" Level="1" AllowAbsent="yes"
+             Description="把安装目录加入当前用户的 PATH，之后可直接运行 cx">
+      <ComponentRef Id="CxUserPath" />
+    </Feature>
+
+    <Feature Id="Autostart" Title="登录后自动后台运行" Level="1" AllowAbsent="yes"
+             Description="登录时自动启动剪贴板同步守护进程（HKCU Run）">
+      <ComponentRef Id="CxAutostart" />
+    </Feature>
+
+    <Feature Id="DesktopShortcut" Title="桌面快捷方式（TUI）" Level="1000" AllowAbsent="yes"
+             Description="在桌面创建打开终端界面的快捷方式">
+      <ComponentRef Id="CxDesktopShortcut" />
+    </Feature>
+
+<?if $(var.WithUi) = 1 ?>
+    <ui:WixUI Id="WixUI_FeatureTree" />
+<?endif?>
+
+    <ComponentGroup Id="CxBinaries" Directory="INSTALLFOLDER">
+      <Component Id="CxExe" Guid="5496894D-B94F-47F0-AFF3-4EE38F700A75">
+        <File Id="CxExeFile" Source="$(var.BinDir)\cx.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- 用户级 PATH（HKCU\Environment），卸载时由 MSI 自动还原 -->
+    <Component Id="CxUserPath" Directory="INSTALLFOLDER"
+               Guid="028361B8-F828-4009-AE3B-DF0BF1048EE3">
+      <Environment Id="CxUserPathEnv"
+                   Name="PATH"
+                   Value="[INSTALLFOLDER]"
+                   Part="last"
+                   Action="set"
+                   Permanent="no"
+                   System="no" />
+      <RegistryValue Root="HKCU" Key="Software\ClipboardX" Name="PathAdded"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!-- 登录自启：HKCU\...\Run -->
+    <Component Id="CxAutostart" Directory="INSTALLFOLDER"
+               Guid="1CBBC060-0729-47C8-AC90-111EF80EB17D">
+      <RegistryValue Root="HKCU"
+                     Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                     Name="ClipboardX"
+                     Type="string"
+                     Value="&quot;[INSTALLFOLDER]cx.exe&quot; start --silent"
+                     KeyPath="yes" />
+    </Component>
+
+    <Component Id="CxStartMenu" Directory="CxMenuFolder"
+               Guid="BB086E78-FF5B-4991-9923-6C6343135D85">
+      <Shortcut Id="CxTuiShortcut"
+                Name="ClipboardX TUI"
+                Description="打开 ClipboardX 终端界面"
+                Target="[INSTALLFOLDER]cx.exe"
+                Arguments="tui"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="CxRemoveMenuFolder" Directory="CxMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\ClipboardX" Name="StartMenu"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="CxDesktopShortcut" Guid="C1D28912-D240-4FE7-B349-15BE2C32CBA7">
+        <Shortcut Id="CxDesktopTuiShortcut"
+                  Name="ClipboardX"
+                  Description="打开 ClipboardX 终端界面"
+                  Target="[INSTALLFOLDER]cx.exe"
+                  Arguments="tui"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\ClipboardX" Name="DesktopShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <!-- 仅在 REMOVEUSERDATA=1 时清除配置/密钥/历史 -->
+    <CustomAction Id="CxRemoveUserData"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="cmd.exe /c rmdir /s /q &quot;[CxUserDataFolder]&quot;"
+                  Execute="immediate"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CxRemoveUserData" After="InstallInitialize"
+              Condition="REMOVE=&quot;ALL&quot; AND REMOVEUSERDATA=&quot;1&quot;" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

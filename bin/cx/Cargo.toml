@@ -1,0 +1,18 @@
+[package]
+name = "cx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 主程序：守护进程 + CLI + TUI"
+default-run = "cx"
+
+[[bin]]
+name = "cx"
+path = "src/main.rs"
+
+[dependencies]
+cx-cli.workspace = true
+cx-core.workspace = true
+clap.workspace = true
+serde_json.workspace = true

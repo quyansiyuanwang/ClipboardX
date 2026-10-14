@@ -1,0 +1,11 @@
+/target/
+/dist/
+/.wix/
+*.wixpdb
+*.wixobj
+*.msi
+*.dmg
+*.pkg
+*.rs.bk
+.DS_Store
+Thumbs.db

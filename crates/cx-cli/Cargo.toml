@@ -1,0 +1,13 @@
+[package]
+name = "cx-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 命令行：clap 子命令定义与控制套接字客户端"
+
+[dependencies]
+cx-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "cx-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ClipboardX 线协议与落盘格式：item 容器、manifest、控制协议"
+
+[dependencies]

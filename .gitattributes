@@ -1,0 +1,18 @@
+# 统一行尾：仓库内文本使用 LF，避免 Windows 上写出的 CRLF 破坏 shell 脚本
+* text=auto eol=lf
+
+# 脚本必须保持 LF，否则 macOS/Linux 上的 pkgbuild/systemd 会报错
+*.sh text eol=lf
+*.command text eol=lf
+packaging/macos/scripts/* text eol=lf
+packaging/linux/* text eol=lf
+
+# Windows 侧明确使用 CRLF
+*.ps1 text eol=crlf
+*.wxs text eol=crlf
+*.wxl text eol=crlf
+
+# 二进制
+*.ico binary
+*.png binary
+*.rtf binary

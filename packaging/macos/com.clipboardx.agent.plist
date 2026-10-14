@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ClipboardX 用户级自启代理。
+  必须是 LaunchAgent（用户登录会话）而不是 LaunchDaemon：macOS 的剪贴板属于
+  用户会话，LaunchDaemon 运行在系统会话中读不到 NSPasteboard。
+  ProcessType=Background + Nice=5 让系统在忙碌时优先保障前台应用。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.clipboardx.agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/cx</string>
+    <string>daemon</string>
+    <string>--foreground</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>Nice</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/clipboardx.agent.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/clipboardx.agent.err.log</string>
+</dict>
+</plist>
