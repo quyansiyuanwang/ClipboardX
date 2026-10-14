@@ -7,6 +7,7 @@
 //! | 主线程 | 等退出信号，然后按顺序收尾（停服务端 → 停引擎并落盘 → 清理 daemon.json） |
 //! | `watcher` | 等平台事件（或轮询兜底）→ 读剪贴板 → 送引擎 |
 //! | `engine` | 唯一持有引擎状态；执行动作（写剪贴板、落盘、回复、广播事件） |
+//! | `cx-backend-*` | 每个启用的后端一个 worker：上传对象、按 manifest 增量拉取 |
 //! | `control` | 接受回环连接；每条连接一个短生命周期线程 |
 //!
 //! 空闲时所有线程都阻塞在 channel/socket 上：CPU 近 0，不需要忙等待。
@@ -19,13 +20,18 @@ use crate::error::DaemonError;
 use crate::lock::InstanceLock;
 use crate::logging;
 use crate::service;
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
+use cx_backend::build_backend;
 use cx_clip::{ChangeNotifier, ClipBackend, ClipContent, SystemClipboard};
 use cx_core::{Config, Identity, LocalSpace, Paths};
+use cx_proto::ManifestEntry;
 use cx_proto::control::{
     DoctorCheck, Event as ControlEvent, Reply, Request, cmd as commands, errcode, event as events,
 };
-use cx_sync::{Action, Command as EngineCommand, Engine, Event as EngineEvent, ReplyPayload};
+use cx_sync::{
+    Action, Command as EngineCommand, Engine, Event as EngineEvent, RemoteSync, ReplyPayload,
+    RetentionLimits,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -250,6 +256,74 @@ impl Daemon {
         let subscribe: SubscribeFactory = Arc::new(move || subscriber.subscribe());
         let server_thread = server.serve(dispatcher, subscribe);
 
+        // ---- 后端 worker 线程 ----
+        // 必须在引擎线程之前建好：发布队列的所有者随后要被移进引擎线程闭包。
+        let worker_shutdown = Arc::new(AtomicBool::new(false));
+        let mut publishers: Vec<Sender<PublishJob>> = Vec::new();
+        let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        {
+            let cursors = engine.cursors_snapshot();
+            let retention = RetentionLimits {
+                max_items: self.config.sync.history_max_items,
+                max_age_ms: self
+                    .config
+                    .sync
+                    .history_max_days
+                    .saturating_mul(24 * 60 * 60 * 1000),
+            };
+            // 有活动时按 poll_active_ms 轮询，空闲时靠 worker 自己退到 poll_idle_ms 的下限
+            let poll_interval = Duration::from_millis(self.config.sync.poll_active_ms.max(500));
+
+            for backend in self.config.enabled_backends() {
+                let built = build_backend(backend, &paths, Duration::from_secs(60));
+                match built {
+                    Ok(remote) => {
+                        let mut sync =
+                            RemoteSync::new(remote, &self.identity.device_id, &self.identity.name);
+                        if let Some(existing) = cursors.get(&backend.name) {
+                            sync.set_cursors(existing.clone());
+                        }
+                        let (tx, rx) = bounded::<PublishJob>(64);
+                        publishers.push(tx);
+                        let backend_name = backend.name.clone();
+                        let engine_tx = engine_tx.clone();
+                        let shutdown = worker_shutdown.clone();
+                        let handle = std::thread::Builder::new()
+                            .name(format!("cx-backend-{}", backend.name))
+                            .spawn(move || {
+                                backend_worker_loop(
+                                    sync,
+                                    rx,
+                                    engine_tx,
+                                    poll_interval,
+                                    retention,
+                                    backend_name,
+                                    shutdown,
+                                )
+                            })
+                            .map_err(DaemonError::io)?;
+                        worker_threads.push(handle);
+                    }
+                    Err(err) => {
+                        log::error!("后端 {} 初始化失败：{err}", backend.name);
+                        // 仍然登记一条失败状态，让 cx status / cx doctor 看得到
+                        let _ = engine_tx.send(EngineMsg::Event(EngineEvent::Command(
+                            EngineCommand::BackendReport {
+                                name: backend.name.clone(),
+                                cursors: Default::default(),
+                                published: 0,
+                                applied: 0,
+                                error: Some(err.to_string()),
+                            },
+                        )));
+                    }
+                }
+            }
+            if self.config.backends.is_empty() {
+                log::info!("未配置任何后端：当前只记录本机历史（cx backend add … 添加）");
+            }
+        }
+
         // ---- 引擎线程 ----
         let engine_thread = {
             let engine_broadcaster = broadcaster.clone();
@@ -269,6 +343,7 @@ impl Daemon {
                                     engine: &mut engine,
                                     clip: &mut clip_write,
                                     broadcaster: &engine_broadcaster,
+                                    publishers: &publishers,
                                 };
                                 let _ = runner.run_all(actions);
                             }
@@ -279,6 +354,7 @@ impl Daemon {
                                     engine: &mut engine,
                                     clip: &mut clip_write,
                                     broadcaster: &engine_broadcaster,
+                                    publishers: &publishers,
                                 };
                                 let payloads = runner.run_all(actions);
                                 for payload in payloads {
@@ -373,6 +449,7 @@ impl Daemon {
         log::info!("收到退出信号，开始收尾");
         server_shutdown.store(true, Ordering::Relaxed);
         watcher_shutdown.store(true, Ordering::Relaxed);
+        worker_shutdown.store(true, Ordering::Relaxed);
         // 监听线程最多等一个轮询间隔就会看到标志并退出，随后由它自己 Drop 掉通知器
 
         let (ack_tx, ack_rx) = bounded::<()>(1);
@@ -383,6 +460,10 @@ impl Daemon {
 
         broadcaster.send(ControlEvent::new(events::SHUTTING_DOWN, json!({})));
         let _ = engine_thread.join();
+        // 引擎线程退出时会 Drop 掉发布队列的发送端，worker 随即收到 Disconnected 而退出
+        for handle in worker_threads {
+            let _ = handle.join();
+        }
         if let Some(thread) = watcher_thread {
             let _ = thread.join();
         }
@@ -391,6 +472,104 @@ impl Daemon {
         log::info!("已停止");
         Ok(0)
     }
+}
+
+/// 发布任务（引擎线程 → 后端 worker）。
+///
+/// 载荷用 `Arc<[u8]>`：多个后端共享同一份字节，避免大图片在每个后端各复制一次。
+struct PublishJob {
+    name: String,
+    entry: ManifestEntry,
+    bytes: Arc<[u8]>,
+}
+
+/// 后端 worker 线程的主循环。
+///
+/// 一个后端一个线程，只做两件事：把引擎产出的对象写上去、按 manifest 增量把别人的
+/// 对象取回来。取回的对象**不在这里解密/应用**，一律交给引擎，由它统一做去重、
+/// 解密与策略判断——否则"两处都以为对方查过"的漏洞迟早会出现。
+fn backend_worker_loop(
+    mut sync: RemoteSync,
+    jobs: Receiver<PublishJob>,
+    engine_tx: Sender<EngineMsg>,
+    poll_interval: Duration,
+    retention: RetentionLimits,
+    name: String,
+    shutdown: Arc<AtomicBool>,
+) {
+    log::info!("后端 {name} 就绪：{}", sync.describe());
+    let mut last_error: Option<String> = None;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // 等发布任务；等到轮询间隔就先做一轮拉取
+        let mut pending: Vec<PublishJob> = Vec::new();
+        match jobs.recv_timeout(poll_interval) {
+            Ok(job) => pending.push(job),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        while pending.len() < 64 {
+            match jobs.try_recv() {
+                Ok(job) => pending.push(job),
+                Err(_) => break,
+            }
+        }
+
+        let mut error = None;
+
+        for job in pending {
+            match sync.publish(&job.name, &job.bytes, job.entry.clone(), retention) {
+                Ok(()) => log::debug!("后端 {name} 已发布 {}", job.name),
+                Err(err) => {
+                    log::warn!("后端 {name} 发布 {} 失败：{err}", job.name);
+                    error = Some(err.to_string());
+                }
+            }
+        }
+
+        match sync.poll(cx_sync::remote::DEFAULT_MAX_FETCH) {
+            Ok(outcome) => {
+                for (object_name, item) in outcome.incoming {
+                    log::debug!("后端 {name} 取回 {object_name}");
+                    let _ = engine_tx.send(EngineMsg::Event(EngineEvent::Command(
+                        EngineCommand::ApplyRemote {
+                            backend: name.clone(),
+                            name: object_name,
+                            item: Box::new(item),
+                        },
+                    )));
+                    sync.note_applied(1);
+                }
+            }
+            Err(err) => {
+                log::warn!("后端 {name} 轮询失败：{err}");
+                error = Some(err.to_string());
+            }
+        }
+
+        // 每轮都汇报：游标必须及时落盘，否则重启会把历史重下一遍
+        let _ = engine_tx.send(EngineMsg::Event(EngineEvent::Command(
+            EngineCommand::BackendReport {
+                name: name.clone(),
+                cursors: sync.cursors().clone(),
+                published: sync.published(),
+                applied: sync.applied(),
+                error: error.clone(),
+            },
+        )));
+        if error != last_error {
+            match &error {
+                Some(message) => log::warn!("后端 {name}：{message}"),
+                None => log::info!("后端 {name} 恢复正常"),
+            }
+            last_error = error;
+        }
+    }
+    log::debug!("后端 {name} worker 已停止");
 }
 
 /// 动作执行器：把引擎输出的动作落成实际副作用。
@@ -403,6 +582,8 @@ struct ActionRunner<'a> {
     engine: &'a mut Engine,
     clip: &'a mut Option<SystemClipboard>,
     broadcaster: &'a Broadcaster,
+    /// 各后端 worker 的发布队列（顺序与配置里的启用后端一致）。
+    publishers: &'a [Sender<PublishJob>],
 }
 
 /// 重读剪贴板的最大嵌套深度。
@@ -432,12 +613,27 @@ impl ActionRunner<'_> {
                 }
                 None
             }
-            Action::Publish { name, bytes } => {
-
-                log::info!(
-                    "已生成对象 {name}（{} 字节）；当前没有启用后端",
-                    bytes.len()
-                );
+            Action::Publish { name, entry, bytes } => {
+                if self.publishers.is_empty() {
+                    log::debug!(
+                        "已生成对象 {name}（{} 字节）但没有启用任何后端",
+                        bytes.len()
+                    );
+                    return None;
+                }
+                // 一次分配，多后端共享（Arc<[u8]>）
+                let shared: Arc<[u8]> = Arc::from(bytes);
+                let hash = entry.hash.chars().take(8).collect::<String>();
+                for sender in self.publishers {
+                    let job = PublishJob {
+                        name: name.clone(),
+                        entry: entry.clone(),
+                        bytes: shared.clone(),
+                    };
+                    if let Err(err) = sender.try_send(job) {
+                        log::warn!("后端发布队列不可用，丢弃 {name}（{hash}）：{err}");
+                    }
+                }
                 None
             }
             Action::Reply(payload) => Some(payload),
@@ -446,7 +642,9 @@ impl ActionRunner<'_> {
                 None
             }
             Action::PollNow => {
-
+                // 后端 worker 按自己的节奏轮询；这里只需要把它们的等待缩短不了，
+                // 因此记录一下即可（`cx pull` 的实际效果是"下一轮马上就会跑"）
+                log::debug!("收到立即拉取请求，后端 worker 将在下一轮执行");
                 None
             }
             Action::RecheckClipboard => {

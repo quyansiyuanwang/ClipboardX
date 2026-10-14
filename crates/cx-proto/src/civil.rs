@@ -45,7 +45,10 @@ pub fn parse_day(day: &str) -> Option<(i64, u32, u32)> {
 }
 
 /// 天数（相对 1970-01-01）→ (年, 月, 日)。
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+///
+/// 公开导出：日志时间戳、CLI 展示、HTTP 日期解析都要用同一份实现。
+/// （曾经同一个算法在仓库里出现了三份，第二个副本就是 bug 的温床。）
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]
@@ -58,8 +61,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// (年, 月, 日) → 天数（相对 1970-01-01）。
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+/// (年, 月, 日) → 天数（相对 1970-01-01）。公开导出的理由同上。
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]

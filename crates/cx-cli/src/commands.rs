@@ -466,7 +466,21 @@ fn run_daemon(
     quiet: bool,
 ) -> Result<ExitCode, DaemonError> {
     paths.ensure()?;
-    let config = Config::load_or_create(paths)?;
+    // 尽早初始化日志：后台自启时 stderr 是丢弃的，配置写错这类**启动期失败**
+    // 只有记进日志文件才可能被看到（否则表现为"进程起来又不见了"）。
+    cx_daemon::logging::init(paths, None, !quiet)?;
+
+    let config = match Config::load_or_create(paths) {
+        Ok(config) => config,
+        Err(err) => {
+            log::error!("配置无法加载：{err}");
+            log::error!(
+                "配置文件：{}（可执行 `cx config check` 查看问题）",
+                paths.config_file().display()
+            );
+            return Err(err.into());
+        }
+    };
     let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
     let space = match LocalSpace::load(paths) {
         Ok(space) => Some(space),

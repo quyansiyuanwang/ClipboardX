@@ -99,6 +99,7 @@ sudo bash packaging/linux/verify-deb.sh dist/ClipboardX_0.1.0_amd64.deb
 |---|---|---|
 | `test` | ubuntu / windows / macos 三平台矩阵 | `cargo fmt --check`、`clippy -D warnings`、`cargo test`、release 构建、**二进制体积预算断言** |
 | `e2e` | ubuntu / windows / macos 三平台矩阵 | `scripts/e2e-local.ps1 -NoClipboard`：`cx start` 分离进程 + start/stop/status/history/push/pause/resume/doctor/reload 全链路断言 |
+| `e2e-webdav` | ubuntu / windows | `scripts/e2e-webdav.ps1`：用 wsgidav 起**真实 WebDAV 服务端**，两台守护进程互相同步（A 的剪贴板 → WebDAV → B 的历史，以及反向），并断言无回环放大 |
 | `msi` | windows-latest | 构建 MSI → `msiexec /i /qn` → 断言文件/PATH/Run 键/`cx version` → `msiexec /x /qn` → 断言无残留 |
 | `dmg` | macos-latest | 构建通用二进制 → pkg → dmg → 挂载 → `installer -pkg` → `lipo -archs` 校验 → 卸载 |
 | `deb` | ubuntu-latest | 构建 deb → `dpkg -i` → 断言 → `dpkg -r` → Xvfb 下启动冒烟 |

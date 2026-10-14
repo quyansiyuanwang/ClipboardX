@@ -12,7 +12,7 @@
 
 use cx_clip::{ClipContent, ClipKind};
 use cx_core::config::ApplyRemoteMode;
-use cx_core::state::SEEN_CAPACITY;
+use cx_core::state::{Cursor, SEEN_CAPACITY};
 use cx_core::{
     Config, CoreError, DaemonState, History, Identity, Paths, SeenSet, SpaceCipher, TtlSet,
 };
@@ -20,8 +20,9 @@ use cx_proto::control::{
     DoctorCheck, DoctorReport, ErrorBody, Event as ControlEvent, HistoryPreview, HistorySummary,
     StatusReport, errcode, event,
 };
-use cx_proto::{Item, ItemMeta, ItemName, content_hash, content_hash_hex};
+use cx_proto::{Item, ItemMeta, ItemName, ManifestEntry, content_hash, content_hash_hex};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 /// 抑制表容量。
 pub const DEFAULT_SUPPRESS_CAPACITY: usize = 8;
@@ -112,12 +113,27 @@ pub enum Command {
         /// 新配置。
         config: Box<Config>,
     },
-
+    /// 收到远端对象（由后端 worker 线程投递）。
     ApplyRemote {
+        /// 来自哪个后端（用于分别统计与退避）。
+        backend: String,
         /// 对象名。
         name: String,
         /// 解码后的 item。
         item: Box<Item>,
+    },
+    /// 后端 worker 汇报一轮结果（游标、计数、错误）。
+    BackendReport {
+        /// 后端名。
+        name: String,
+        /// 各设备的 manifest 游标（由 worker 维护，交引擎持久化）。
+        cursors: BTreeMap<String, Cursor>,
+        /// 该 worker 累计发布条数。
+        published: u64,
+        /// 该 worker 累计应用条数。
+        applied: u64,
+        /// 本轮错误（`None` 表示正常）。
+        error: Option<String>,
     },
 }
 
@@ -126,10 +142,12 @@ pub enum Command {
 pub enum Action {
     /// 把内容写入本机剪贴板。
     ApplyToClipboard(ClipContent),
-
+    /// 发布对象到各后端（由守护进程的 worker 线程消费）。
     Publish {
         /// 对象名。
         name: String,
+        /// manifest 条目（含哈希/大小/类型，worker 据此维护 manifest）。
+        entry: ManifestEntry,
         /// 容器字节。
         bytes: Vec<u8>,
     },
@@ -427,7 +445,18 @@ impl Engine {
                     },
                 ]
             }
-            Command::ApplyRemote { name, item } => self.apply_remote(now_ms, &name, &item),
+            Command::ApplyRemote {
+                backend,
+                name,
+                item,
+            } => self.apply_remote(now_ms, &backend, &name, &item),
+            Command::BackendReport {
+                name,
+                cursors,
+                published,
+                applied,
+                error,
+            } => self.on_backend_report(now_ms, &name, cursors, published, applied, error),
         }
     }
 
@@ -507,8 +536,23 @@ impl Engine {
                 self.last_published_fingerprint = Some(content.fingerprint_hex());
                 self.last_save_ms = now_ms;
 
+                let entry = ManifestEntry {
+                    name: name.clone(),
+                    day: name
+                        .split('-')
+                        .next()
+                        .and_then(|ts| ts.parse::<u64>().ok())
+                        .map(cx_proto::civil::day_from_ms)
+                        .unwrap_or_default(),
+                    size: bytes.len() as u64,
+                    hash: hash.clone(),
+                    kind: item.kind,
+                    created_ms: item.meta.created_ms,
+                    mime: item.meta.mime.clone(),
+                };
                 actions.push(Action::Publish {
                     name: name.clone(),
+                    entry,
                     bytes,
                 });
                 actions.push(Action::Notify(ControlEvent::new(
@@ -571,7 +615,7 @@ impl Engine {
     }
 
     /// 收到远端对象：校验 → 解密 → 入库 → 按策略应用。
-    fn apply_remote(&mut self, now_ms: u64, name: &str, item: &Item) -> Vec<Action> {
+    fn apply_remote(&mut self, now_ms: u64, backend: &str, name: &str, item: &Item) -> Vec<Action> {
         let mut actions = Vec::new();
         if self.state.paused {
             return actions;
@@ -623,11 +667,8 @@ impl Engine {
         }
         self.seen.insert(name);
         self.state.mark_seen(name);
-        let backend_count = self.config.enabled_backends().count().max(1) as u64;
-        for backend in self.config.enabled_backends() {
-            self.state.backend_mut(&backend.name, true).count_applied(1);
-        }
-        let _ = backend_count;
+        // 只给"真正送来这条内容"的后端计数：否则多后端场景下计数会成倍虚高
+        self.state.backend_mut(backend, true).count_applied(1);
 
         // 应用策略
         let fingerprint = content.fingerprint_hex();
@@ -879,6 +920,63 @@ impl Engine {
         }
 
         DoctorReport::new(checks)
+    }
+
+    /// 后端 worker 汇报一轮结果：更新游标、计数与退避状态。
+    fn on_backend_report(
+        &mut self,
+        now_ms: u64,
+        name: &str,
+        cursors: BTreeMap<String, Cursor>,
+        published: u64,
+        applied: u64,
+        error: Option<String>,
+    ) -> Vec<Action> {
+        let enabled = self
+            .config
+            .backend(name)
+            .map(|backend| backend.enabled)
+            .unwrap_or(true);
+        let state = self.state.backend_mut(name, enabled);
+        state.cursors = cursors;
+        state.published = published;
+        state.applied = applied;
+
+        match error {
+            Some(message) => {
+                // 退避抖动：用系统随机数避免多后端同时重试
+                let mut draw = [0u8; 1];
+                let _ = getrandom::fill(&mut draw);
+                let jitter = (draw[0] % 21) as u64;
+                let failures = state.consecutive_failures;
+                let message_for_log = message.clone();
+                state.record_failure(now_ms, message, jitter);
+                log::debug!(
+                    "后端 {name} 失败（第 {} 次）：{message_for_log}",
+                    failures + 1
+                );
+            }
+            None => state.record_success(now_ms),
+        }
+
+        let mut actions = vec![Action::Notify(ControlEvent::new(
+            event::STATUS_CHANGED,
+            json!({ "backend": name }),
+        ))];
+        // 状态变更不必每次都落盘，跟着其它保存点走
+        if now_ms.saturating_sub(self.last_save_ms) > 5_000 {
+            actions.push(Action::SaveState);
+        }
+        actions
+    }
+
+    /// 供守护进程启动时恢复各后端游标。
+    pub fn cursors_snapshot(&self) -> BTreeMap<String, BTreeMap<String, Cursor>> {
+        self.state
+            .backends
+            .iter()
+            .map(|(name, state)| (name.clone(), state.cursors.clone()))
+            .collect()
     }
 
     /// 已处理集合长度（测试与状态展示用）。
@@ -1152,6 +1250,7 @@ mod tests {
         let actions = h.engine.handle(
             h.now,
             Event::Command(Command::ApplyRemote {
+                backend: "test".to_string(),
                 name: name.to_string(),
                 item: Box::new(item),
             }),
@@ -1176,6 +1275,7 @@ mod tests {
         let first = h.engine.handle(
             h.now,
             Event::Command(Command::ApplyRemote {
+                backend: "test".to_string(),
                 name: name.to_string(),
                 item: Box::new(item.clone()),
             }),
@@ -1186,6 +1286,7 @@ mod tests {
         let second = h.engine.handle(
             h.now,
             Event::Command(Command::ApplyRemote {
+                backend: "test".to_string(),
                 name: name.to_string(),
                 item: Box::new(item),
             }),
@@ -1204,6 +1305,7 @@ mod tests {
         let actions = h.engine.handle(
             h.now,
             Event::Command(Command::ApplyRemote {
+                backend: "test".to_string(),
                 name: name.to_string(),
                 item: Box::new(plain_item(name, b"manual")),
             }),
@@ -1227,6 +1329,7 @@ mod tests {
         let actions = h.engine.handle(
             h.now,
             Event::Command(Command::ApplyRemote {
+                backend: "test".to_string(),
                 name: busy_name.to_string(),
                 item: Box::new(plain_item(busy_name, b"remote")),
             }),
@@ -1241,6 +1344,7 @@ mod tests {
         let actions = h.engine.handle(
             h.now,
             Event::Command(Command::ApplyRemote {
+                backend: "test".to_string(),
                 name: idle_name.to_string(),
                 item: Box::new(plain_item(idle_name, b"remote")),
             }),

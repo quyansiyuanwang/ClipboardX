@@ -7,6 +7,7 @@ license.workspace = true
 description = "ClipboardX 同步引擎：发布/拉取、去重与回环抑制、LWW、裁剪、退避"
 
 [dependencies]
+cx-backend.workspace = true
 cx-clip.workspace = true
 cx-core.workspace = true
 cx-proto.workspace = true
@@ -15,3 +16,7 @@ hex.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# 集成测试要自己构造加密空间（产品路径由 cx-core 的 space 模块覆盖）
+cx-crypto.workspace = true

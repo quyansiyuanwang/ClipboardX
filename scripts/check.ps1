@@ -32,6 +32,9 @@ if ($hostIsWindows) {
         $steps.Add(@{
                 Name = 'cargo clippy --target x86_64-unknown-linux-gnu -D warnings'
                 Cmd  = { cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings }
+                # 目标平台缺 C 工具链时（ring 要编 C/汇编）不算门禁失败：
+                # 真正的 Linux 检查由 CI 的 ubuntu 作业负责，这里只求抓到 cfg 分支的 lint。
+                AllowToolchainMiss = $true
             })
     }
     else {
@@ -46,6 +49,12 @@ foreach ($step in $steps) {
     $output = & $step.Cmd 2>&1
     $code = $LASTEXITCODE
     if ($code -ne 0) {
+        $text = ($output | Out-String)
+        $toolchainMiss = $text -match 'failed to find tool|error occurred in cc-rs|linker .* not found'
+        if ($step.AllowToolchainMiss -and $toolchainMiss) {
+            Write-Host '    跳过：本机缺少目标平台的 C 工具链（CI 的对应平台作业会检查）' -ForegroundColor Yellow
+            continue
+        }
         $failed.Add($step.Name)
         Write-Host "    失败（exit $code），输出末尾：" -ForegroundColor Red
         $output | Select-Object -Last 25 | ForEach-Object { Write-Host "      $_" }

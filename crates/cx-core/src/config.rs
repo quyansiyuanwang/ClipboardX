@@ -377,8 +377,14 @@ impl Config {
                     if backend.url.as_deref().unwrap_or("").trim().is_empty() {
                         problems.push(format!("后端 {name}（webdav）缺少 url"));
                     }
-                    if backend.username.is_none() {
-                        problems.push(format!("后端 {name}（webdav）缺少 username"));
+                    // 用户名可以省略（匿名 WebDAV 是合法配置，例如内网资料库）；
+                    // 但"只有口令、没有用户名"一定是配错了。
+                    if backend.username.is_none()
+                        && (backend.password_file.is_some() || backend.password_env.is_some())
+                    {
+                        problems.push(format!(
+                            "后端 {name}（webdav）配置了口令但没有 username（匿名访问请删掉口令配置）"
+                        ));
                     }
                     if backend.password_file.is_some() && backend.password_env.is_some() {
                         problems.push(format!(

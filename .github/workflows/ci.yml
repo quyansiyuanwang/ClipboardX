@@ -85,6 +85,32 @@ jobs:
         shell: pwsh
         run: ./scripts/e2e-local.ps1 -NoClipboard
 
+  e2e-webdav:
+    name: 端到端（WebDAV 双设备）${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装 Python（脚本会用 pip 装 wsgidav 起真实 WebDAV 服务端）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 这条作业把"跨设备同步"整条链路跑通：
+      # A 的剪贴板 → A 的引擎 → 真实 WebDAV → B 的 worker → B 的历史，以及反向。
+      - name: 端到端脚本（WebDAV）
+        shell: pwsh
+        run: ./scripts/e2e-webdav.ps1
+
   msi:
     name: Windows MSI 构建与安装验收
     runs-on: windows-latest
