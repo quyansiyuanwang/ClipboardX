@@ -128,6 +128,10 @@ pub struct App {
     last_plan: Vec<String>,
     /// 列表可视行数（渲染层每帧告知）。
     viewport_rows: usize,
+    /// 列表内容区的顶部行与行数（渲染层每帧告知，鼠标点击要用它做坐标换算）。
+    list_geometry: Option<(u16, u16)>,
+    /// 列表当前滚动到第几行（渲染层每帧告知：ratatui 自己算的，只有渲染后才知道）。
+    list_offset: usize,
     /// 预览滚动偏移（行）。
     preview_scroll: u16,
     /// 最近一条提示。
@@ -320,6 +324,30 @@ impl App {
     /// 可视行数。
     pub fn viewport_rows(&self) -> usize {
         self.viewport_rows.max(1)
+    }
+
+    /// 渲染层回填列表内容区的位置与滚动偏移。
+    pub fn set_list_geometry(&mut self, top: u16, rows: u16, offset: usize) {
+        self.list_geometry = Some((top, rows));
+        self.list_offset = offset;
+    }
+
+    /// 点击某一行：命中列表就选中对应条目，返回它在 `visible` 里的下标。
+    ///
+    /// 坐标换算必须用**渲染时**记录的位置与偏移：列表是不是滚动、滚动到哪一行，
+    /// 都是 ratatui 在渲染时为了"让选中项可见"自己算出来的，App 这边凭空推不出来。
+    pub fn click(&mut self, row: u16) -> Option<usize> {
+        let (top, rows) = self.list_geometry?;
+        if rows == 0 || row < top || row >= top.saturating_add(rows) {
+            return None;
+        }
+        let index = self.list_offset + (row - top) as usize;
+        if index >= self.visible.len() {
+            // 点在列表空白处：不动光标（比"随便选一个"更符合直觉）
+            return None;
+        }
+        self.move_to(index);
+        Some(index)
     }
 
     /// 生成这一轮要发出的预览请求（位置 + 对象名）。
@@ -1318,6 +1346,73 @@ mod tests {
         assert!(app.pending_delete.is_none());
         assert!(app.notice.as_ref().unwrap().is_error);
         assert!(app.notice.as_ref().unwrap().text.contains("没有可删除"));
+    }
+    #[test]
+    fn 点击列表行会选中对应条目() {
+        let mut app = app_with(10);
+        // 渲染层会告诉我们：内容区从第 3 行开始、高 5 行、当前没滚动
+        app.set_list_geometry(3, 5, 0);
+        assert_eq!(app.click(3), Some(0), "第一行 = 第一条");
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.click(6), Some(3), "第 4 行 = 第 4 条");
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn 点击要算上滚动偏移() {
+        let mut app = app_with(50);
+        app.set_list_geometry(3, 5, 20); // 列表已经滚到第 20 条
+        assert_eq!(app.click(3), Some(20), "屏幕上第一行是第 21 条");
+        assert_eq!(app.click(7), Some(24));
+    }
+
+    #[test]
+    fn 点在列表之外的空白处不动光标() {
+        let mut app = app_with(3);
+        app.set_list_geometry(3, 5, 0);
+        app.down();
+        let selected = app.cursor;
+
+        // 头部 / 列表边框外 / 页脚
+        assert_eq!(app.click(0), None);
+        assert_eq!(app.click(2), None);
+        assert_eq!(app.click(20), None);
+        assert_eq!(app.cursor, selected, "这些点击不该改变选中项");
+
+        // 列表内部但超出条目数的空白行
+        app.set_list_geometry(3, 5, 0);
+        assert_eq!(app.click(6), None, "只有 3 条，第 4 行是空白");
+        assert_eq!(app.cursor, selected);
+    }
+
+    #[test]
+    fn 还没渲染过时点击不越界() {
+        let mut app = app_with(3);
+        assert_eq!(app.click(5), None, "没有几何信息时应当安全返回");
+    }
+
+    #[test]
+    fn 过滤之后点击按可见顺序映射() {
+        let mut app = app_with(6);
+        // 让其中一条的内容里带上独特关键词，过滤后只剩它
+        app.apply(preview(4, "独特关键词 在这里"));
+        app.on_key(key(KeyCode::Char('/')));
+        for ch in "独特关键词".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_len(), 1, "过滤后只剩一条");
+
+        app.set_list_geometry(3, 4, 0);
+        // 可见列表只有一项，点第一行命中它——位置是 4（不是 0）
+        assert_eq!(app.click(3), Some(0), "返回的是 visible 下标");
+        assert_eq!(
+            app.selected_position(),
+            Some(4),
+            "选中的是那条被过滤出来的内容"
+        );
+        // 第二行是空的
+        assert_eq!(app.click(4), None);
     }
     #[test]
     fn 状态行包含关键信息() {

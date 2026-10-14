@@ -100,6 +100,11 @@ fn run_loop(
                 match mouse.kind {
                     MouseEventKind::ScrollDown => app.on_scroll(3),
                     MouseEventKind::ScrollUp => app.on_scroll(-3),
+                    // 左键点列表某一行就选中它（坐标换算由 App 负责：它手里有渲染时
+                    // 回填的列表位置与滚动偏移）
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        app.click(mouse.row);
+                    }
                     _ => {}
                 }
                 continue;
