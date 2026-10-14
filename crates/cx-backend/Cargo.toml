@@ -15,6 +15,10 @@ attohttpc = { version = "0.31", default-features = false, features = [
 base64.workspace = true
 cx-core.workspace = true
 cx-proto.workspace = true
+hex.workspace = true
+# 自实现 AWS SigV4：只用到 HMAC-SHA256。相比 aws-sdk-s3（连同 tokio/hyper），
+# 依赖数量与体积小两个数量级，也符合本项目"不用 async 运行时"的取舍。
+hmac.workspace = true
 log.workspace = true
 percent-encoding.workspace = true
 quick-xml.workspace = true
@@ -23,4 +27,5 @@ quick-xml.workspace = true
 rustls-pki-types = "1"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true

@@ -29,6 +29,14 @@ pub enum BackendError {
         detail: String,
     },
 
+    /// 目标不存在（404：对象缺失、桶缺失、路径不对）。
+    #[error("不存在：{0}")]
+    NotFound(String),
+
+    /// 与远端状态冲突（409：桶不存在、目录不存在、并发写冲突）。
+    #[error("冲突：{0}")]
+    Conflict(String),
+
     /// XML 解析失败（PROPFIND/LIST 响应）。
     #[error("XML 解析失败：{0}")]
     Xml(String),
@@ -72,6 +80,8 @@ impl BackendError {
             BackendError::Transport(_) => "transport",
             BackendError::Status { .. } => "status",
             BackendError::Unauthorized { .. } => "auth",
+            BackendError::NotFound(_) => "not_found",
+            BackendError::Conflict(_) => "conflict",
             BackendError::Xml(_) => "xml",
             BackendError::Malformed(_) => "malformed",
             BackendError::Config(_) => "config",

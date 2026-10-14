@@ -396,11 +396,33 @@ impl Config {
                     if backend.bucket.as_deref().unwrap_or("").trim().is_empty() {
                         problems.push(format!("后端 {name}（s3）缺少 bucket"));
                     }
+                    if backend
+                        .access_key_id
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                    {
+                        problems.push(format!("后端 {name}（s3）缺少 access_key_id"));
+                    }
+                    if backend.secret_access_key_file.is_none()
+                        && backend.secret_access_key_env.is_none()
+                    {
+                        problems.push(format!(
+                            "后端 {name}（s3）需要 secret_access_key_file 或 secret_access_key_env"
+                        ));
+                    }
                     if backend.secret_access_key_file.is_some()
                         && backend.secret_access_key_env.is_some()
                     {
                         problems.push(format!(
                             "后端 {name}（s3）同时配置了 secret_access_key_file 与 secret_access_key_env"
+                        ));
+                    }
+                    // AWS 官方端点必须走 virtual-host；自建端点通常要 path-style
+                    if backend.endpoint.is_none() && backend.path_style == Some(true) {
+                        problems.push(format!(
+                            "后端 {name}（s3）用的是 AWS 官方端点，不能强制 path-style"
                         ));
                     }
                 }

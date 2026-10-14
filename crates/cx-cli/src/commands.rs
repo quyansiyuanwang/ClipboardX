@@ -146,6 +146,13 @@ pub enum Command {
         command: SpaceCommand,
     },
 
+
+    Backend {
+        /// 子命令
+        #[command(subcommand)]
+        command: BackendCommand,
+    },
+
     /// 打开终端界面
     Tui,
 }
@@ -159,6 +166,92 @@ pub enum ConfigCommand {
     Show,
     /// 打印配置问题清单（等同 doctor 的配置部分）
     Check,
+}
+
+/// `cx backend` 的子命令。
+///
+/// 只改配置文件与凭据文件，**不碰网络**（`test` 除外，它为了能在守护进程未运行时
+/// 也能排障而直接连一次）。
+#[derive(Debug, Clone, Subcommand)]
+pub enum BackendCommand {
+    /// 列出已配置的后端
+    List {
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+    },
+    /// 添加后端
+    Add {
+        /// 后端种类与其参数
+        #[command(subcommand)]
+        kind: BackendAddCommand,
+    },
+    /// 移除后端（连同它的凭据文件）
+    Remove {
+        /// 后端名
+        name: String,
+    },
+    /// 测试连通性（直连一次，不需要守护进程在运行）
+    Test {
+        /// 后端名
+        name: String,
+    },
+}
+
+/// `cx backend add` 的子命令。
+#[derive(Debug, Clone, Subcommand)]
+pub enum BackendAddCommand {
+    /// WebDAV（Nextcloud / ownCloud / Apache mod_dav / nginx dav）
+    Webdav {
+        /// 后端名（唯一）
+        name: String,
+        /// 集合 URL（Nextcloud 形如 https://cloud.example.com/remote.php/dav/files/<用户>/clipboardx）
+        url: String,
+        /// 用户名（匿名 WebDAV 可省略）
+        #[arg(long)]
+        username: Option<String>,
+        /// 从标准输入读入口令（避免出现在命令行历史里）
+        #[arg(long)]
+        password_stdin: bool,
+        /// 自定义 CA 证书文件名（放在 secrets/ 下）
+        #[arg(long)]
+        ca_file: Option<String>,
+        /// 跳过 TLS 校验（仅调试）
+        #[arg(long)]
+        insecure: bool,
+    },
+    /// S3 兼容对象存储（AWS S3 / MinIO / Cloudflare R2 / 阿里云 OSS）
+    S3 {
+        /// 后端名（唯一）
+        name: String,
+        /// 桶名
+        #[arg(long)]
+        bucket: String,
+        /// 自定义端点（MinIO/R2 等；AWS 官方端点请省略）
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// 区域（默认 us-east-1）
+        #[arg(long)]
+        region: Option<String>,
+        /// 键前缀（建议形如 clipboardx/<空间>）
+        #[arg(long)]
+        prefix: Option<String>,
+        /// 访问密钥 id
+        #[arg(long)]
+        access_key_id: String,
+        /// 从标准输入读私有密钥（避免出现在命令行历史里）
+        #[arg(long)]
+        secret_stdin: bool,
+        /// 用 path-style 寻址（MinIO 通常需要；省略时按"自建端点即 path-style"推断）
+        #[arg(long)]
+        path_style: bool,
+        /// 自定义 CA 证书文件名
+        #[arg(long)]
+        ca_file: Option<String>,
+        /// 跳过 TLS 校验（仅调试）
+        #[arg(long)]
+        insecure: bool,
+    },
 }
 
 /// `cx service` 的子命令。
@@ -343,6 +436,8 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             Ok(ExitCode::SUCCESS)
         }
 
+        Command::Backend { command } => run_backend(paths, command),
+
         Command::Config { command } => match command {
             ConfigCommand::Path => {
                 println!("{}", paths.config_file().display());
@@ -517,4 +612,460 @@ fn read_stdin_text(limit: u64) -> Result<String, DaemonError> {
     }
     String::from_utf8(buffer)
         .map_err(|_| DaemonError::Protocol("标准输入不是合法 UTF-8".to_string()))
+}
+
+/// `cx backend` 的实现。
+///
+/// 设计取舍：这里**只改配置与凭据文件**，不碰网络（`Test` 例外——它存在的意义
+/// 就是"守护进程没起来时也能排障"，因此直接连一次）。附带的好处是"添加后端"
+/// 不需要守护进程在运行，安装脚本可以先写好配置再启动。
+fn run_backend(paths: &Paths, command: BackendCommand) -> Result<ExitCode, DaemonError> {
+    match command {
+        BackendCommand::List { json } => {
+            let config = Config::load_or_create(paths)?;
+            if json {
+                let items: Vec<serde_json::Value> = config
+                    .backends
+                    .iter()
+                    .map(|backend| {
+                        json!({
+                            "name": backend.name,
+                            "kind": backend.kind.as_str(),
+                            "enabled": backend.enabled,
+                            "target": backend_target(backend),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string())
+                );
+            } else if config.backends.is_empty() {
+                println!("还没有配置任何后端。");
+                println!(
+                    "例如：cx backend add webdav dav --url https://cloud.example.com/remote.php/dav/files/alice/clipboardx --username alice --password-stdin"
+                );
+                println!(
+                    "      cx backend add s3 oss --bucket clipboardx --endpoint http://127.0.0.1:9000 --access-key-id minioadmin --secret-stdin --path-style"
+                );
+            } else {
+                for backend in &config.backends {
+                    let state = if backend.enabled { "启用" } else { "停用" };
+                    println!(
+                        "{:<12} {:<7} {:<4} {}",
+                        backend.name,
+                        backend.kind.as_str(),
+                        state,
+                        backend_target(backend)
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        BackendCommand::Add { kind } => ok_or_failure(add_backend(paths, kind)?),
+
+        BackendCommand::Remove { name } => {
+            let mut config = Config::load_or_create(paths)?;
+            let before = config.backends.len();
+            config.backends.retain(|backend| backend.name != name);
+            if config.backends.len() == before {
+                eprintln!("没有名为 {name} 的后端（用 `cx backend list` 查看）");
+                return Ok(ExitCode::FAILURE);
+            }
+            config.save(paths)?;
+            // 凭据文件只删我们自己两种命名约定下的
+            for candidate in [format!("{name}.pass"), format!("{name}.key")] {
+                let path = paths.secret_file(&candidate);
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            println!("已移除后端 {name}");
+            println!("提示：`cx reload` 让运行中的守护进程重新读取配置。");
+            Ok(ExitCode::SUCCESS)
+        }
+
+        BackendCommand::Test { name } => ok_or_failure(test_backend(paths, &name)?),
+    }
+}
+
+/// 把"成功与否"映射成退出码。
+fn ok_or_failure(ok: bool) -> Result<ExitCode, DaemonError> {
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// 后端的一句话描述（`list` 与错误信息复用）。
+fn backend_target(backend: &cx_core::BackendSection) -> String {
+    match backend.kind {
+        cx_core::BackendKind::Webdav | cx_core::BackendKind::Server => backend
+            .url
+            .clone()
+            .unwrap_or_else(|| "（缺 url）".to_string()),
+        cx_core::BackendKind::S3 => {
+            let endpoint = backend
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| "AWS".to_string());
+            let bucket = backend
+                .bucket
+                .clone()
+                .unwrap_or_else(|| "（缺 bucket）".to_string());
+            let prefix = backend.prefix.clone().unwrap_or_default();
+            format!("{endpoint}/{bucket}/{prefix}")
+        }
+    }
+}
+
+/// 添加后端。
+fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonError> {
+    let mut config = Config::load_or_create(paths)?;
+    let section = match kind {
+        BackendAddCommand::Webdav {
+            name,
+            url,
+            username,
+            password_stdin,
+            ca_file,
+            insecure,
+        } => {
+            let mut section = empty_section(name, cx_core::BackendKind::Webdav);
+            section.url = Some(url);
+            section.username = username;
+            section.ca_file = ca_file;
+            section.insecure = insecure;
+            if password_stdin {
+                if section.username.is_some() {
+                    let file = format!("{}.pass", section.name);
+                    write_secret_file(paths, &file, &read_secret_stdin("口令")?)?;
+                    section.password_file = Some(file);
+                } else {
+                    eprintln!(
+                        "注意：没有 --username 时忽略 --password-stdin（匿名 WebDAV 不需要口令）"
+                    );
+                }
+            }
+            section
+        }
+        BackendAddCommand::S3 {
+            name,
+            bucket,
+            endpoint,
+            region,
+            prefix,
+            access_key_id,
+            secret_stdin,
+            path_style,
+            ca_file,
+            insecure,
+        } => {
+            let mut section = empty_section(name, cx_core::BackendKind::S3);
+            section.bucket = Some(bucket);
+            section.endpoint = endpoint;
+            section.region = region;
+            section.prefix = prefix;
+            section.access_key_id = Some(access_key_id);
+            section.ca_file = ca_file;
+            section.insecure = insecure;
+            // 省略时由后端按"有无自定义端点"推断（自建端点默认 path-style）
+            section.path_style = if path_style { Some(true) } else { None };
+            if secret_stdin {
+                let file = format!("{}.key", section.name);
+                write_secret_file(paths, &file, &read_secret_stdin("私有密钥")?)?;
+                section.secret_access_key_file = Some(file);
+            } else {
+                eprintln!(
+                    "提示：没给 --secret-stdin；之后可重跑本命令或手写 secret_access_key_file"
+                );
+            }
+            section
+        }
+    };
+
+    if config
+        .backends
+        .iter()
+        .any(|backend| backend.name == section.name)
+    {
+        eprintln!(
+            "已经有名为 {} 的后端了（先 `cx backend remove {}`）",
+            section.name, section.name
+        );
+        return Ok(false);
+    }
+
+    let name = section.name.clone();
+    config.backends.push(section);
+    // 先校验再落盘：宁可不保存，也不要留下一份自己都通不过的配置
+    let problems = config.problems();
+    if !problems.is_empty() {
+        eprintln!("配置有问题，未保存：");
+        for problem in &problems {
+            eprintln!("  - {problem}");
+        }
+        return Ok(false);
+    }
+    config.save(paths)?;
+
+    println!("已添加后端 {name}");
+    println!("下一步：cx backend test {name}   然后 cx reload（或 cx restart）");
+    Ok(true)
+}
+
+/// 造一个只有 name/kind 的后端配置。
+fn empty_section(name: String, kind: cx_core::BackendKind) -> cx_core::BackendSection {
+    cx_core::BackendSection {
+        name,
+        kind,
+        enabled: true,
+        url: None,
+        space: None,
+        token_file: None,
+        username: None,
+        password_file: None,
+        password_env: None,
+        ca_file: None,
+        insecure: false,
+        bucket: None,
+        prefix: None,
+        region: None,
+        endpoint: None,
+        access_key_id: None,
+        secret_access_key_file: None,
+        secret_access_key_env: None,
+        path_style: None,
+        poll_interval_ms: None,
+    }
+}
+
+/// 从标准输入读一条凭据（去掉首尾空白）。
+fn read_secret_stdin(label: &str) -> Result<String, DaemonError> {
+    eprint!("请输入{label}（回车结束）：");
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| DaemonError::Protocol(format!("读取{label}失败：{err}")))?;
+    let value = line.trim().to_string();
+    if value.is_empty() {
+        return Err(DaemonError::Protocol(format!("{label}不能为空")));
+    }
+    Ok(value)
+}
+
+/// 写入凭据文件（尽量收紧权限）。
+fn write_secret_file(paths: &Paths, file_name: &str, value: &str) -> Result<(), DaemonError> {
+    let path = paths.secret_file(file_name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| DaemonError::Protocol(format!("创建凭据目录失败：{err}")))?;
+    }
+    cx_core::fsutil::write_atomic(&path, value.as_bytes())
+        .map_err(|err| DaemonError::Protocol(format!("写入凭据文件失败：{err}")))?;
+    let _ = cx_core::fsutil::tighten_permissions(&path, false);
+    Ok(())
+}
+
+/// 直连测试一个后端（不需要守护进程在运行）。
+fn test_backend(paths: &Paths, name: &str) -> Result<bool, DaemonError> {
+    let config = Config::load(paths)?;
+    let Some(section) = config.backends.iter().find(|backend| backend.name == name) else {
+        eprintln!("没有名为 {name} 的后端（用 `cx backend list` 查看）");
+        return Ok(false);
+    };
+
+    let backend = cx_backend::build_backend(section, paths, std::time::Duration::from_secs(30))
+        .map_err(|err| DaemonError::Protocol(format!("无法构造后端 {name}：{err}")))?;
+    let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
+    let mut sync = cx_sync::RemoteSync::new(backend, &identity.device_id, &identity.name);
+
+    match sync.probe() {
+        Ok(summary) => {
+            println!("后端 {name} 可用：{summary}");
+            Ok(true)
+        }
+        Err(err) => {
+            eprintln!("后端 {name} 不可用：{err}");
+            if err.is_auth() {
+                eprintln!("提示：检查用户名/口令（S3 则是 access key 与 secret）是否正确。");
+            } else if err.kind() == "config" {
+                eprintln!("提示：`cx backend remove {name}` 后用 `cx backend add` 重新添加。");
+            } else {
+                eprintln!("提示：确认网络可达、地址正确；自建服务端需先建好桶或目录。");
+            }
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+    use cx_backend::s3_testserver::TestS3Server;
+    use cx_backend::testserver::TestWebDavServer;
+
+    fn temp_paths(tag: &str) -> Paths {
+        let root = std::env::temp_dir().join(format!(
+            "cx-cli-{tag}-{}-{}",
+            std::process::id(),
+            cx_core::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::from_root(&root);
+        paths.ensure().unwrap();
+        paths
+    }
+
+    #[test]
+    fn 后端描述覆盖三种种类() {
+        let mut webdav = empty_section("dav".to_string(), cx_core::BackendKind::Webdav);
+        webdav.url = Some("https://cloud.example.com/dav".to_string());
+        assert_eq!(backend_target(&webdav), "https://cloud.example.com/dav");
+
+        let mut s3 = empty_section("oss".to_string(), cx_core::BackendKind::S3);
+        s3.endpoint = Some("http://127.0.0.1:9000".to_string());
+        s3.bucket = Some("clipboardx".to_string());
+        s3.prefix = Some("space-a".to_string());
+        assert_eq!(
+            backend_target(&s3),
+            "http://127.0.0.1:9000/clipboardx/space-a"
+        );
+
+        // 没写端点时显示 AWS
+        s3.endpoint = None;
+        assert!(backend_target(&s3).starts_with("AWS/clipboardx"));
+    }
+
+    #[test]
+    fn 添加_webdav_后端会写配置与口令文件() {
+        let paths = temp_paths("add-webdav");
+        let ok = add_backend(
+            &paths,
+            BackendAddCommand::Webdav {
+                name: "dav".to_string(),
+                url: "https://cloud.example.com/remote.php/dav/files/alice/clipboardx".to_string(),
+                username: Some("alice".to_string()),
+                password_stdin: false,
+                ca_file: None,
+                insecure: false,
+            },
+        )
+        .unwrap();
+        assert!(ok, "应当添加成功");
+
+        let config = Config::load(&paths).unwrap();
+        assert_eq!(config.backends.len(), 1);
+        assert_eq!(config.backends[0].kind, cx_core::BackendKind::Webdav);
+        assert_eq!(config.backends[0].name, "dav");
+
+        // 重复添加应当被拒绝
+        let again = add_backend(
+            &paths,
+            BackendAddCommand::Webdav {
+                name: "dav".to_string(),
+                url: "https://other.example.com/dav".to_string(),
+                username: None,
+                password_stdin: false,
+                ca_file: None,
+                insecure: false,
+            },
+        )
+        .unwrap();
+        assert!(!again, "同名后端应当被拒绝");
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
+    fn 添加_s3_后端时缺少密钥会被校验拦下() {
+        let paths = temp_paths("add-s3");
+        // 没有 --secret-stdin ⇒ 缺少 secret 来源 ⇒ 配置校验不通过 ⇒ 不予保存
+        let ok = add_backend(
+            &paths,
+            BackendAddCommand::S3 {
+                name: "oss".to_string(),
+                bucket: "clipboardx".to_string(),
+                endpoint: Some("http://127.0.0.1:9000".to_string()),
+                region: Some("us-east-1".to_string()),
+                prefix: Some("space-a".to_string()),
+                access_key_id: "minioadmin".to_string(),
+                secret_stdin: false,
+                path_style: true,
+                ca_file: None,
+                insecure: false,
+            },
+        )
+        .unwrap();
+        assert!(!ok, "缺密钥应当被拦下");
+        let config = Config::load(&paths).unwrap();
+        assert!(config.backends.is_empty(), "不合法配置不应落盘");
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
+    fn 移除后端会删掉配置与凭据文件() {
+        let paths = temp_paths("remove");
+        write_secret_file(&paths, "oss.key", "minioadmin").unwrap();
+        let mut config = Config::load_or_create(&paths).unwrap();
+        let mut section = empty_section("oss".to_string(), cx_core::BackendKind::S3);
+        section.bucket = Some("clipboardx".to_string());
+        section.access_key_id = Some("minioadmin".to_string());
+        section.secret_access_key_file = Some("oss.key".to_string());
+        config.backends.push(section);
+        config.save(&paths).unwrap();
+        assert!(paths.secret_file("oss.key").exists());
+
+        let code = run_backend(
+            &paths,
+            BackendCommand::Remove {
+                name: "oss".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(code, _));
+        let config = Config::load(&paths).unwrap();
+        assert!(config.backends.is_empty());
+        assert!(!paths.secret_file("oss.key").exists(), "凭据文件也应被删除");
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
+    fn 直连测试能识别可用的_webdav_与_s3() {
+        let paths = temp_paths("probe");
+
+        // WebDAV：对着仓库内的测试服务端
+        let dav = TestWebDavServer::start();
+        let mut config = Config::load_or_create(&paths).unwrap();
+        let mut webdav = empty_section("dav".to_string(), cx_core::BackendKind::Webdav);
+        webdav.url = Some(dav.url());
+        config.backends.push(webdav);
+
+        // S3：对着会校验签名的测试服务端（桶还不存在，probe 会顺手建出来）
+        let s3 = TestS3Server::start("minioadmin", "minioadmin", "clipboardx");
+        let mut s3_section = empty_section("oss".to_string(), cx_core::BackendKind::S3);
+        s3_section.bucket = Some("clipboardx".to_string());
+        s3_section.endpoint = Some(s3.endpoint());
+        s3_section.access_key_id = Some("minioadmin".to_string());
+        s3_section.secret_access_key_env = Some("CX_TEST_S3_SECRET".to_string());
+        s3_section.path_style = Some(true);
+        config.backends.push(s3_section);
+        config.save(&paths).unwrap();
+
+        unsafe { std::env::set_var("CX_TEST_S3_SECRET", "minioadmin") };
+        assert!(test_backend(&paths, "dav").unwrap(), "WebDAV 后端应当可用");
+        assert!(test_backend(&paths, "oss").unwrap(), "S3 后端应当可用");
+        assert_eq!(s3.buckets_created(), 1, "probe 应当建出桶");
+        assert!(
+            s3.signature_failures().is_empty(),
+            "{:?}",
+            s3.signature_failures()
+        );
+        unsafe { std::env::remove_var("CX_TEST_S3_SECRET") };
+
+        // 不存在的后端名：给出明确失败而不是 panic
+        assert!(!test_backend(&paths, "nope").unwrap());
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
 }

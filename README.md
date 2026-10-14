@@ -46,6 +46,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 .\scripts\e2e-local.ps1        # 端到端：守护进程 + CLI + 真实剪贴板（会临时改写剪贴板并恢复）
 .\scripts\e2e-local.ps1 -NoClipboard   # 无头版本（CI 用）
 .\scripts\e2e-webdav.ps1       # 端到端：两台守护进程经真实 WebDAV（wsgidav）互相同步
+.\scripts\e2e-s3.ps1           # 端到端：两台守护进程经 S3 兼容存储（moto）互相同步
 .\scripts\build-msi.ps1        # 产出 dist\ClipboardX-<v>-x64.msi（WiX v4，版本锁定在仓库内）
 .\scripts\verify-msi.ps1 -Msi dist\ClipboardX-0.1.0-x64.msi
 ```

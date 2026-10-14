@@ -18,6 +18,7 @@
 use crate::date::parse_http_date;
 use crate::error::BackendError;
 use crate::http::{HttpSettings, configure};
+use crate::xml::resolve_entity;
 use crate::{PutOutcome, RemoteBackend, RemoteObject};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use quick_xml::Reader;
@@ -710,29 +711,6 @@ pub(crate) fn parse_multistatus(body: &[u8]) -> Result<Vec<RemoteObject>, Backen
     Ok(objects)
 }
 
-/// 解析实体引用名（不含 `&` 与 `;`）。
-///
-/// 支持五个预定义实体与数字字符引用（`&#34;` / `&#x22;`）。自己实现而不是依赖
-/// `quick-xml::escape`：只有这么几种，且能顺手覆盖数字引用与未知实体的保留策略。
-fn resolve_entity(name: &str) -> Option<String> {
-    match name {
-        "amp" => Some("&".to_string()),
-        "lt" => Some("<".to_string()),
-        "gt" => Some(">".to_string()),
-        "quot" => Some("\"".to_string()),
-        "apos" => Some("'".to_string()),
-        _ => {
-            let digits = name.strip_prefix('#')?;
-            let code = if let Some(hex) = digits.strip_prefix(['x', 'X']) {
-                u32::from_str_radix(hex, 16).ok()?
-            } else {
-                digits.parse::<u32>().ok()?
-            };
-            char::from_u32(code).map(|c| c.to_string())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,24 +995,6 @@ mod tests {
             "getetag"
         );
         assert_eq!(BytesStart::new("href").local_name().into_inner(), "href");
-    }
-
-    #[test]
-    fn 实体解析() {
-        assert_eq!(resolve_entity("quot").as_deref(), Some("\""));
-        assert_eq!(resolve_entity("amp").as_deref(), Some("&"));
-        assert_eq!(resolve_entity("lt").as_deref(), Some("<"));
-        assert_eq!(resolve_entity("gt").as_deref(), Some(">"));
-        assert_eq!(resolve_entity("apos").as_deref(), Some("'"));
-        // 数字引用（十进制与十六进制）
-        assert_eq!(resolve_entity("#34").as_deref(), Some("\""));
-        assert_eq!(resolve_entity("#x22").as_deref(), Some("\""));
-        assert_eq!(resolve_entity("#X22").as_deref(), Some("\""));
-        assert_eq!(resolve_entity("#20013").as_deref(), Some("中"));
-        // 未知或非法
-        assert!(resolve_entity("nbsp").is_none());
-        assert!(resolve_entity("#999999999").is_none());
-        assert!(resolve_entity("").is_none());
     }
 
     #[test]

@@ -105,12 +105,26 @@ impl RemoteSync {
 
     /// 探活（`cx backend test` / doctor 用）。
     pub fn probe(&mut self) -> Result<String, BackendError> {
+        // 先确保"根"可用：S3 上桶可能还不存在（自建 MinIO 首次使用很常见），
+        // 这一步会顺手把桶建出来；WebDAV 的根集合由用户事先配好，这里什么都不做。
+        let created = match self.backend.ensure_root() {
+            Ok(created) => created,
+            Err(err) => {
+                return Err(err);
+            }
+        };
+        let root_note = if created {
+            "；已自动创建根（S3 的桶）"
+        } else {
+            ""
+        };
+
         let space = if cx_backend::load_space_meta(&mut *self.backend)?.is_some() {
             "空间元数据：已存在"
         } else {
             "空间元数据：尚未写入（需要 cx space init/join）"
         };
-        Ok(format!("{}；{space}", self.backend.describe()))
+        Ok(format!("{}；{space}{root_note}", self.backend.describe()))
     }
 
     /// 发布一个对象，并把它记进自己的 manifest。
