@@ -878,9 +878,19 @@ fn add_backend_from_draft(
     println!("已添加后端 {name}（凭据写入 secrets/，权限 0600）");
 
     // 直连自测：让用户在界面里就能立刻知道配得对不对
-    match build_named_backend(paths, &name) {
-        Ok(backend) => println!("已构建后端：{}", backend.describe()),
-        Err(err) => println!("后端构建失败：{err}\n可以改完再试：cx backend test {name}"),
+    // 真实探测一次（与 `cx backend test` 同一条路径）：配得对不对当场就知道，
+    // 而不是等守护进程下一轮轮询才在面板里看到红色。
+    match build_named_backend(paths, &name).and_then(|backend| {
+        let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
+        let mut sync = cx_sync::RemoteSync::new(backend, &identity.device_id, &identity.name);
+        sync.probe()
+            .map_err(|err| DaemonError::Protocol(err.to_string()))
+    }) {
+        Ok(summary) => println!("连通性自测：通过（{summary}）"),
+        Err(err) => {
+            println!("连通性自测：失败——{err}");
+            println!("后端已保存，改好后可以再测：cx backend test {name}");
+        }
     }
 
     // 后端 worker 是启动时创建的，因此新增后端要重启守护进程才生效
