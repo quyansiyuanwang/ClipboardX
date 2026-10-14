@@ -15,7 +15,7 @@ mod kdf;
 
 pub use aead::Sealed;
 pub use error::CryptoError;
-pub use kdf::{KdfParams, SpaceKey, KDF_ARGON2ID, unwrap_space_key, wrap_space_key};
+pub use kdf::{KDF_ARGON2ID, KdfParams, SpaceKey, unwrap_space_key, wrap_space_key};
 
 /// 载荷加密算法标识（写入 `cx-space.json` 与 item 元数据）。
 pub const CIPHER_XCHACHA20POLY1305: &str = "xchacha20poly1305";

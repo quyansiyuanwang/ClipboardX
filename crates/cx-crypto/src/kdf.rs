@@ -7,7 +7,7 @@
 //! - 换口令只需重新包裹一次，不必重写历史对象。
 
 use crate::error::CryptoError;
-use crate::{aead, random_bytes, SPACE_KEY_LEN};
+use crate::{SPACE_KEY_LEN, aead, random_bytes};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -62,11 +62,17 @@ impl KdfParams {
     /// 参数自检：算法受支持、盐长度正确、开销在合理区间。
     pub fn validate(&self) -> Result<(), CryptoError> {
         if self.algo != KDF_ARGON2ID {
-            return Err(CryptoError::KdfParams(format!("不支持的算法 {}", self.algo)));
+            return Err(CryptoError::KdfParams(format!(
+                "不支持的算法 {}",
+                self.algo
+            )));
         }
         let salt = hex::decode(&self.salt).map_err(|e| CryptoError::Codec(e.to_string()))?;
         if salt.len() < 8 {
-            return Err(CryptoError::KdfParams(format!("盐过短：{} 字节", salt.len())));
+            return Err(CryptoError::KdfParams(format!(
+                "盐过短：{} 字节",
+                salt.len()
+            )));
         }
         if self.m_cost < 8 || self.t_cost < 1 || self.p_cost < 1 {
             return Err(CryptoError::KdfParams(
@@ -188,7 +194,10 @@ pub fn unwrap_space_key(
 }
 
 /// argon2id 派生 32 字节密钥。
-fn derive_key(passphrase: &[u8], params: &KdfParams) -> Result<zeroize::Zeroizing<[u8; 32]>, CryptoError> {
+fn derive_key(
+    passphrase: &[u8],
+    params: &KdfParams,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, CryptoError> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
     let salt = hex::decode(&params.salt).map_err(|e| CryptoError::Codec(e.to_string()))?;
@@ -233,10 +242,13 @@ mod tests {
     }
 
     #[test]
-    fn AAD_不匹配时解密失败() {
+    fn aad_不匹配时解密失败() {
         let key = SpaceKey::generate().unwrap();
         let sealed = key.seal("a.cxi", b"hello").unwrap();
-        assert!(key.open("b.cxi", &sealed.nonce, &sealed.ciphertext).is_err());
+        assert!(
+            key.open("b.cxi", &sealed.nonce, &sealed.ciphertext)
+                .is_err()
+        );
     }
 
     #[test]
@@ -244,7 +256,10 @@ mod tests {
         let key = SpaceKey::generate().unwrap();
         let mut sealed = key.seal("a.cxi", b"hello world").unwrap();
         sealed.ciphertext[0] ^= 0x01;
-        assert!(key.open("a.cxi", &sealed.nonce, &sealed.ciphertext).is_err());
+        assert!(
+            key.open("a.cxi", &sealed.nonce, &sealed.ciphertext)
+                .is_err()
+        );
     }
 
     #[test]
@@ -252,7 +267,10 @@ mod tests {
         let key1 = SpaceKey::generate().unwrap();
         let key2 = SpaceKey::generate().unwrap();
         let sealed = key1.seal("a.cxi", b"hello").unwrap();
-        assert!(key2.open("a.cxi", &sealed.nonce, &sealed.ciphertext).is_err());
+        assert!(
+            key2.open("a.cxi", &sealed.nonce, &sealed.ciphertext)
+                .is_err()
+        );
     }
 
     #[test]

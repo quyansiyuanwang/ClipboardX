@@ -21,18 +21,22 @@ pub struct Sealed {
 
 /// 用 32 字节密钥加密；AAD 参与认证但不加密。
 pub fn seal_with_key(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Sealed, CryptoError> {
-    let nonce: [u8; NONCE_LEN] = crate::random_bytes()?;
+    let nonce_bytes: [u8; NONCE_LEN] = crate::random_bytes()?;
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::KeyLength)?;
+    let nonce = XNonce::from(nonce_bytes);
     let ciphertext = cipher
         .encrypt(
-            XNonce::from(nonce),
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad,
             },
         )
         .map_err(|_| CryptoError::Encrypt)?;
-    Ok(Sealed { nonce, ciphertext })
+    Ok(Sealed {
+        nonce: nonce_bytes,
+        ciphertext,
+    })
 }
 
 /// 用 32 字节密钥解密；任何不匹配（密钥、AAD、密文、标签）都返回
@@ -47,9 +51,10 @@ pub fn open_with_key(
         return Err(CryptoError::Decrypt);
     }
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::KeyLength)?;
+    let nonce = XNonce::from(*nonce);
     cipher
         .decrypt(
-            XNonce::from(*nonce),
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad,
