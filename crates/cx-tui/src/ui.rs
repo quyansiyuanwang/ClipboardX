@@ -58,6 +58,42 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.wizard.is_some() {
         draw_wizard(frame, area, app);
     }
+    if let Some(name) = &app.pending_backend_remove {
+        draw_confirm_remove(frame, area, name);
+    }
+}
+
+/// 移除后端的确认：与删除历史条目一样，破坏性操作默认"不删"。
+fn draw_confirm_remove(frame: &mut Frame<'_>, area: Rect, name: &str) {
+    let popup = centered(area, 64, 30);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("移除后端 {name}？"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  只删本机配置与凭据，不删除已上传到该后端的对象；"),
+        Line::from("  其他已配置的后端不受影响。之后可以再按 a 添加回来。"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y / 回车", Style::default().fg(Color::Yellow)),
+            Span::raw("  移除　　"),
+            Span::styled("其他任意键", Style::default().fg(Color::DarkGray)),
+            Span::raw("  取消"),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" 确认移除 ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 /// 删除确认：唯一会真的丢内容的操作，因此单独一个浮层，且默认是"不删"。
@@ -726,7 +762,16 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     ("●", Style::default().fg(Color::Green))
                 };
+                let selected = status
+                    .backends
+                    .iter()
+                    .position(|item| item.name == backend.name)
+                    == Some(app.panel_backend());
                 lines.push(Line::from(vec![
+                    Span::styled(
+                        if selected { "▶ " } else { "  " },
+                        Style::default().fg(Color::Cyan),
+                    ),
                     Span::styled(format!("{mark} "), style),
                     Span::styled(
                         format!("{:<10}", backend.name),
@@ -802,7 +847,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  b / Esc 关闭　J/K 或 PgUp/PgDn 滚动　0 回到开头",
+        "  ↑↓ 选后端　x 移除选中　b/Esc 关闭　J/K 或 PgUp/PgDn 滚动　0 回到开头",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -1489,6 +1534,41 @@ mod tests {
             "设备名占了 {} 列",
             display_width(&source)
         );
+    }
+    #[test]
+    fn 面板里选中后端有标记且移除确认说明影响范围() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": [
+                    backend("home", "server", true, 0, None),
+                    backend("oss", "s3", true, 0, None)
+                ],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        app.show_panel = true;
+        let screen = render(&mut app, 120, 30);
+        assert!(has(&screen, "▶"), "选中的后端要有标记：{screen}");
+        assert!(has(&screen, "↑↓ 选后端"), "页脚要说明怎么选：{screen}");
+        assert!(has(&screen, "x 移除选中"), "{screen}");
+
+        // 确认浮层
+        app.pending_backend_remove = Some("home".to_string());
+        let screen = render(&mut app, 120, 30);
+        assert!(has(&screen, "确认移除"), "{screen}");
+        assert!(has(&screen, "移除后端 home？"), "{screen}");
+        assert!(
+            has(&screen, "不删除已上传到该后端的对象"),
+            "要说清影响范围：{screen}"
+        );
+        assert!(has(&screen, "y / 回车"), "{screen}");
     }
     #[test]
     fn 空历史时不会_panic() {
