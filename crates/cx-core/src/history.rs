@@ -197,6 +197,67 @@ impl History {
         max_items > 0 && self.entries.len() > max_items.saturating_mul(4)
     }
 
+    /// 删除一条历史（位置 0 = 最新），返回被删掉的条目。
+    ///
+    /// 日志是追加式的，"删一条"只能靠重写：把其余条目的帧依次写进临时文件、原子替换，
+    /// 同时重算偏移并重写索引。代价是 O(n)，但历史本来就只有几百条。
+    ///
+    /// **只动本机历史**：不删后端对象、不改写已发布的清单、不通知其他设备——别的设备上
+    /// 仍然留着它自己的副本。这个边界是刻意的：真正的多端删除要处理墓碑与冲突
+    /// （"我删了、他又发上来"算谁赢），没有想清楚之前不做。
+    pub fn delete_at(&mut self, position: usize) -> Result<HistoryEntry, CoreError> {
+        if self.entries.is_empty() {
+            return Err(CoreError::HistoryCorrupt(
+                "历史为空，没有可删除的条目".to_string(),
+            ));
+        }
+        if position >= self.entries.len() {
+            return Err(CoreError::HistoryCorrupt(format!(
+                "位置 {position} 超出范围（共 {} 条）",
+                self.entries.len()
+            )));
+        }
+        // entries 是插入顺序（最旧在前），而位置 0 表示最新
+        let index = self.entries.len() - 1 - position;
+        let removed = self.entries[index].clone();
+
+        let tmp_log = self.log_path.with_extension("log.delete");
+        let mut out = std::fs::File::create(&tmp_log).map_err(|e| CoreError::io(&tmp_log, e))?;
+        let mut new_entries = Vec::with_capacity(self.entries.len() - 1);
+        let mut offset = 0u64;
+
+        for (current, entry) in self.entries.iter().enumerate() {
+            if current == index {
+                continue;
+            }
+            // 逐条重新读出来再写：偏移会变，索引必须跟着重算
+            let item = self.read_entry(entry)?;
+            let bytes = item.encode()?;
+            let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + bytes.len());
+            frame.extend_from_slice(&FRAME_MAGIC);
+            frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&bytes);
+            out.write_all(&frame)
+                .map_err(|e| CoreError::io(&tmp_log, e))?;
+
+            let mut updated = entry.clone();
+            updated.offset = offset;
+            updated.frame_len = frame.len() as u32;
+            offset += frame.len() as u64;
+            new_entries.push(updated);
+        }
+        out.flush().map_err(|e| CoreError::io(&tmp_log, e))?;
+        out.sync_all().map_err(|e| CoreError::io(&tmp_log, e))?;
+        drop(out);
+
+        // 先替换日志再更新内存状态：中途失败时磁盘上仍是旧日志，索引也还没动
+        std::fs::rename(&tmp_log, &self.log_path).map_err(|e| CoreError::io(&self.log_path, e))?;
+        self.log_size = offset;
+        self.entries = new_entries;
+        self.write_index()?;
+        Ok(removed)
+    }
+
     /// 压缩：只保留最新 `keep` 条，重写日志与索引（原子替换）。
     ///
     /// 返回保留下来的条目数。
@@ -455,6 +516,93 @@ mod tests {
         format!("{created_ms:013}-ab12cd34-{hash_short}.cxi")
     }
 
+    #[test]
+    fn 删除中间一条后其余条目仍可完整读回() {
+        let paths = temp_paths("delete-middle");
+        let mut history = History::open(&paths).unwrap();
+        for index in 0..5 {
+            let text = format!("第 {index} 条");
+            let item = make_item(&text, 1_000 + index);
+            history
+                .append(&make_name(1_000 + index, &format!("{index:08}")), &item)
+                .unwrap();
+        }
+        assert_eq!(history.len(), 5);
+
+        // 位置 2（0 = 最新）=> 插入序里的第 3 条，也就是 created_ms = 1002
+        let removed = history.delete_at(2).unwrap();
+        assert_eq!(removed.created_ms, 1_002, "被删的应当是那一条");
+        assert_eq!(history.len(), 4);
+
+        // 剩下的条目内容必须仍然读得回来（偏移被重算过，这里就是在验这一点）
+        for (index, created) in [(0usize, 1_004u64), (1, 1_003), (2, 1_001), (3, 1_000)] {
+            let entry = history.newest_first(10)[index].clone();
+            assert_eq!(entry.created_ms, created, "第 {index} 条不对");
+            let item = history.read_entry(&entry).unwrap();
+            assert_eq!(
+                String::from_utf8(item.payload.clone()).unwrap(),
+                format!("第 {} 条", created - 1_000)
+            );
+        }
+
+        // 关掉再打开：索引与日志必须自洽（重开走的是索引路径）
+        drop(history);
+        let reopened = History::open(&paths).unwrap();
+        assert_eq!(reopened.len(), 4);
+        assert_eq!(reopened.skipped_frames(), 0, "不该有被跳过的帧");
+        let item = reopened.read_entry(reopened.newest_first(1)[0]).unwrap();
+        assert_eq!(String::from_utf8(item.payload.clone()).unwrap(), "第 4 条");
+
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap_or(&paths.data_dir));
+    }
+
+    #[test]
+    fn 删除最新与最旧都不越界() {
+        let paths = temp_paths("delete-ends");
+        let mut history = History::open(&paths).unwrap();
+        for index in 0..3 {
+            let item = make_item(&format!("内容 {index}"), 2_000 + index);
+            history
+                .append(&make_name(2_000 + index, &format!("{index:08}")), &item)
+                .unwrap();
+        }
+
+        // 位置 0 = 最新
+        let newest = history.delete_at(0).unwrap();
+        assert_eq!(newest.created_ms, 2_002);
+        // 剩下的最后一条 = 最旧
+        let oldest = history.delete_at(1).unwrap();
+        assert_eq!(oldest.created_ms, 2_000);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.newest_first(1)[0].created_ms, 2_001);
+
+        // 删到只剩一条再删：应当变空且不报错
+        history.delete_at(0).unwrap();
+        assert!(history.is_empty());
+        assert_eq!(history.newest_first(10).len(), 0);
+
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap_or(&paths.data_dir));
+    }
+
+    #[test]
+    fn 越界或空历史删除给出明确错误() {
+        let paths = temp_paths("delete-bounds");
+        let mut history = History::open(&paths).unwrap();
+
+        let err = history.delete_at(0).unwrap_err();
+        assert!(err.to_string().contains("历史为空"), "{err}");
+
+        let item = make_item("唯一一条", 3_000);
+        history
+            .append(&make_name(3_000, "00000001"), &item)
+            .unwrap();
+        let err = history.delete_at(3).unwrap_err();
+        assert!(err.to_string().contains("超出范围"), "{err}");
+        assert!(err.to_string().contains("共 1 条"), "{err}");
+        assert_eq!(history.len(), 1, "失败的删除不该改动任何东西");
+
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap_or(&paths.data_dir));
+    }
     #[test]
     fn 追加与读取往返() {
         let paths = temp_paths("append");

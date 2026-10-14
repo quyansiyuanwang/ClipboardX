@@ -42,6 +42,8 @@ pub enum KeyOutcome {
     Reload,
     /// 拉一次诊断（后端面板要用）。
     Doctor,
+    /// 删除一条本机历史（位置 0 = 最新）。
+    Delete(usize),
 }
 
 /// 一条提示信息。
@@ -136,6 +138,8 @@ pub struct App {
     pub show_panel: bool,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
     pub doctor: Option<DoctorReport>,
+    /// 等待确认的删除位置（删除是破坏性操作，必须先确认一次）。
+    pub pending_delete: Option<usize>,
     /// 后台线程是否还在跑。
     pub running: bool,
 }
@@ -464,6 +468,20 @@ impl App {
             return KeyOutcome::None;
         }
 
+        // 删除确认：只有 y/回车 才真的删，其他任何键都取消
+        if let Some(position) = self.pending_delete {
+            self.pending_delete = None;
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    KeyOutcome::Delete(position)
+                }
+                _ => {
+                    self.note("已取消删除");
+                    KeyOutcome::None
+                }
+            };
+        }
+
         // 面板与帮助页都是"看一眼就关"的浮层：任意键关闭（q 退出）
         if self.show_panel {
             return match key.code {
@@ -587,6 +605,17 @@ impl App {
                     KeyOutcome::Pause
                 }
             }
+            // 删除要先确认：这是唯一会真的丢内容的操作
+            KeyCode::Char('d') => match self.selected_position() {
+                Some(position) => {
+                    self.pending_delete = Some(position);
+                    KeyOutcome::None
+                }
+                None => {
+                    self.warn("没有可删除的条目");
+                    KeyOutcome::None
+                }
+            },
             KeyCode::Char('r') => KeyOutcome::Refresh,
             KeyCode::Char('p') => KeyOutcome::Push,
             KeyCode::Char('R') => KeyOutcome::Reload,
@@ -1244,6 +1273,52 @@ mod tests {
         assert!(doctor.checks.iter().any(|check| check.name == "局域网"));
     }
 
+    #[test]
+    fn 删除必须确认_其他键一律取消() {
+        let mut app = app_with(3);
+        app.down(); // 选中位置 1
+        assert_eq!(app.on_key(key(KeyCode::Char('d'))), KeyOutcome::None);
+        assert_eq!(app.pending_delete, Some(1), "d 只是进入确认，不该立刻删");
+
+        // 取消：任何非 y/回车 的键
+        assert_eq!(app.on_key(key(KeyCode::Char('n'))), KeyOutcome::None);
+        assert!(app.pending_delete.is_none());
+        assert!(!app.notice.as_ref().unwrap().is_error);
+
+        // 确认
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.on_key(key(KeyCode::Char('y'))), KeyOutcome::Delete(1));
+        assert!(app.pending_delete.is_none(), "确认后应当清掉待确认状态");
+        // 回车也算确认
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), KeyOutcome::Delete(1));
+    }
+
+    #[test]
+    fn 确认浮层打开时按键不会触发别的命令() {
+        let mut app = app_with(3);
+        // 这些键在平时分别是"发布/暂停/退出"，确认态里只能算取消。
+        // 每次都要重新打开确认——第一次按键已经把它关掉了（这正是上一版测试写错的地方）。
+        for ch in ['p', ' ', 'q'] {
+            assert_eq!(app.on_key(key(KeyCode::Char('d'))), KeyOutcome::None);
+            assert!(app.pending_delete.is_some(), "d 应当打开确认");
+            assert_eq!(
+                app.on_key(key(KeyCode::Char(ch))),
+                KeyOutcome::None,
+                "{ch} 在确认态里只应当取消，不该触发对应命令"
+            );
+            assert!(app.pending_delete.is_none());
+        }
+    }
+
+    #[test]
+    fn 没有条目时按_d_给提示() {
+        let mut app = App::new();
+        assert_eq!(app.on_key(key(KeyCode::Char('d'))), KeyOutcome::None);
+        assert!(app.pending_delete.is_none());
+        assert!(app.notice.as_ref().unwrap().is_error);
+        assert!(app.notice.as_ref().unwrap().text.contains("没有可删除"));
+    }
     #[test]
     fn 状态行包含关键信息() {
         let mut app = App::new();

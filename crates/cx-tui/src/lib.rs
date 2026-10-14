@@ -122,6 +122,12 @@ fn run_loop(
                         app.forget_previews();
                     }
                     KeyOutcome::Doctor => client.request_doctor(),
+                    KeyOutcome::Delete(position) => {
+                        client.request_delete(position);
+                        // 删完立刻刷新：列表里那一条应当马上消失
+                        client.request_history(HISTORY_LIMIT);
+                        app.forget_previews();
+                    }
                     KeyOutcome::Push => client.request_push(),
                     KeyOutcome::Reload => client.request("reload"),
                 }

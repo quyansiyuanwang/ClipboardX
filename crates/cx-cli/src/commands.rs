@@ -96,6 +96,12 @@ pub enum Command {
         position: usize,
     },
 
+    /// 删除一条本机历史（只动本机：不删后端对象、不影响其他设备）
+    Delete {
+        /// 位置：0 = 最新
+        position: usize,
+    },
+
     /// 立即发布内容（默认发布当前剪贴板）
     Push {
         /// 直接指定文本
@@ -411,6 +417,19 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             args.insert("position".to_string(), json!(position));
             client.request(commands::COPY, args)?;
             println!("已把第 {position} 条（0 = 最新）写回剪贴板");
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Command::Delete { position } => {
+            let mut client = ControlClient::connect(paths)?;
+            let mut args = Map::new();
+            args.insert("position".to_string(), json!(position));
+            client.request(commands::HISTORY_DELETE, args)?;
+            // 删除只作用于本机历史：把边界说清楚，别让人以为别的设备上也没了
+            println!(
+                "已删除第 {position} 条（0 = 最新）的本机历史。\n\
+                 注意：这是本机动作——后端对象与其他设备上的副本不受影响。"
+            );
             Ok(ExitCode::SUCCESS)
         }
 

@@ -29,6 +29,8 @@ pub mod cmd {
     pub const HISTORY_SHOW: &str = "history.show";
     /// 把历史中的某条写回本机剪贴板。
     pub const COPY: &str = "copy";
+    /// 删除一条本机历史（位置 0 = 最新）。只动本机，不传播给其他设备。
+    pub const HISTORY_DELETE: &str = "history.delete";
     /// 立即发布当前剪贴板（或指定内容）。
     pub const PUSH: &str = "push";
     /// 立即拉取一次所有后端。

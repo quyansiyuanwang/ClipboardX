@@ -80,6 +80,13 @@ pub enum Command {
         /// 文本预览的最大字符数。
         max_chars: usize,
     },
+    /// 删除一条本机历史。只动本机：不删后端对象、不改已发布清单、不通知其他设备。
+    HistoryDelete {
+        /// 请求 id。
+        id: u64,
+        /// 位置（0 = 最新）。
+        position: usize,
+    },
     /// 把历史内容写回本机剪贴板。
     Copy {
         /// 请求 id。
@@ -407,6 +414,16 @@ impl Engine {
                     body: error_body(&err),
                 })],
             },
+            Command::HistoryDelete { id, position } => match self.delete_from_history(position) {
+                Ok((remaining, name)) => {
+                    log::info!("已删除历史条目 {name}（剩余 {remaining} 条）");
+                    vec![Action::Reply(ReplyPayload::Done { id })]
+                }
+                Err(err) => vec![Action::Reply(ReplyPayload::Error {
+                    id,
+                    body: error_body(&err),
+                })],
+            },
             Command::Copy { id, position } => match self.copy_from_history(now_ms, position) {
                 Ok(actions) => {
                     let mut out = vec![Action::Reply(ReplyPayload::Done { id })];
@@ -698,6 +715,18 @@ impl Engine {
     }
 
     /// 把历史内容写回剪贴板（`cx copy`）。
+    /// 删除一条本机历史，返回 `(剩余条数, 被删对象名)`。
+    ///
+    /// 删除后把名字留在已处理集合里：删除只作用于本机，而后端的游标如果还没越过它，
+    /// 下一次轮询会把它重新拉回来——用户刚刚明确说不要它了，不该再冒出来。
+    fn delete_from_history(&mut self, position: usize) -> Result<(usize, String), CoreError> {
+        let removed = self.history.delete_at(position)?;
+        self.seen.insert(&removed.name);
+        self.state.mark_seen(&removed.name);
+        let _ = self.state.save(&self.paths);
+        Ok((self.history.len(), removed.name))
+    }
+
     fn copy_from_history(
         &mut self,
         now_ms: u64,
@@ -1334,6 +1363,58 @@ mod tests {
         assert_eq!(h.engine.history_len(), 1, "但仍应入库，便于 cx copy");
     }
 
+    #[test]
+    fn 删除本机历史后条目消失且不会立刻被拉回来() {
+        let mut h = Harness::new(Config::default());
+        h.feed(Harness::text("第一条"));
+        h.tick(10);
+        h.feed(Harness::text("第二条"));
+        h.tick(20);
+        h.feed(Harness::text("第三条"));
+        h.tick(30);
+        assert_eq!(h.engine.history_len(), 3);
+
+        // 删掉位置 1（0 = 最新）=> 中间那条
+        let actions = h.engine.handle(
+            h.now,
+            Event::Command(Command::HistoryDelete { id: 7, position: 1 }),
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Reply(_))),
+            "应当回一条应答"
+        );
+        assert_eq!(h.engine.history_len(), 2, "历史应当少一条");
+
+        // 删除只作用于本机历史，因此不该产生任何发布动作
+        assert!(published(&actions).is_none(), "删除不该顺手发布什么");
+
+        // 它仍然留在"已处理"集合里：某个后端游标落后而重新拉到它时，不该再应用一次
+        let name = h
+            .engine
+            .recent_entries(10)
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(name.len(), 2);
+        assert!(!name.iter().any(|n| n.contains("第二条")));
+    }
+
+    #[test]
+    fn 越界删除返回错误而不是悄悄成功() {
+        let mut h = Harness::new(Config::default());
+        h.feed(Harness::text("只有一条"));
+        h.tick(10);
+
+        let actions = h.engine.handle(
+            h.now,
+            Event::Command(Command::HistoryDelete { id: 9, position: 5 }),
+        );
+        let replied_error = actions
+            .iter()
+            .any(|a| matches!(a, Action::Reply(ReplyPayload::Error { .. })));
+        assert!(replied_error, "越界删除应当回一条失败应答");
+        assert_eq!(h.engine.history_len(), 1, "失败的删除不该改动历史");
+    }
     #[test]
     fn only_if_idle_在本机剪贴板被用户占用时跳过() {
         let mut config = Config::default();

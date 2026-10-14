@@ -51,6 +51,42 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.show_panel {
         draw_panel(frame, area, app);
     }
+    if let Some(position) = app.pending_delete {
+        draw_confirm_delete(frame, area, position);
+    }
+}
+
+/// 删除确认：唯一会真的丢内容的操作，因此单独一个浮层，且默认是"不删"。
+fn draw_confirm_delete(frame: &mut Frame<'_>, area: Rect, position: usize) {
+    let popup = centered(area, 62, 30);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("删除第 {position} 条？"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  只从本机历史里移除。后端对象与其他设备上的副本不受影响，"),
+        Line::from("  已复制到别处的内容也不会被追回。"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y / 回车", Style::default().fg(Color::Yellow)),
+            Span::raw("  删除　　"),
+            Span::styled("其他任意键", Style::default().fg(Color::DarkGray)),
+            Span::raw("  取消"),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" 确认删除 ")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 /// 画主体（列表 + 预览），返回列表的可视行数供调用方回填。
@@ -372,7 +408,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
     } else if app.filter_active() {
         " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　/ 改过滤　Esc 清过滤　? 帮助　q 退出 "
     } else {
-        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　b 后端状态　/ 过滤　? 帮助　q 退出 "
+        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　d 删除　b 后端状态　/ 过滤　? 帮助　q 退出 "
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -554,6 +590,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  p                立即发布本机剪贴板"),
         Line::from("  r                刷新状态与历史"),
         Line::from("  R                重新读取配置"),
+        Line::from("  d                删除选中项（本机历史，会先确认）"),
         Line::from("  b                后端与连接面板（各后端健康、局域网对端）"),
         Line::from("  ?                帮助（本页）"),
         Line::from("  q                退出"),
@@ -1034,6 +1071,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn 删除确认浮层说明影响范围与按键() {
+        let mut app = app_with(3);
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = render(&mut app, 120, 30);
+        assert!(has(&screen, "确认删除"), "{screen}");
+        assert!(has(&screen, "删除第 0 条？"), "{screen}");
+        assert!(
+            has(&screen, "其他设备上的副本不受影响"),
+            "要说明只动本机：{screen}"
+        );
+        assert!(has(&screen, "y / 回车"), "{screen}");
+        assert!(has(&screen, "取消"), "{screen}");
+    }
+
+    #[test]
+    fn 页脚与帮助都提到删除键() {
+        let mut app = app_with(1);
+        let screen = render(&mut app, 140, 24);
+        assert!(has(&screen, "d 删除"), "页脚应当提到 d：{screen}");
+
+        let mut help = app_with(1);
+        help.show_help = true;
+        let screen = render(&mut help, 130, 40);
+        assert!(has(&screen, "删除选中项"), "{screen}");
+        assert!(has(&screen, "会先确认"), "帮助里要说明需要确认：{screen}");
+    }
     #[test]
     fn 空历史时不会_panic() {
         let mut app = App::new();
