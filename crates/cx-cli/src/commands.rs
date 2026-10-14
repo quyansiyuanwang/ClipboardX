@@ -1212,7 +1212,9 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
     config.save(paths)?;
 
     println!("已添加后端 {name}");
-    println!("下一步：cx backend test {name}   然后 cx reload（或 cx restart）");
+    // 别写成"cx reload 即可"：reload 只重载引擎侧配置，后端 worker 是守护进程启动时
+    // 创建的，新增后端必须重启才会真正开始同步（这条引导之前是错的）。
+    println!("下一步：cx backend test {name}   然后重启守护进程生效：cx restart");
     Ok(true)
 }
 
