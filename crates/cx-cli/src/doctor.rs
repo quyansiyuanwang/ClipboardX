@@ -239,7 +239,18 @@ fn secret_permissions_check(paths: &Paths) -> DoctorCheck {
             format!("{checked} 个密钥文件都在用户目录下（Windows 权限由 ACL 表达）")
         }
     } else {
-        complaints.join("；")
+        // 报出问题还要给出怎么修：只说"应为 600"，用户下一步仍要自己查怎么改权限
+        #[cfg(unix)]
+        {
+            format!(
+                "{}；修复：对上面这些文件执行 chmod 600（目录用 700）",
+                complaints.join("；")
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            complaints.join("；")
+        }
     };
 
     DoctorCheck {
