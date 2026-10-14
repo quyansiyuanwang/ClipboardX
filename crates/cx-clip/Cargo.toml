@@ -7,3 +7,18 @@ license.workspace = true
 description = "ClipboardX 剪贴板适配层：clipboard-rs 读写与变更监听，含测试替身"
 
 [dependencies]
+blake3.workspace = true
+crossbeam-channel.workspace = true
+cx-proto.workspace = true
+hex.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+log.workspace = true
+thiserror.workspace = true
+
+# Linux 额外启用 Wayland 支持（wl-clipboard-rs），X11 由默认的 x11rb 提供。
+# 用 target 依赖而不是全局 feature：避免在 Windows/macOS 上白拉一份 wayland 依赖。
+[target.'cfg(target_os = "linux")'.dependencies]
+clipboard-rs = { version = "0.3.5", features = ["image", "wayland"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+clipboard-rs = { version = "0.3.5", features = ["image"] }
