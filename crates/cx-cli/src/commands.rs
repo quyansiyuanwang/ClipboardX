@@ -798,7 +798,12 @@ fn set_backend_enabled(paths: &Paths, name: &str) -> Result<bool, DaemonError> {
     Ok(enabled)
 }
 
-/// 从配置里移除一个后端（界面里移除后端的落地口）。
+/// 从配置里移除一个后端，并清掉它自己的凭据文件。
+///
+/// CLI 的 `cx backend remove` 与界面里的移除都走这里——一份实现，行为不会分叉。
+///
+/// 凭据按**前缀**清理（`<名>.<后缀>`），而不是列举已知后缀：写入侧用过 `.pass`/`.key`，
+/// 表单写入用 `.token`/`.password`/`.secret`，列举迟早会漏掉一种，把凭据留在盘上。
 fn remove_backend(paths: &Paths, name: &str) -> Result<(), DaemonError> {
     let mut config = Config::load_or_create(paths)?;
     let before = config.backends.len();
@@ -807,6 +812,16 @@ fn remove_backend(paths: &Paths, name: &str) -> Result<(), DaemonError> {
         return Err(DaemonError::Protocol(format!("没有名为 {name} 的后端")));
     }
     config.save(paths)?;
+
+    let prefix = format!("{name}.");
+    if let Ok(entries) = std::fs::read_dir(paths.secrets_dir()) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1016,23 +1031,14 @@ fn run_backend(paths: &Paths, command: BackendCommand) -> Result<ExitCode, Daemo
         BackendCommand::Add { kind } => ok_or_failure(add_backend(paths, kind)?),
 
         BackendCommand::Remove { name } => {
-            let mut config = Config::load_or_create(paths)?;
-            let before = config.backends.len();
-            config.backends.retain(|backend| backend.name != name);
-            if config.backends.len() == before {
-                eprintln!("没有名为 {name} 的后端（用 `cx backend list` 查看）");
+            // 与界面里的移除共用一份实现（含凭据清理）
+            if let Err(err) = remove_backend(paths, &name) {
+                eprintln!("{err}（用 `cx backend list` 查看）");
                 return Ok(ExitCode::FAILURE);
             }
-            config.save(paths)?;
-            // 凭据文件只删我们自己两种命名约定下的
-            for candidate in [format!("{name}.pass"), format!("{name}.key")] {
-                let path = paths.secret_file(&candidate);
-                if path.exists() {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
             println!("已移除后端 {name}");
-            println!("提示：`cx reload` 让运行中的守护进程重新读取配置。");
+            // 说清生效条件：后端 worker 是守护进程启动时创建的，reload 不重建它
+            println!("提示：需要重启守护进程才能生效（cx stop && cx start）。");
             Ok(ExitCode::SUCCESS)
         }
 
@@ -1341,12 +1347,24 @@ mod backend_tests {
             poll_interval_ms: None,
         });
         config.save(&paths).unwrap();
+        // 放两个该后端的凭据文件（两种历史命名都放，验证按前缀清理）
+        std::fs::create_dir_all(paths.secrets_dir()).unwrap();
+        let token = paths.secret_file("home.token");
+        let pass = paths.secret_file("home.pass");
+        std::fs::write(&token, "t").unwrap();
+        std::fs::write(&pass, "p").unwrap();
 
         super::remove_backend(&paths, "home").unwrap();
         let after = Config::load(&paths).unwrap();
         assert!(
             !after.backends.iter().any(|backend| backend.name == "home"),
             "移除后配置里不该还有它"
+        );
+        assert!(!token.exists(), "凭据文件应当被清掉：{}", token.display());
+        assert!(
+            !pass.exists(),
+            "按前缀清理就该覆盖所有历史命名：{}",
+            pass.display()
         );
 
         // 再移除一次应当明确报错，而不是静默成功
