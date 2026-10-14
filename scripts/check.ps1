@@ -23,6 +23,23 @@ if (-not $SkipTest) {
     $steps.Add(@{ Name = 'cargo test --workspace'; Cmd = { cargo test --workspace } })
 }
 
+# 跨平台 lint：Windows 上编不出 Unix 的 cfg 分支，像"函数在 Unix 上是 dead code"
+# 这类问题只会在 CI 的 Linux/macOS 作业里炸出来。本机装了 linux 目标就顺带查一遍。
+$hostIsWindows = $IsWindows -or ($PSVersionTable.PSEdition -eq 'Desktop')
+if ($hostIsWindows) {
+    $installed = (rustup target list --installed 2>$null) -split "`n" | ForEach-Object { $_.Trim() }
+    if ($installed -contains 'x86_64-unknown-linux-gnu') {
+        $steps.Add(@{
+                Name = 'cargo clippy --target x86_64-unknown-linux-gnu -D warnings'
+                Cmd  = { cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings }
+            })
+    }
+    else {
+        Write-Host '提示：未安装 x86_64-unknown-linux-gnu 目标，跳过跨平台 clippy' -ForegroundColor Yellow
+        Write-Host '      rustup target add x86_64-unknown-linux-gnu' -ForegroundColor Yellow
+    }
+}
+
 $failed = [System.Collections.Generic.List[string]]::new()
 foreach ($step in $steps) {
     Write-Host "==> $($step.Name)"

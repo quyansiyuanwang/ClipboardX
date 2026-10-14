@@ -21,7 +21,13 @@ fn exe_path() -> Result<String, DaemonError> {
         .map_err(DaemonError::io)
 }
 
-/// 启动命令（供自启项引用）。
+/// Windows 自启项里要写的完整命令（`"<exe>" start --silent`）。
+///
+/// 仅 Windows 使用：macOS 写 LaunchAgent 的 `ProgramArguments`、Linux 写 systemd 单元的
+/// `ExecStart`，两者都直接引用可执行文件，而不是 `start` 子命令。
+/// 用 `#[cfg(windows)]` 而不是 `#[allow(dead_code)]`：用不到的平台不该把它编进来，
+/// 否则 `clippy -D warnings` 会在 Unix 上判它 dead code。
+#[cfg(windows)]
 fn start_command() -> Result<String, DaemonError> {
     Ok(format!("\"{}\" start --silent", exe_path()?))
 }
@@ -323,6 +329,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn 启动命令是绝对路径且带_start() {
         let command = start_command().unwrap();
         assert!(command.contains("\" start --silent"), "命令格式：{command}");
