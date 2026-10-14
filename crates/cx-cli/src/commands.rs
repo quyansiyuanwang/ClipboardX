@@ -798,6 +798,21 @@ fn set_backend_enabled(paths: &Paths, name: &str) -> Result<bool, DaemonError> {
     Ok(enabled)
 }
 
+/// 校验后端名。
+///
+/// 名字会成为凭据文件名（`secrets/<名>.<后缀>`），因此这条规则必须
+/// **在写任何文件之前**执行；含路径分隔符或 `..` 的名字否则可能把凭据写到
+/// `secrets/` 之外。两条添加入口都调用它，规则只有一份。
+fn check_backend_name(name: &str) -> Result<(), DaemonError> {
+    let name = name.trim();
+    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+        return Err(DaemonError::Protocol(format!(
+            "后端名不合法（不能为空，也不能含路径分隔符或 ..）：{name}"
+        )));
+    }
+    Ok(())
+}
+
 /// 从配置里移除一个后端，并清掉它自己的凭据文件。
 ///
 /// CLI 的 `cx backend remove` 与界面里的移除都走这里——一份实现，行为不会分叉。
@@ -846,13 +861,8 @@ fn add_backend_from_draft(
     use cx_tui::WizardKind;
 
     let name = draft.name().trim().to_string();
-    // 后端名会被用作凭据文件名，因此必须在**写任何文件之前**校验：
-    // 含路径分隔符或 `..` 的名字可能把凭据写到 secrets/ 之外。
-    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
-        return Err(DaemonError::Protocol(format!(
-            "后端名不合法（不能为空，也不能含路径分隔符或 ..）：{name}"
-        )));
-    }
+    // 后端名会被用作凭据文件名，必须在**写任何文件之前**校验（共用规则）
+    check_backend_name(&name)?;
     let mut config = Config::load_or_create(paths)?;
     if config.backends.iter().any(|backend| backend.name == name) {
         return Err(DaemonError::Protocol(format!(
@@ -1113,19 +1123,13 @@ fn backend_target(backend: &cx_core::BackendSection) -> String {
 /// 添加后端。
 fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonError> {
     // 名字会成为凭据文件名，而下面每个分支都会**先写凭据**、末尾才整体校验配置，
-    // 因此必须先在这里把名字校验掉：含路径分隔符或 `..` 的名字可能把凭据写到
-    // secrets/ 之外（表单路径已经有同样的前置校验，两处规则一致）。
+    // 因此必须先在这里把名字校验掉（与表单入口共用同一条规则）。
     let pending_name = match &kind {
         BackendAddCommand::Webdav { name, .. }
         | BackendAddCommand::Server { name, .. }
         | BackendAddCommand::S3 { name, .. } => name.trim().to_string(),
     };
-    if pending_name.is_empty() || pending_name.contains(['/', '\\']) || pending_name.contains("..")
-    {
-        return Err(DaemonError::Protocol(format!(
-            "后端名不合法（不能为空，也不能含路径分隔符或 ..）：{pending_name}"
-        )));
-    }
+    check_backend_name(&pending_name)?;
 
     let mut config = Config::load_or_create(paths)?;
     let section = match kind {
