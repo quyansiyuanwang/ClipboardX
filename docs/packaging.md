@@ -38,13 +38,18 @@ pwsh scripts/build-msi.ps1 -NoUi           # 不装 UI 扩展，产出无向导�
 
 - 同一 arm64 runner 上分别构建 `aarch64-apple-darwin` 与 `x86_64-apple-darwin`，
   用 `lipo -create` 合成通用二进制（若失败可退化为两个单架构 DMG）。
-- 两个组件包：
-  - `com.clipboardx.cli` → `/usr/local/bin/cx`
-  - `com.clipboardx.agent` → `/Library/LaunchAgents/com.clipboardx.agent.plist` + 立即装载脚本
-- `Distribution.xml` 提供"自定"步骤：是否安装登录自启（默认勾选）。
-- 安装后脚本 `postinstall` 用 `stat -f%u /dev/console` 找出控制台用户，
-  `launchctl bootstrap gui/<uid>` 立即装载；无图形会话时提示下次登录自动加载。
+- **单一组件包**（`pkgbuild`）：一个 `com.clipboardx.cli` 包里同时装
+  - `/usr/local/bin/cx`
+  - `/Library/LaunchAgents/com.clipboardx.agent.plist`
+  - 安装后脚本 `postinstall`
+- `postinstall` 用 `stat -f%u /dev/console` 找出控制台用户，
+  `launchctl bootstrap gui/<uid>` 立即装载代理；无图形会话时提示下次登录自动加载。
+- 自启开关不放在安装向导里，而是运行时命令 `cx service install|uninstall`
+  （原因见 §6.1：productbuild 的产品归档会静默丢失 payload）。
 - DMG 内容：`ClipboardX.pkg` + `安装说明.txt` + `卸载.command`。
+- 构建时硬断言三层：二进制 ≥ 100 KB、`pkgutil --payload-files` 必须列出
+  `usr/local/bin/cx` 与 LaunchAgent、pkg 与 DMG 体积下限。任何一层不满足即失败，
+  避免再出现"安装成功但什么都没有"的情况。
 - 为什么不做成 `.app`：程序是 TUI，没有图形主窗口，"拖入 Applications"不适用。
 
 
@@ -123,6 +128,25 @@ sudo bash packaging/linux/verify-deb.sh dist/ClipboardX_0.1.0_amd64.deb
    安装 → 文件落位、PATH 生效、Run 键写入、`cx version` 可运行 → 卸载 → 文件/Run 键/PATH 全部还原，全部通过。
 
   仓库内 dotnet tool 固定的 WiX 4.0.6、Docker 已装但 daemon 未运行、WSL 有 Debian（用于 `bash -n` 校验脚本）。
+
+## 6.1 macOS 打包踩坑（productbuild 产品归档）
+
+首个 DMG 版本用"两个组件包 + `productbuild --distribution`"来提供"是否安装自启"的可选界面，
+结果 CI 上出现一串极具误导性的现象：
+
+1. `pkgbuild` 正常：`cli.pkg` 480 KB，`pkgutil --payload-files cli.pkg` 能列出 `./usr/local/bin/cx`；
+2. `productbuild` 无任何告警，只是打印 "Wrote product to .../ClipboardX.pkg"；
+3. 产出的 `ClipboardX.pkg` **只有 4 KB**——完整 payload 没被嵌入；
+4. `installer -pkg ClipboardX.pkg -target /` 报告 "The install was successful."；
+5. 但 `/usr/local/bin/cx` 与 `/Library/LaunchAgents/...plist` **都不存在**。
+
+也就是说 Distribution.xml 里的 `<pkg-ref id="com.clipboardx.cli" />` 静默解析失败，
+installer 装了一个空产品。最终处理方式：**放弃 productbuild**，改为单一组件包，
+自启开关交给 `cx service install|uninstall`；并在构建脚本里加了三层硬断言
+（二进制体积、payload 文件清单、pkg/DMG 体积下限），让这类问题在构建期就炸出来。
+
+
+打包流水线必须在断言里检查"该出现的文件确实出现了"。
 
 ## 7. 常见故障排查
 
