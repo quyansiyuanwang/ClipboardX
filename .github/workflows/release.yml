@@ -36,7 +36,12 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
+      # 拉全量历史：下面要判断"tag 指向的提交是否在 main 上"，
+      # 而 checkout 默认是 depth=1 的浅克隆——此时 `git merge-base --is-ancestor`
+      # 看不出任何祖先关系，会把"给 main 上的历史提交补打 tag"误判成"不在 main 上"。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: 校验 tag 与 Cargo.toml
         id: check
         shell: bash
@@ -54,7 +59,9 @@ jobs:
             exit 1
           fi
           # 顺带确认 tag 指向的提交就在 main 上（防止从分支随手打 tag 发布）
-          git fetch --no-tags --depth=1 origin main
+          # 注意：这里不能再加 --depth=1，否则 FETCH_HEAD 是个没有父提交的浅端点，
+          # 上面的祖先判断会永远失败。
+          git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
             echo "::error::tag 指向的提交不在 main 上"
             exit 1
