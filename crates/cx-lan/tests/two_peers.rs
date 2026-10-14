@@ -205,7 +205,7 @@ fn 没有对端时发布不报错只是投递零() {
         Vec::new(),
         "space-1",
     );
-
+    // 内容不会丢：对端下次连上时会通过清单（Manifest/Want）补齐
     assert_eq!(node.service.publish("a.cxi", b"nobody listens"), 0);
     assert_eq!(node.service.peer_count(), 0);
     assert_eq!(node.service.received(), 0);

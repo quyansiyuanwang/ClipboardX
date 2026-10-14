@@ -6,11 +6,11 @@
 |---|---|---|---|---|
 | Windows | `ClipboardX-<v>-x64.msi` | WiX v4（仓库内 dotnet tool 固定版本） | ✅ 可构建 + 真实安装/卸载验收 | ✅ `windows-latest` |
 | macOS | `ClipboardX-<v>-universal.dmg`（内含 `ClipboardX.pkg`） | `pkgbuild` + `productbuild` + `hdiutil` + `lipo` | ❌ 只能由 macOS 构建 | ✅ `macos-latest` |
-| Linux | `ClipboardX_<v>_<arch>.deb` | `dpkg-deb`（无额外工具） | ⚠️ 需 WSL/Docker 才能构建（本机 Docker daemon 未运行） | ✅ `ubuntu-latest` |
-
+| Linux | `ClipboardX_<v>_<arch>.deb` | `dpkg-deb`（无额外工具） | ⚠️ 需要 Linux 环境（WSL / Docker / Linux 主机） | ✅ `ubuntu-latest` |
+| Linux | `.tar.gz`（可选） | `tar` | — | ✅ |
 | 通用 | 校验和 `SHA256SUMS` | `sha256sum` | ✅ | ✅ |
 
-**为什么 DMG 不能在本机（Windows）产出**：`pkgbuild`/`productbuild`/`hdiutil` 是 macOS 自带工具；
+**为什么 DMG 不能在 Windows 上产出**：`pkgbuild`/`productbuild`/`hdiutil` 是 macOS 自带工具；
 macOS 目标也无法从 Windows 交叉编译（需要 macOS SDK，且剪贴板代码本身是平台相关的）。
 因此 macOS 产物只能在 macOS 主机或 `macos-*` runner 上构建。
 
@@ -51,7 +51,7 @@ pwsh scripts/build-msi.ps1 -NoUi           # 不装 UI 扩展，产出无向导�
   `usr/local/bin/cx` 与 LaunchAgent、pkg 与 DMG 体积下限。任何一层不满足即失败，
   避免再出现"安装成功但什么都没有"的情况。
 - 为什么不做成 `.app`：程序是 TUI，没有图形主窗口，"拖入 Applications"不适用。
-
+  （后续可追加一个 `LSUIElement` 的 `.app` 作为可选启动器。）
 
 ```bash
 bash packaging/macos/build-dmg.sh                                   # 未签名
@@ -100,19 +100,19 @@ sudo bash packaging/linux/verify-deb.sh dist/ClipboardX_0.1.0_amd64.deb
 | `test` | ubuntu / windows / macos 三平台矩阵 | `cargo fmt --check`、`clippy -D warnings`、`cargo test`、release 构建、**二进制体积预算断言** |
 | `e2e` | ubuntu / windows / macos 三平台矩阵 | `scripts/e2e-local.ps1 -NoClipboard`：`cx start` 分离进程 + start/stop/status/history/push/pause/resume/doctor/reload 全链路断言 |
 | `e2e-webdav` | ubuntu / windows | `scripts/e2e-webdav.ps1`：用 wsgidav 起**真实 WebDAV 服务端**，两台守护进程互相同步（A 的剪贴板 → WebDAV → B 的历史，以及反向），并断言无回环放大 |
-
+| `e2e-server` | ubuntu / windows / macos | `scripts/e2e-server.ps1`：真实 `cx-server` + 自助注册 + `cx space init/publish/join` + 两台守护进程同步 + 直接在服务端数据目录里断言明文没有落到任何对象里。不依赖任何外部服务 |
 | `e2e-s3` | ubuntu / windows | `scripts/e2e-s3.ps1`：用 moto 起 **S3 兼容服务端**，两台守护进程经 S3（SigV4 签名 + 桶自动创建）互相同步；签名正确性另由 `cargo test` 里会重算签名的测试服务端保证 |
 | `msi` | windows-latest | 构建 MSI → `msiexec /i /qn` → 断言文件/PATH/Run 键/`cx version` → `msiexec /x /qn` → 断言无残留 |
 | `dmg` | macos-latest | 构建通用二进制 → pkg → dmg → 挂载 → `installer -pkg` → `lipo -archs` 校验 → 卸载 |
 | `deb` | ubuntu-latest | 构建 deb → `dpkg -i` → 断言 → `dpkg -r` → Xvfb 下启动冒烟 |
 
 **注意**：CI 的 macOS/Linux runner 没有图形会话，所以 CI 能验证"安装、文件落位、二进制可运行"，
-
+**不能**验证剪贴板行为；那部分需要在真机上验收。
 
 > 首次推送前 CI 不会运行；仓库需要在 GitHub 上创建（`gh auth status` 已登录 `quyansiyuanwang`）。
 > 私有仓库的 macOS runner 计费为 Linux 的 10 倍（一次 DMG 构建约 30–60 计费分钟），公开仓库免费。
 
-
+## 6. 打包踩坑记录
 
 事实与坑（都已解决，写下来避免重踩）：
 
@@ -128,12 +128,10 @@ sudo bash packaging/linux/verify-deb.sh dist/ClipboardX_0.1.0_amd64.deb
    `SummaryInformation@Codepage="936"`（摘要流只接受 ANSI 代码页，`65001` 会被拒绝）。
 5. **`msiexec` 与 PATH 环境变量**：`<Environment System="no">` 写的是用户 PATH（`HKCU\Environment`），
    卸载会自动还原，验证脚本据此断言。
-6. **产物与验收结果**：`ClipboardX-0.1.0-x64.msi` 约 476 KB；本机
-   安装 → 文件落位、PATH 生效、Run 键写入、`cx version` 可运行 → 卸载 → 文件/Run 键/PATH 全部还原，全部通过。
-
-  仓库内 dotnet tool 固定的 WiX 4.0.6、Docker 已装但 daemon 未运行、WSL 有 Debian（用于 `bash -n` 校验脚本）。
-
-## 6.1 macOS 打包踩坑（productbuild 产品归档）
+6. **安装后会发生什么**（`scripts/verify-msi.ps1` 逐条断言）：文件落到
+   `%LOCALAPPDATA%\Programs\ClipboardX`、用户 PATH 追加该目录、`HKCU\...\Run` 写入自启项、
+   `cx version` 可运行；卸载后文件、Run 键与 PATH 全部还原。
+### 6.1 macOS 打包踩坑（productbuild 产品归档）
 
 首个 DMG 版本用"两个组件包 + `productbuild --distribution`"来提供"是否安装自启"的可选界面，
 结果 CI 上出现一串极具误导性的现象：
@@ -149,10 +147,10 @@ installer 装了一个空产品。最终处理方式：**放弃 productbuild**�
 自启开关交给 `cx service install|uninstall`；并在构建脚本里加了三层硬断言
 （二进制体积、payload 文件清单、pkg/DMG 体积下限），让这类问题在构建期就炸出来。
 
-
+教训：**"安装成功"不等于"装上了"**，
 打包流水线必须在断言里检查"该出现的文件确实出现了"。
 
-## 6.2 守护进程与句柄继承（Windows 上会让脚本挂起）
+### 6.2 守护进程与句柄继承（Windows 上会让脚本挂起）
 
 `cx start` 需要在后台挂载守护进程，而"分离进程"在 Windows 上有一个隐蔽的坑：
 
@@ -189,7 +187,7 @@ Unix 侧用 `setsid` 新建会话，fd 由调用方的 CLOEXEC 语义保证不�
 | LaunchAgent 未生效 | `launchctl print gui/$(id -u)/com.clipboardx.agent`；确认是 agent 在用户会话内而非 daemon |
 | Linux 守护进程报会话缺失 | 无 DISPLAY/WAYLAND_DISPLAY；桌面登录后再启动，或用 `cx daemon --no-clipboard` 做纯中继 |
 
-## 6. 发布流程
+## 8. 发布流程
 
 打一个与 `Cargo.toml` 版本一致的 tag 即可：
 

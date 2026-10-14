@@ -1,7 +1,7 @@
 # 构建 Windows MSI 安装包
 #
 # 依赖：
-
+#   - cargo / rustc
 #   - .NET SDK（dotnet 10 已装）；WiX 通过仓库内 .config/dotnet-tools.json 固定为 v4
 #
 # 用法：

@@ -1,4 +1,4 @@
-
+# 端到端验收（自建服务端）
 #
 # 用法：
 #   pwsh scripts/e2e-server.ps1              # 自动探测剪贴板

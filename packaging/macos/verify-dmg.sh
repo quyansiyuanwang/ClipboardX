@@ -4,7 +4,7 @@
 # 用法：sudo bash packaging/macos/verify-dmg.sh dist/ClipboardX-0.1.0-universal.dmg
 #
 # 说明：CI 的 macOS runner 是无图形会话的，所以这里只能验证「安装 + 二进制可运行 +
-
+# LaunchAgent 落位」。剪贴板真实行为必须在真机上验收。
 set -euo pipefail
 
 DMG="${1:?用法: verify-dmg.sh <dmg 路径>}"

@@ -5,72 +5,109 @@ TUI 界面，支持自建服务端，也支持直接用 WebDAV 或 S3 作为同�
 
 ## 设计要点
 
-- **不用 async 运行时**：单线程状态机 + 阻塞线程 + channel，空闲时 CPU 近 0、内存占用小。
+- **不用 async 运行时**：单线程状态机 + 阻塞线程 + channel，空闲 10 秒的 CPU 时间增量实测 0 ms、
+  常驻内存约 6–11 MB。
 - **内容不出明文**：载荷用 XChaCha20-Poly1305 端到端加密，服务端与对象存储只见密文。
-- **后端即存储**：`cx-server`、WebDAV（Nextcloud 等）、S3（MinIO / R2 / AWS）共用同一套对象布局。
+- **后端即存储**：`cx-server`、WebDAV（Nextcloud 等）、S3（MinIO / R2 / AWS）共用同一套对象布局，
+  换后端不用改引擎。
+- **局域网直连**：同一网段内两台设备可以不经过任何服务端互推内容（Noise XX + PSK，
+  PSK 由空间密钥派生，只有同一空间的设备能连上）。
 - **前端可替换**：TUI 与 CLI 都只通过本地控制套接字访问守护进程，不直接碰剪贴板与网络。
-- **两个二进制**：`cx`（守护进程 + CLI + TUI）、`cx-server`（自建服务端）。
+- **两个二进制**：`cx`（守护进程 + CLI + TUI，约 3.9 MB）、`cx-server`（自建服务端，约 0.7 MB）。
+
+## 安装
+
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| Windows | `ClipboardX-<版本>-x64.msi` | 双击安装（per-user，不需要管理员），可选加入 PATH、登录自启、桌面快捷方式 |
+| macOS | `ClipboardX-<版本>-universal.dmg` | 打开后运行其中的 `.pkg`，安装到 `/usr/local/bin` 并注册 LaunchAgent |
+| Linux | `clipboardx_<版本>_amd64.deb` | `sudo dpkg -i`（或 `apt install ./*.deb` 自动补依赖），系统级安装 + systemd 用户单元 |
+
+自建服务端 `cx-server` 随包一起安装（它不依赖剪贴板与图形会话）。
+
+## 上手
+
+```bash
+cx start                 # 后台挂载守护进程（登录自启：cx service install）
+cx status                # 设备、后端、历史、各后端计数
+cx tui                   # 全屏终端界面（历史、预览、写回剪贴板、暂停/发布/重载）
+cx history --limit 20
+cx copy 0                # 把最新一条写回剪贴板
+cx pause / cx resume
+cx doctor                # 守护进程起不来时也能跑（本地回退检查，含密钥权限检查）
+cx stop
+```
+
+配置同步后端（三种任选，也可同时用）：
+
+```bash
+# 自建服务端
+cx-server space create 家庭空间 --quota 512MB    # 输出空间 id 与注册密钥
+cx-server serve --listen 0.0.0.0:8688           # 前台跑（systemd / Docker 都按前台进程管理）
+cx backend add server home http://<主机>:8688 --space <空间 id> --enroll-secret <注册密钥>
+cx space init --passphrase-stdin && cx space publish home
+# 另一台设备：cx space join home --passphrase-stdin
+
+# WebDAV（Nextcloud 等）
+cx backend add webdav dav https://cloud.example.com/remote.php/dav/files/<用户>/clipboardx --username <用户> --password-stdin
+
+# S3 兼容（AWS / MinIO / R2 / OSS）
+cx backend add s3 oss --bucket clipboardx --endpoint http://127.0.0.1:9000 --access-key-id <AK> --secret-stdin --path-style
+
+cx backend list          # 查看已配置后端
+cx backend test <名字>    # 直连测一次（不需要守护进程在运行）
+```
+
+局域网直连（不经过服务端）：
+
+```toml
+[lan]
+enabled = true
+pairing_code = "自定的配对码"   # 未加密空间必须配；有空间密钥时由密钥派生 PSK
+peers = ["192.168.1.23:8699"]   # 可选：mDNS 被禁的网络里用显式地址
+```
+
+## 已知限制
+
+- **安装包未签名**：首次安装会被系统拦一下（Windows 点「更多信息 → 仍要运行」，macOS 右键「打开」）。
+  补上证书后 CI 会自动签名/公证，流程不变，见 [docs/packaging.md](docs/packaging.md)。
+- **空间密钥的密封下发未实现**：`GET /v1/spaces/{id}/key` 明确返回 501，当前用"口令 + `cx space join`"。
+- macOS 与 Linux 的行为只在 CI 上验证过，未在真机长期使用。
+
+## 开发
+
+```powershell
+cargo build --release --bin cx --bin cx-server
+cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+
+.\scripts\check.ps1            # 提交前门禁：fmt + clippy + test（含跨平台 clippy）
+
+# 端到端脚本（每条都是"起真实进程/真实服务端"的验收，不依赖 mock）
+.\scripts\e2e-local.ps1        # 守护进程 + CLI + 真实剪贴板（会临时改写剪贴板并恢复）
+.\scripts\e2e-local.ps1 -NoClipboard   # 无头版本（CI 用）
+.\scripts\e2e-webdav.ps1       # 两台守护进程经真实 WebDAV（wsgidav）互相同步
+.\scripts\e2e-s3.ps1           # 两台守护进程经 S3 兼容存储（moto）互相同步
+.\scripts\e2e-server.ps1       # 自建服务端（注册 → 建空间 → 加入 → 双设备同步 → 服务端只有密文）
+.\scripts\e2e-lan.ps1          # 局域网直连（不配任何后端，两台守护进程互推；错配对码者收不到）
+.\scripts\e2e-hardening.ps1    # 体积预算、密钥权限、明文不落盘、空闲 CPU/内存实测
+
+.\scripts\build-msi.ps1        # 产出 dist\ClipboardX-<v>-x64.msi（WiX v4，版本锁定在仓库内）
+.\scripts\verify-msi.ps1 -Msi dist\ClipboardX-0.1.0-x64.msi
+.\scripts\verify-msi-upgrade.ps1   # 装旧版 → 装新版 → 只留一份 → 卸干净
+
+bash packaging/macos/build-dmg.sh      # 仅 macOS
+bash packaging/linux/build-deb.sh      # 需要 dpkg-deb
+```
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [docs/protocol.md](docs/protocol.md) | 对象布局 v1、item 容器格式、同步算法、回声抑制、控制协议、服务端 REST |
-
-| [docs/packaging.md](docs/packaging.md) | MSI / DMG / deb 构建方式、三端自启机制、签名公证、实测记录与踩坑 |
-
-
-## 当前状态
-
-
-|---|---|---|
-
-
-
-
-
-
-
-
-
-
-
-## 开发
-
-```powershell
-cargo build --release --bin cx
-cargo test
-cargo clippy --workspace --all-targets -- -D warnings
-
-.\scripts\check.ps1            # 提交前门禁：fmt + clippy + test（含跨平台 clippy）
-.\scripts\e2e-local.ps1        # 端到端：守护进程 + CLI + 真实剪贴板（会临时改写剪贴板并恢复）
-.\scripts\e2e-local.ps1 -NoClipboard   # 无头版本（CI 用）
-.\scripts\e2e-webdav.ps1       # 端到端：两台守护进程经真实 WebDAV（wsgidav）互相同步
-.\scripts\e2e-s3.ps1           # 端到端：两台守护进程经 S3 兼容存储（moto）互相同步
-.\scripts\e2e-server.ps1       # 端到端：自建服务端 MVP（注册→建空间→加入→双设备同步→服务端只有密文）
-.\scripts\e2e-lan.ps1          # 端到端：局域网直连（不配任何后端，两台守护进程互推；错配对码者收不到）
-.\scripts\e2e-hardening.ps1    # 加固验收：体积预算、密钥 0600、明文不落盘、空闲 CPU/内存实测
-.\scripts\build-msi.ps1        # 产出 dist\ClipboardX-<v>-x64.msi（WiX v4，版本锁定在仓库内）
-.\scripts\verify-msi.ps1 -Msi dist\ClipboardX-0.1.0-x64.msi
-```
-
-日常用法：
-
-```powershell
-cx start            # 后台挂载守护进程（登录自启用 cx service install）
-cx status           # 设备、后端、历史、计数
-cx history --limit 20
-cx copy 0           # 把最新一条写回剪贴板
-cx pause / cx resume
-cx doctor           # 守护进程起不来时也能跑（本地回退检查）
-cx stop
-```
-
-```bash
-bash packaging/macos/build-dmg.sh      # 仅 macOS
-bash packaging/linux/build-deb.sh      # 需要 dpkg-deb
-```
+| [docs/protocol.md](docs/protocol.md) | 对象布局 v1、item 容器格式、同步算法、回声抑制、控制协议、服务端 REST、局域网协议 |
+| [docs/packaging.md](docs/packaging.md) | MSI / DMG / deb 构建方式、三端自启机制、签名与公证、发布流程 |
 
 ## 许可证
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0（二选一，各取所需：[MIT](LICENSE-MIT) 更简单且兼容 GPLv2，
+[Apache-2.0](LICENSE-APACHE) 含明确的专利授权）。

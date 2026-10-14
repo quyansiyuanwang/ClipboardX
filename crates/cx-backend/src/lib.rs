@@ -11,7 +11,7 @@
 //! - [`testserver`]：测试用的极小 WebDAV 服务端（**仅供测试**，但公开导出，
 //!   这样 `cx-sync` 的集成测试也能复用）。
 //!
-
+//! 待实现：自建服务端 REST。
 
 mod date;
 mod error;
@@ -187,7 +187,7 @@ pub fn list_manifests(backend: &mut dyn RemoteBackend) -> Result<Vec<RemoteObjec
 
 /// 由配置构造后端。
 ///
-
+/// 目前只支持 WebDAV 与 S3；自建服务端尚未接入（现在就返回明确的
 /// 配置错误，而不是静默失败）。
 pub fn build_backend(
     section: &cx_core::BackendSection,

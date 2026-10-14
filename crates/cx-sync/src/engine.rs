@@ -42,7 +42,7 @@ pub enum Event {
     Prime(Option<ClipContent>),
     /// 来自控制套接字的命令。
     Command(Command),
-
+    /// 周期心跳：用于状态落盘与后端轮询。
     Tick,
 }
 
@@ -96,7 +96,7 @@ pub enum Command {
         /// 是否忽略"与上次相同"的判断。
         force: bool,
     },
-
+    /// 立即拉取一次。
     Pull {
         /// 请求 id。
         id: u64,
@@ -155,7 +155,7 @@ pub enum Action {
     Reply(ReplyPayload),
     /// 推送给订阅者的事件。
     Notify(ControlEvent),
-
+    /// 立刻拉取一次后端。
     PollNow,
     /// 请守护进程重新读取剪贴板并作为事件送回（resume / push 用）。
     RecheckClipboard,

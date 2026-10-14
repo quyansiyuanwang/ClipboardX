@@ -4,7 +4,7 @@
 # 用法：sudo bash packaging/linux/verify-deb.sh dist/ClipboardX_0.1.0_amd64.deb
 #
 # 说明：CI runner 没有图形会话，因此这里只验证「安装 + 二进制可运行 + 单元文件落位」。
-
+# 剪贴板真实行为在 CI 里由 Xvfb 冒烟覆盖；更完整的真机验收见 packaging/linux/README-install.zh-CN.txt。
 set -euo pipefail
 
 DEB="${1:?用法: verify-deb.sh <deb 路径>}"

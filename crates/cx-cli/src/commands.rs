@@ -142,7 +142,7 @@ pub enum Command {
         command: SpaceCommand,
     },
 
-
+    /// 同步后端管理（自建服务端 / WebDAV / S3）
     Backend {
         /// 子命令
         #[command(subcommand)]

@@ -80,7 +80,7 @@ jobs:
 
       # 用 --no-clipboard 在无桌面环境里跑完整链路：
       # cx start（分离进程）→ start/stop/status/history/push/pause/resume/doctor/reload
-
+      # 真实剪贴板的采集行为需要图形会话，CI 里只验无剪贴板路径。
       - name: 端到端脚本（无头模式）
         shell: pwsh
         run: ./scripts/e2e-local.ps1 -NoClipboard
@@ -152,7 +152,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-
+      # 这条作业验的是自建服务端的完整链路：cx-server + 自助注册 + 建/加空间 + 双设备同步，
       # 并直接在服务端数据目录里断言"明文没有出现在任何对象里"。
       # 不依赖任何外部服务（wsgidav/moto 都不需要）。
       - name: 端到端脚本（自建服务端）

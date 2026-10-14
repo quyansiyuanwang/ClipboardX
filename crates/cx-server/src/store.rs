@@ -52,7 +52,7 @@ pub struct SpaceMeta {
     pub used_bytes: u64,
     /// 注册密钥的哈希（十六进制）；`None` 表示不允许自助注册。
     pub enroll_secret_hash: Option<String>,
-
+    /// 对象保留天数（0 表示不自动清理；当前只做记录，自动清理尚未实现）。
     pub retention_days: u32,
 }
 

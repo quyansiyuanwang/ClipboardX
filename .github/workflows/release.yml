@@ -207,7 +207,7 @@ jobs:
           version="${{ needs.version.outputs.version }}"
           tag="${GITHUB_REF_NAME}"
           gh release view "$tag" >/dev/null 2>&1 && gh release delete "$tag" --yes || true
-
+          # 0.x 阶段一律标为预发布：核心功能还在打磨，
           # 不该给人"正式版"的暗示。1.0 之后自动变成正式发布。
           extra=()
           case "$version" in

@@ -65,7 +65,7 @@ cx-lan = { path = "crates/cx-lan" }
 cx-sync = { path = "crates/cx-sync" }
 cx-tui = { path = "crates/cx-tui" }
 
-
+# 体积与常驻开销预算（目标：cx < 6 MB、cx-server < 5 MB，空闲内存 < 40 MB）
 [profile.release]
 opt-level = "s"
 lto = "fat"

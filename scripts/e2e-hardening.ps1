@@ -1,4 +1,4 @@
-
+# 加固验收：把"应该很轻、应该安全"变成可测量的断言
 #
 # 用法：
 #   pwsh scripts/e2e-hardening.ps1

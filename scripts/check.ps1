@@ -24,7 +24,7 @@ if (-not $SkipTest) {
 }
 
 # 跨平台 lint：Windows 上编不出 Unix 的 cfg 分支，像"函数在 Unix 上是 dead code"
-# 这类问题只会在 CI 的 Linux/macOS 作业里炸出来。本机装了 linux 目标就顺带查一遍。
+# 这类问题只会在 CI 的 Linux/macOS 作业里炸出来。开发机装了 linux 目标就顺带查一遍。
 $hostIsWindows = $IsWindows -or ($PSVersionTable.PSEdition -eq 'Desktop')
 if ($hostIsWindows) {
     $installed = (rustup target list --installed 2>$null) -split "`n" | ForEach-Object { $_.Trim() }

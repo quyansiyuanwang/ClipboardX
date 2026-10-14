@@ -92,7 +92,7 @@ try {
         Assert-True ($newExeHash -eq $builtHash) '升级后的可执行文件与最新构建产物逐字节一致'
     }
     else {
-        Ok '跳过载荷比对（本机没有对应 target 的构建产物）'
+        Ok '跳过载荷比对（没有对应 target 的构建产物）'
     }
     Assert-True ($oldExeHash -eq $newExeHash -or $oldExeHash -ne $newExeHash) '（载荷哈希已记录）'
 
