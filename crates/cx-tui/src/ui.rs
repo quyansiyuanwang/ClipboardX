@@ -151,7 +151,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 }
 
-fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let width = area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem<'_>> = app
         .visible()
@@ -178,6 +178,12 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
         state.select(Some(app.cursor.min(app.visible().len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
+
+    // 把"列表内容区在哪、滚到第几行"回填给 App：鼠标点击要靠它把屏幕坐标换算成条目下标。
+    // offset 是 ratatui 为了"让选中项可见"自己算的，只有渲染之后才拿得到。
+    let inner_top = area.y.saturating_add(1);
+    let inner_rows = area.height.saturating_sub(2);
+    app.set_list_geometry(inner_top, inner_rows, state.offset());
 }
 
 /// 列表标题：条数 + 光标位置，过滤生效时把过滤词也写出来。
@@ -590,6 +596,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  p                立即发布本机剪贴板"),
         Line::from("  r                刷新状态与历史"),
         Line::from("  R                重新读取配置"),
+        Line::from("  鼠标             滚轮翻列表；左键点某一行即选中它"),
         Line::from("  d                删除选中项（本机历史，会先确认）"),
         Line::from("  b                后端与连接面板（各后端健康、局域网对端）"),
         Line::from("  ?                帮助（本页）"),
@@ -1100,6 +1107,54 @@ mod tests {
         let screen = render(&mut help, 130, 40);
         assert!(has(&screen, "删除选中项"), "{screen}");
         assert!(has(&screen, "会先确认"), "帮助里要说明需要确认：{screen}");
+    }
+    #[test]
+    fn 渲染后用真实坐标点击能选中对应的行() {
+        let mut app = app_with(6);
+        app.apply(loaded(0, "第一条内容"));
+        app.apply(loaded(2, "第三条内容"));
+        let screen = render(&mut app, 120, 30);
+        let lines: Vec<&str> = screen.lines().collect();
+
+        // 不写死行号：从画面上找到那一行再点它——头部高度会随提示行变化，
+        // 写死行号只会让测试跟着布局一起漂（第一版就是这么错的）。
+        let row_of = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| compact(line).contains(needle))
+                .map(|row| row as u16)
+                .unwrap_or_else(|| panic!("画面上找不到 {needle}：\n{screen}"))
+        };
+
+        let first = row_of("第一条内容");
+        assert_eq!(app.click(first), Some(0));
+        assert_eq!(app.selected_position(), Some(0));
+
+        let third = row_of("第三条内容");
+        assert_eq!(app.click(third), Some(2));
+        assert_eq!(app.selected_position(), Some(2));
+
+        // 点头部（标题那一行）不该有反应
+        app.home();
+        assert_eq!(app.click(0), None);
+        assert_eq!(app.selected_position(), Some(0));
+    }
+    #[test]
+    fn 列表滚动后点击仍然对得上() {
+        let mut app = app_with(40);
+        app.set_viewport_rows(6);
+        // 先移到很下面，让 ratatui 不得不滚动列表
+        for _ in 0..30 {
+            app.down();
+        }
+        let _ = render(&mut app, 120, 12); // 小屏：只能显示几行，必然滚动
+        // 选中项所在的那一行，点它应当仍然是当前这条
+        let before = app.cursor;
+        let _ = app.click(3); // 屏幕第一行
+        assert!(
+            app.cursor <= before,
+            "点屏幕上第一行应当选中它（滚动过之后它就是可见范围的第一条）"
+        );
     }
     #[test]
     fn 空历史时不会_panic() {
