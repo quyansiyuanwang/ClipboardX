@@ -15,8 +15,13 @@ struct Node {
 
 impl Node {
     fn start(tag: &str, port: u16, psk: &str, peers: Vec<SocketAddr>, space: &str) -> Self {
+        // 加一个进程内计数：多个用例用同样的 tag（"a"/"b"）且 now_ms 只有毫秒精度时
+        // 会撞到同一个目录，一个用例的 remove_dir_all 会把另一个的密钥文件删空。
+        // 这个坑在 CI 上才暴露（本地跑得快、撞不上）。
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "cx-lan-node-{tag}-{}-{}",
+            "cx-lan-node-{tag}-{}-{}-{unique}",
             std::process::id(),
             cx_core::now_ms()
         ));

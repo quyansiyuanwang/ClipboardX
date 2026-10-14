@@ -137,31 +137,31 @@ pub fn snapshot(paths: &Paths, width: u16, height: u16) -> Result<String, TuiErr
     client.request_status();
     client.request_history(HISTORY_LIMIT);
 
-    // 等首轮数据（最多 2 秒），拿到就不再等
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // 等状态**与历史**都到齐。只等状态是不够的：历史晚到会让下面根本没机会请求预览，
+    // 快照里就只剩"（正在读取…）"——CI 上就因为这个失败过一次。
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
         while let Ok(event) = client.try_recv() {
             app.apply(event);
         }
-        if app.status.is_some() || std::time::Instant::now() >= deadline {
+        if (app.status.is_some() && !app.items.is_empty()) || std::time::Instant::now() >= deadline
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // 选中项的预览也拉一次（列表里展示的是预览摘要）
+    // 再等选中项的完整预览
     if let Some(position) = app.selected_position() {
         client.request_preview(position);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            let before = app.preview.is_some();
+        loop {
             while let Ok(event) = client.try_recv() {
                 app.apply(event);
             }
-            if app.preview.is_some() && !before {
-                break;
-            }
-            if app.preview_error.is_some() {
+            if app.preview.is_some()
+                || app.preview_error.is_some()
+                || std::time::Instant::now() >= deadline
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
