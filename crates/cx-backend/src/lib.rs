@@ -20,6 +20,7 @@ pub mod layout;
 mod memory;
 mod s3;
 pub mod s3_testserver;
+mod server;
 pub mod signing;
 pub mod testserver;
 mod webdav;
@@ -29,6 +30,7 @@ pub use error::BackendError;
 pub use http::{DEFAULT_TIMEOUT, HttpSettings};
 pub use memory::MemoryBackend;
 pub use s3::{MAX_LIST_OBJECTS, S3Backend, S3Options};
+pub use server::{ServerBackend, ServerOptions, enroll};
 pub use webdav::{PROPFIND_BODY, WebDavBackend, WebDavOptions};
 
 use std::time::Duration;
@@ -264,10 +266,31 @@ pub fn build_backend(
             })?;
             Ok(Box::new(backend))
         }
-        cx_core::BackendKind::Server => Err(BackendError::Config(format!(
+        cx_core::BackendKind::Server => {
+            let url = section
+                .url
+                .clone()
+                .ok_or_else(|| BackendError::Config(format!("后端 {} 缺少 url", section.name)))?;
+            let token = read_secret(paths, section.token_file.as_deref(), None, "设备令牌")?
+                .ok_or_else(|| {
+                    BackendError::Config(format!(
+                        "后端 {} 需要 token_file（`cx space join` 会写入）",
+                        section.name
+                    ))
+                })?;
+            let ca_file = section.ca_file.as_ref().map(|name| paths.secret_file(name));
 
-            section.name
-        ))),
+            let backend = ServerBackend::new(ServerOptions {
+                name: section.name.clone(),
+                url,
+                space: section.space.clone(),
+                token,
+                ca_file,
+                insecure: section.insecure,
+                timeout,
+            })?;
+            Ok(Box::new(backend))
+        }
     }
 }
 
@@ -402,13 +425,30 @@ mod tests {
     #[test]
     fn 自建服务端尚未实现时给出明确错误() {
         let paths = temp_paths("kinds");
+        // 只有 url、没有令牌文件：应当给出可操作的错误
         let err = take_error(build_backend(
             &config_section(cx_core::BackendKind::Server),
             &paths,
             Duration::from_secs(1),
         ));
         assert!(matches!(err, BackendError::Config(_)));
+        assert!(err.to_string().contains("token_file"), "{err}");
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
 
+    #[test]
+    fn server_后端可从配置构造并读取令牌文件() {
+        let paths = temp_paths("servercfg");
+        std::fs::write(paths.secret_file("srv.token"), b"cxd_testtoken\n").unwrap();
+        let mut section = config_section(cx_core::BackendKind::Server);
+        section.token_file = Some("srv.token".to_string());
+        section.space = Some("abc123".to_string());
+
+        let backend = build_backend(&section, &paths, Duration::from_secs(5)).unwrap();
+        assert_eq!(backend.kind(), "server");
+        let text = backend.describe();
+        assert!(text.contains("example.com"), "{text}");
+        assert!(text.contains("abc123"), "{text}");
         let _ = std::fs::remove_dir_all(&paths.config_dir);
     }
 

@@ -20,3 +20,5 @@ serde_json.workspace = true
 [dev-dependencies]
 # 集成测试要自己构造加密空间（产品路径由 cx-core 的 space 模块覆盖）
 cx-crypto.workspace = true
+# 集成测试会起一个真实 cx-server
+cx-server.workspace = true

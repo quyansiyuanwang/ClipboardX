@@ -7,5 +7,12 @@ license.workspace = true
 description = "ClipboardX 可自建同步服务端：空间/设备令牌、对象存储、长轮询、配额与保留策略"
 
 [dependencies]
-cx-core.workspace = true
+blake3.workspace = true
 clap.workspace = true
+cx-core.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

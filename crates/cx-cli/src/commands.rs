@@ -220,6 +220,28 @@ pub enum BackendAddCommand {
         #[arg(long)]
         insecure: bool,
     },
+    /// 自建服务端（cx-server）
+    Server {
+        /// 后端名（唯一）
+        name: String,
+        /// 服务端基址（例如 http://192.168.1.10:8688）
+        url: String,
+        /// 空间 id（`cx-server space create` 输出）
+        #[arg(long)]
+        space: String,
+        /// 从标准输入读设备令牌（管理员用 `cx-server token issue` 签发）
+        #[arg(long)]
+        token_stdin: bool,
+        /// 注册密钥（给了就直接自助注册，不用 --token-stdin）
+        #[arg(long)]
+        enroll_secret: Option<String>,
+        /// 自定义 CA 证书文件名
+        #[arg(long)]
+        ca_file: Option<String>,
+        /// 跳过 TLS 校验（仅调试）
+        #[arg(long)]
+        insecure: bool,
+    },
     /// S3 兼容对象存储（AWS S3 / MinIO / Cloudflare R2 / 阿里云 OSS）
     S3 {
         /// 后端名（唯一）
@@ -273,6 +295,19 @@ pub enum SpaceCommand {
         /// 不加密（对象存储里可直接读到内容，仅调试用）
         #[arg(long)]
         no_encrypt: bool,
+        /// 从标准输入读取口令（不提示）
+        #[arg(long)]
+        passphrase_stdin: bool,
+    },
+    /// 把本机空间元数据上传到某个后端（首次创建空间后执行一次）
+    Publish {
+        /// 后端名
+        backend: String,
+    },
+    /// 从某个后端加入已有空间（需要口令）
+    Join {
+        /// 后端名
+        backend: String,
         /// 从标准输入读取口令（不提示）
         #[arg(long)]
         passphrase_stdin: bool,
@@ -513,6 +548,23 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                 println!("下一步：用 `cx backend add server|webdav|s3` 配置同步后端。");
                 Ok(ExitCode::SUCCESS)
             }
+            SpaceCommand::Publish { backend } => ok_or_failure(publish_space(paths, &backend)?),
+            SpaceCommand::Join {
+                backend,
+                passphrase_stdin,
+            } => {
+                let passphrase = if passphrase_stdin {
+                    Some(read_stdin_text(4096)?.trim().to_string())
+                } else {
+                    None
+                };
+                if let Some(text) = &passphrase
+                    && text.is_empty()
+                {
+                    return Err(DaemonError::Protocol("口令不能为空".to_string()));
+                }
+                ok_or_failure(join_space(paths, &backend, passphrase.as_deref())?)
+            }
             SpaceCommand::Show { json } => {
                 let space = LocalSpace::load(paths)?;
                 if json {
@@ -614,6 +666,58 @@ fn read_stdin_text(limit: u64) -> Result<String, DaemonError> {
         .map_err(|_| DaemonError::Protocol("标准输入不是合法 UTF-8".to_string()))
 }
 
+/// 按名字构造一个后端（`backend test` / `space publish` / `space join` 共用）。
+fn build_named_backend(
+    paths: &Paths,
+    name: &str,
+) -> Result<Box<dyn cx_backend::RemoteBackend>, DaemonError> {
+    let config = Config::load(paths)?;
+    let Some(section) = config.backends.iter().find(|backend| backend.name == name) else {
+        return Err(DaemonError::Protocol(format!(
+            "没有名为 {name} 的后端（用 `cx backend list` 查看）"
+        )));
+    };
+    cx_backend::build_backend(section, paths, std::time::Duration::from_secs(30))
+        .map_err(|err| DaemonError::Protocol(format!("无法构造后端 {name}：{err}")))
+}
+
+/// 把本机空间元数据上传到某个后端。
+fn publish_space(paths: &Paths, backend: &str) -> Result<bool, DaemonError> {
+    let space = LocalSpace::load(paths)?;
+    let mut remote = build_named_backend(paths, backend)?;
+    let json = space.meta.to_json()?;
+    cx_backend::store_space_meta(&mut *remote, &json)
+        .map_err(|err| DaemonError::Protocol(format!("上传空间元数据失败：{err}")))?;
+    println!(
+        "已把空间元数据上传到后端 {backend}（空间 {}）",
+        space.short_id()
+    );
+    println!("其他设备现在可以用 `cx space join {backend} --passphrase-stdin` 加入。");
+    Ok(true)
+}
+
+/// 从某个后端加入已有空间。
+fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<bool, DaemonError> {
+    let mut remote = build_named_backend(paths, backend)?;
+    let json = cx_backend::load_space_meta(&mut *remote)
+        .map_err(|err| DaemonError::Protocol(format!("读取空间元数据失败：{err}")))?
+        .ok_or_else(|| {
+            DaemonError::Protocol(format!(
+                "后端 {backend} 上还没有空间元数据（先在已加入的设备上执行 `cx space publish {backend}`）"
+            ))
+        })?;
+    let space = LocalSpace::join(paths, &json, passphrase)?;
+    println!("已加入空间 {}", space.short_id());
+    println!(
+        "加密：{}",
+        if space.cipher.space_key().is_some() {
+            "XChaCha20-Poly1305"
+        } else {
+            "未加密"
+        }
+    );
+    Ok(true)
+}
 /// `cx backend` 的实现。
 ///
 /// 设计取舍：这里**只改配置与凭据文件**，不碰网络（`Test` 例外——它存在的意义
@@ -749,6 +853,50 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
                     );
                 }
             }
+            section
+        }
+        BackendAddCommand::Server {
+            name,
+            url,
+            space,
+            token_stdin,
+            enroll_secret,
+            ca_file,
+            insecure,
+        } => {
+            let mut section = empty_section(name, cx_core::BackendKind::Server);
+            section.url = Some(url.clone());
+            section.space = Some(space.clone());
+            section.insecure = insecure;
+            let ca_path = ca_file.clone().map(|file| paths.secret_file(&file));
+            section.ca_file = ca_file;
+
+            let token = if let Some(secret) = enroll_secret {
+                let identity = Identity::load_or_create(paths, None)?;
+                let token = cx_backend::enroll(
+                    &url,
+                    &space,
+                    &secret,
+                    &identity.name,
+                    ca_path,
+                    insecure,
+                    std::time::Duration::from_secs(30),
+                )
+                .map_err(|err| DaemonError::Protocol(format!("自助注册失败：{err}")))?;
+                println!("自助注册成功，已获取设备令牌");
+                token
+            } else if token_stdin {
+                read_secret_stdin("设备令牌")?
+            } else {
+                return Err(DaemonError::Protocol(
+                    "请用 --token-stdin 提供设备令牌（管理员签发），或用 --enroll-secret 自助注册"
+                        .to_string(),
+                ));
+            };
+
+            let file = format!("{}.token", section.name);
+            write_secret_file(paths, &file, &token)?;
+            section.token_file = Some(file);
             section
         }
         BackendAddCommand::S3 {

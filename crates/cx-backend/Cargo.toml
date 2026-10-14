@@ -29,3 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# 集成测试会起一个真实 cx-server（同进程、真实监听端口）
+cx-server.workspace = true

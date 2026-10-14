@@ -435,6 +435,7 @@ dependencies = [
  "base64 0.23.1",
  "cx-core",
  "cx-proto",
+ "cx-server",
  "hex",
  "hmac",
  "log",
@@ -545,8 +546,15 @@ dependencies = [
 name = "cx-server"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "cx-core",
+ "getrandom 0.4.3",
+ "hex",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -556,6 +564,7 @@ dependencies = [
  "clap",
  "cx-core",
  "cx-server",
+ "log",
  "serde_json",
 ]
 
@@ -568,6 +577,7 @@ dependencies = [
  "cx-core",
  "cx-crypto",
  "cx-proto",
+ "cx-server",
  "getrandom 0.4.3",
  "hex",
  "log",

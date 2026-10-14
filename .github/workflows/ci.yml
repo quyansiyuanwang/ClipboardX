@@ -137,6 +137,28 @@ jobs:
         shell: pwsh
         run: ./scripts/e2e-s3.ps1
 
+  e2e-server:
+    name: 端到端（自建服务端 MVP）${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+
+      # 并直接在服务端数据目录里断言"明文没有出现在任何对象里"。
+      # 不依赖任何外部服务（wsgidav/moto 都不需要）。
+      - name: 端到端脚本（自建服务端）
+        shell: pwsh
+        run: ./scripts/e2e-server.ps1
+
   msi:
     name: Windows MSI 构建与安装验收
     runs-on: windows-latest
