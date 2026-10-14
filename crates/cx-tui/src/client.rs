@@ -59,6 +59,7 @@ enum Request {
     Copy(usize),
     Push,
     Simple(&'static str),
+    Delete(usize),
     Doctor,
     /// 守护进程推来事件后触发的刷新。
     ExternalRefresh,
@@ -110,6 +111,11 @@ impl DaemonClient {
     /// 请求历史列表。
     pub fn request_history(&self, limit: usize) {
         let _ = self.tx.send(Request::History(limit));
+    }
+
+    /// 删除一条本机历史。
+    pub fn request_delete(&self, position: usize) {
+        let _ = self.tx.send(Request::Delete(position));
     }
 
     /// 请求一次诊断（后端面板显示"局域网连上几个对端"要用）。
@@ -203,6 +209,23 @@ fn worker(
                     });
                 }
             },
+            Request::Delete(position) => {
+                let mut args = Map::new();
+                args.insert("position".to_string(), json!(position));
+                match client.request(commands::HISTORY_DELETE, args) {
+                    Ok(_) => {
+                        let _ = events.send(UiEvent::Info(format!(
+                            "已删除第 {position} 条的本机历史（其他设备不受影响）"
+                        )));
+                    }
+                    Err(err) => {
+                        let _ = events.send(UiEvent::Failure {
+                            command: "history.delete".to_string(),
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            }
             Request::Doctor => match client.simple(commands::DOCTOR) {
                 Ok(value) => match serde_json::from_value::<DoctorReport>(value) {
                     Ok(report) => {

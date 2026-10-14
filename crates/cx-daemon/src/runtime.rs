@@ -956,6 +956,15 @@ fn to_command(
             position: request.arg_u64("position").unwrap_or(0) as usize,
             max_chars: request.arg_u64("max_chars").unwrap_or(2_000).min(1_000_000) as usize,
         }),
+        commands::HISTORY_DELETE => {
+            let position = request
+                .arg_u64("position")
+                .ok_or_else(|| "history.delete 需要 position 参数".to_string())?;
+            Ok(EngineCommand::HistoryDelete {
+                id,
+                position: position as usize,
+            })
+        }
         commands::COPY => {
             let position = request
                 .arg_u64("position")
