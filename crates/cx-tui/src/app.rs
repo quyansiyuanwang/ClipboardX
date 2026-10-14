@@ -140,6 +140,8 @@ pub struct App {
     pub show_help: bool,
     /// 是否显示"后端与连接"面板。
     pub show_panel: bool,
+    /// 面板的滚动偏移（面板里有配置引导，小终端放不下）。
+    panel_scroll: u16,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
     pub doctor: Option<DoctorReport>,
     /// 等待确认的删除位置（删除是破坏性操作，必须先确认一次）。
@@ -324,6 +326,11 @@ impl App {
     /// 渲染层每帧告知列表的可视行数（决定预取窗口与分页步长）。
     pub fn set_viewport_rows(&mut self, rows: usize) {
         self.viewport_rows = rows.max(1);
+    }
+
+    /// 面板滚动偏移。
+    pub fn panel_scroll(&self) -> u16 {
+        self.panel_scroll
     }
 
     /// 可视行数。
@@ -517,8 +524,38 @@ impl App {
 
         // 面板与帮助页都是"看一眼就关"的浮层：任意键关闭（q 退出）
         if self.show_panel {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             return match key.code {
                 KeyCode::Char('q') => KeyOutcome::Quit,
+                // 滚动键不关闭面板：引导内容在小终端上放不下，得能翻
+                KeyCode::Char('J') => {
+                    self.panel_scroll = self.panel_scroll.saturating_add(1);
+                    KeyOutcome::None
+                }
+                KeyCode::Char('K') => {
+                    self.panel_scroll = self.panel_scroll.saturating_sub(1);
+                    KeyOutcome::None
+                }
+                KeyCode::PageDown => {
+                    self.panel_scroll = self.panel_scroll.saturating_add(10);
+                    KeyOutcome::None
+                }
+                KeyCode::PageUp => {
+                    self.panel_scroll = self.panel_scroll.saturating_sub(10);
+                    KeyOutcome::None
+                }
+                KeyCode::Char('d') if ctrl => {
+                    self.panel_scroll = self.panel_scroll.saturating_add(10);
+                    KeyOutcome::None
+                }
+                KeyCode::Char('u') if ctrl => {
+                    self.panel_scroll = self.panel_scroll.saturating_sub(10);
+                    KeyOutcome::None
+                }
+                KeyCode::Char('0') => {
+                    self.panel_scroll = 0;
+                    KeyOutcome::None
+                }
                 // b 是开关：再按一次就关掉（不能变成"先被任意键关掉、再按又打开"）
                 KeyCode::Char('b') | KeyCode::Esc => {
                     self.show_panel = false;
@@ -561,6 +598,7 @@ impl App {
             }
             KeyCode::Char('b') => {
                 self.show_panel = true;
+                self.panel_scroll = 0;
                 // 打开时拉一次诊断：后端面板要显示局域网对端等只有 doctor 才知道的信息
                 KeyOutcome::Doctor
             }
@@ -685,7 +723,7 @@ impl App {
         let (healthy, failing, disabled) = self.backend_health();
         if status.backends.is_empty() {
             return Some((
-                "还没有配置同步后端：内容只留在本机。用 cx backend add … 添加（按 b 看详情）"
+                "还没有配置同步后端：内容只留在本机。按 b 看配置引导（三种方式、凭据怎么传）"
                     .to_string(),
                 true,
             ));
@@ -1204,7 +1242,10 @@ mod tests {
         app.apply(UiEvent::Status(Box::new(status(false))));
         let (text, warn) = app.health_line().expect("空后端应当有提示");
         assert!(warn, "这是需要用户处理的提示");
-        assert!(text.contains("cx backend add"), "要给出下一步：{text}");
+        // 提示要指向界面内的引导（面板里有分步说明与凭据怎么传），
+        // 而不是甩一条命令行——早先这里断言的是 "cx backend add"
+        assert!(text.contains("按 b"), "要指向界面内的配置引导：{text}");
+        assert!(text.contains("凭据"), "要提到凭据这件事：{text}");
         assert_eq!(app.backend_health(), (0, 0, 0));
     }
 
@@ -1430,6 +1471,49 @@ mod tests {
         );
         // 第二行是空的
         assert_eq!(app.click(4), None);
+    }
+    #[test]
+    fn 面板里滚动键不关闭面板() {
+        let mut app = app_with(1);
+        app.on_key(key(KeyCode::Char('b')));
+        assert!(app.show_panel);
+        assert_eq!(app.panel_scroll(), 0);
+
+        app.on_key(key(KeyCode::Char('J')));
+        app.on_key(key(KeyCode::Char('J')));
+        assert!(app.show_panel, "J 是滚面板，不该关掉它");
+        assert_eq!(app.panel_scroll(), 2);
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(app.panel_scroll(), 1);
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.panel_scroll(), 11);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.panel_scroll(), 1);
+        app.on_key(ctrl(KeyCode::Char('d')));
+        assert_eq!(app.panel_scroll(), 11);
+        app.on_key(ctrl(KeyCode::Char('u')));
+        assert_eq!(app.panel_scroll(), 1);
+        app.on_key(key(KeyCode::Char('0')));
+        assert_eq!(app.panel_scroll(), 0);
+        // 到顶后继续上滚不越界
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(app.panel_scroll(), 0);
+
+        // 仍然是"b / Esc 关闭，其他键关闭"
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(!app.show_panel);
+    }
+
+    #[test]
+    fn 每次打开面板滚动都从顶部开始() {
+        let mut app = app_with(1);
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::Char('J')));
+        app.on_key(key(KeyCode::Char('J')));
+        assert_eq!(app.panel_scroll(), 2);
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.panel_scroll(), 0, "重新打开不该停在上一半截");
     }
     #[test]
     fn 状态行包含关键信息() {
