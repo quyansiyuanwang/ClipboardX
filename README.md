@@ -49,6 +49,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 .\scripts\e2e-s3.ps1           # 端到端：两台守护进程经 S3 兼容存储（moto）互相同步
 .\scripts\e2e-server.ps1       # 端到端：自建服务端 MVP（注册→建空间→加入→双设备同步→服务端只有密文）
 .\scripts\e2e-lan.ps1          # 端到端：局域网直连（不配任何后端，两台守护进程互推；错配对码者收不到）
+.\scripts\e2e-hardening.ps1    # 加固验收：体积预算、密钥 0600、明文不落盘、空闲 CPU/内存实测
 .\scripts\build-msi.ps1        # 产出 dist\ClipboardX-<v>-x64.msi（WiX v4，版本锁定在仓库内）
 .\scripts\verify-msi.ps1 -Msi dist\ClipboardX-0.1.0-x64.msi
 ```

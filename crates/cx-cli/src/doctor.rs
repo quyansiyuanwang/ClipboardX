@@ -112,6 +112,10 @@ fn local_report(paths: &Paths) -> DoctorReport {
         }),
     }
 
+    // 密钥文件权限：这是"安全"里最容易出错、也最容易被忽略的一项——
+    // 空间密钥被人读到，等于所有剪贴板内容都被人读到。
+    checks.push(secret_permissions_check(paths));
+
     // 剪贴板
     match cx_clip::SystemClipboard::new() {
         Ok(clipboard) => {
@@ -173,6 +177,77 @@ fn local_report(paths: &Paths) -> DoctorReport {
     DoctorReport::new(checks)
 }
 
+/// 检查密钥文件的权限。
+///
+/// Unix 上要求 0600（只有本人可读写）；Windows 上权限由 ACL 表达，
+/// 这里只确认文件在用户的配置/数据目录下（不做 ACL 解析，避免给出假的安全感）。
+fn secret_permissions_check(paths: &Paths) -> DoctorCheck {
+    let mut watched: Vec<std::path::PathBuf> = vec![
+        paths.space_key_file(),
+        paths.control_token_file(),
+        paths.config_dir.join("lan.key"),
+    ];
+    // secrets/ 下的口令、令牌、S3 私钥
+    if let Ok(entries) = std::fs::read_dir(paths.secrets_dir()) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                watched.push(entry.path());
+            }
+        }
+    }
+
+    // 非 Unix 平台上不会往里 push（权限由 ACL 表达），因此那里的 mut 是多余的
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut complaints: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for path in &watched {
+        if !path.exists() {
+            continue;
+        }
+        checked += 1;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode & 0o077 != 0 {
+                        complaints.push(format!(
+                            "{} 权限是 {mode:o}（应为 600）",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    }
+                }
+                Err(err) => complaints.push(format!("{} 无法读取元数据：{err}", path.display())),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
+    let detail = if checked == 0 {
+        "还没有需要保护的密钥文件".to_string()
+    } else if complaints.is_empty() {
+        #[cfg(unix)]
+        {
+            format!("{checked} 个密钥文件都是 600")
+        }
+        #[cfg(not(unix))]
+        {
+            format!("{checked} 个密钥文件都在用户目录下（Windows 权限由 ACL 表达）")
+        }
+    } else {
+        complaints.join("；")
+    };
+
+    DoctorCheck {
+        name: "密钥权限".to_string(),
+        ok: complaints.is_empty(),
+        detail,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
