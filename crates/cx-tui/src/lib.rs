@@ -51,7 +51,9 @@ pub enum TuiExit {
 
 /// 进入全屏 TUI。
 pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    };
     use crossterm::execute;
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -62,7 +64,13 @@ pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
             .map_err(|err| TuiError::Io(format!("无法初始化终端：{err}")))?;
     enable_raw_mode().map_err(|err| TuiError::Io(format!("无法进入 raw 模式：{err}")))?;
     let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+    let _ = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        // 括号粘贴：整段文本一次送到，不再逐字符模拟按键
+        EnableBracketedPaste
+    );
 
     let result = run_loop(&mut terminal, paths);
 
@@ -70,7 +78,8 @@ pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
     let _ = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     );
     let _ = terminal.show_cursor();
     result
@@ -113,6 +122,11 @@ fn run_loop(
                 event::read().map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))?;
             // 滚轮翻列表：EnableMouseCapture 早就开了，但一直没处理鼠标事件，
             // 于是滚轮在界面里完全没反应。
+            // 粘贴整段文本：交给界面按字段处理（含去掉末尾换行的处理）
+            if let TermEvent::Paste(text) = &event {
+                app.on_paste(text);
+                continue;
+            }
             if let TermEvent::Mouse(mouse) = event {
                 use crossterm::event::MouseEventKind;
                 match mouse.kind {
