@@ -16,10 +16,13 @@ mod app;
 mod client;
 mod error;
 mod ui;
+mod wizard;
 
 pub use app::{App, KeyOutcome};
 pub use client::{DaemonClient, UiEvent};
 pub use error::TuiError;
+pub use wizard::BackendDraft as TuiBackendDraft;
+pub use wizard::{BackendDraft, Wizard, WizardKind};
 
 use cx_core::Paths;
 use cx_proto::control::HistoryPreview;
@@ -32,8 +35,20 @@ pub const DEFAULT_REDRAW_MS: u64 = 1000;
 /// 历史列表一次取多少条。
 pub const HISTORY_LIMIT: usize = 500;
 
+/// 界面退出的原因。
+///
+/// `AddBackend` 用于"用户在界面里填完表单"这种情形：界面只负责收集，落盘与自测由
+/// 命令层完成（`cx tui` 与 `cx backend add` 是同一个二进制）。
+#[derive(Debug)]
+pub enum TuiExit {
+    /// 用户主动退出。
+    Quit,
+    /// 表单填完了，交给调用方去添加后端。
+    AddBackend(Box<BackendDraft>),
+}
+
 /// 进入全屏 TUI。
-pub fn run(paths: &Paths) -> Result<(), TuiError> {
+pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::execute;
     use crossterm::terminal::{
@@ -62,7 +77,7 @@ pub fn run(paths: &Paths) -> Result<(), TuiError> {
 fn run_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     paths: &Paths,
-) -> Result<(), TuiError> {
+) -> Result<TuiExit, TuiError> {
     use crossterm::event::{self, Event as TermEvent, KeyEventKind};
 
     let mut app = App::new();
@@ -70,6 +85,7 @@ fn run_loop(
     app.note("正在连接守护进程…");
 
     let tick = Duration::from_millis(DEFAULT_REDRAW_MS);
+    let mut exit = TuiExit::Quit;
 
     loop {
         // 1) 处理后台线程送来的消息
@@ -127,6 +143,11 @@ fn run_loop(
                         app.forget_previews();
                     }
                     KeyOutcome::Doctor => client.request_doctor(),
+                    // 表单填完：退出界面，把草稿交回命令层
+                    KeyOutcome::AddBackend(draft) => {
+                        exit = TuiExit::AddBackend(draft);
+                        break;
+                    }
                     KeyOutcome::Delete(position) => {
                         client.request_delete(position);
                         // 删完立刻刷新：列表里那一条应当马上消失
@@ -145,7 +166,7 @@ fn run_loop(
     }
 
     client.shutdown();
-    Ok(())
+    Ok(exit)
 }
 
 /// 渲染一帧到 stdout（不需要终端，便于脚本与 CI 校验）。

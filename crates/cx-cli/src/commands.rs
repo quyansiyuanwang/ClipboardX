@@ -625,9 +625,16 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             // 从快捷方式启动时守护进程通常还没起来。这里先确保它在跑，
             // 否则界面会停在"未连接"上，用户看到的就是"黑窗一闪"。
             ensure_daemon_running(paths)?;
-            cx_tui::run(paths)
-                .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?;
-            Ok(ExitCode::SUCCESS)
+            match cx_tui::run(paths)
+                .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?
+            {
+                cx_tui::TuiExit::Quit => Ok(ExitCode::SUCCESS),
+                cx_tui::TuiExit::AddBackend(draft) => {
+                    // 界面只负责收集，落盘与自测在这里做（同一进程内的库调用）
+                    add_backend_from_draft(paths, &draft)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
         }
     }
 }
@@ -754,6 +761,135 @@ fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<
 ///
 /// 已经连得上就直接返回；连不上就按 `cx start` 的方式拉起一个后台守护进程，
 /// 最多等 5 秒等它开始监听。
+/// 把 TUI 表单收集到的草稿落成配置（界面里添加后端的落地口）。
+///
+/// 与 `cx backend add` 走同一套核心逻辑：写 `secrets/` 下的凭据文件 + 追加
+/// `[[backend]]` 段。差别只是凭据来自表单而不是标准输入。
+fn add_backend_from_draft(
+    paths: &Paths,
+    draft: &cx_tui::TuiBackendDraft,
+) -> Result<(), DaemonError> {
+    use cx_core::config::{BackendKind, BackendSection};
+    use cx_tui::WizardKind;
+
+    let name = draft.name().trim().to_string();
+    if name.is_empty() {
+        return Err(DaemonError::Protocol("后端名不能为空".to_string()));
+    }
+    let mut config = Config::load_or_create(paths)?;
+    if config.backends.iter().any(|backend| backend.name == name) {
+        return Err(DaemonError::Protocol(format!(
+            "已经有名为 {name} 的后端了（用 `cx backend remove {name}` 先删掉）"
+        )));
+    }
+
+    let mut section = BackendSection {
+        name: name.clone(),
+        kind: match draft.kind {
+            WizardKind::Server => BackendKind::Server,
+            WizardKind::Webdav => BackendKind::Webdav,
+            WizardKind::S3 => BackendKind::S3,
+        },
+        enabled: true,
+        url: None,
+        space: None,
+        token_file: None,
+        username: None,
+        password_file: None,
+        password_env: None,
+        ca_file: None,
+        insecure: false,
+        bucket: None,
+        prefix: None,
+        region: None,
+        endpoint: None,
+        access_key_id: None,
+        secret_access_key_file: None,
+        secret_access_key_env: None,
+        path_style: None,
+        poll_interval_ms: None,
+    };
+
+    // 凭据一律写进 secrets/（0600），不落进 config.toml
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
+    let mut save_secret = |label: &str, value: &str| -> Result<String, DaemonError> {
+        let file_name = format!("{name}.{label}");
+        write_secret_file(paths, &file_name, value)?;
+        written.push(paths.secret_file(&file_name));
+        Ok(file_name)
+    };
+
+    let result = (|| -> Result<(), DaemonError> {
+        match draft.kind {
+            WizardKind::Server => {
+                section.url = Some(draft.get("服务端地址").trim().to_string());
+                section.space = Some(draft.get("空间 id").trim().to_string());
+                let secret = draft.get("注册密钥").trim();
+                if !secret.is_empty() {
+                    section.token_file = Some(save_secret("token", secret)?);
+                }
+            }
+            WizardKind::Webdav => {
+                section.url = Some(draft.get("URL").trim().to_string());
+                let user = draft.get("用户名").trim();
+                if !user.is_empty() {
+                    section.username = Some(user.to_string());
+                }
+                let password = draft.get("口令").trim();
+                if !password.is_empty() {
+                    section.password_file = Some(save_secret("password", password)?);
+                } else if user.is_empty() {
+                    return Err(DaemonError::Protocol(
+                        "匿名 WebDAV 也要留空用户名，但至少填 URL".to_string(),
+                    ));
+                }
+            }
+            WizardKind::S3 => {
+                section.bucket = Some(draft.get("桶名").trim().to_string());
+                let endpoint = draft.get("端点").trim();
+                if !endpoint.is_empty() {
+                    section.endpoint = Some(endpoint.to_string());
+                }
+                section.region = Some(draft.get("区域").trim().to_string());
+                section.access_key_id = Some(draft.get("AccessKeyId").trim().to_string());
+                let secret = draft.get("SecretAccessKey").trim();
+                if !secret.is_empty() {
+                    section.secret_access_key_file = Some(save_secret("secret", secret)?);
+                }
+                let prefix = draft.get("前缀").trim();
+                if !prefix.is_empty() {
+                    section.prefix = Some(prefix.to_string());
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        // 落盘失败就把已经写下的凭据清掉，别留半截文件
+        for path in written {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(err);
+    }
+
+    config.backends.push(section);
+    config.save(paths)?;
+    println!("已添加后端 {name}（凭据写入 secrets/，权限 0600）");
+
+    // 直连自测：让用户在界面里就能立刻知道配得对不对
+    match build_named_backend(paths, &name) {
+        Ok(backend) => println!("已构建后端：{}", backend.describe()),
+        Err(err) => println!("后端构建失败：{err}\n可以改完再试：cx backend test {name}"),
+    }
+
+    // 后端 worker 是启动时创建的，因此新增后端要重启守护进程才生效
+    if cx_daemon::stop_running(paths)? {
+        println!("已重启守护进程以启用新后端");
+    }
+    let _ = cx_daemon::spawn_background(paths, false);
+    Ok(())
+}
 fn ensure_daemon_running(paths: &Paths) -> Result<(), DaemonError> {
     if ControlClient::connect(paths).is_ok() {
         return Ok(());

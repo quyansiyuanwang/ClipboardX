@@ -7,6 +7,7 @@
 //! 左右分栏会把两边都挤到不可读，上下堆叠反而能用。
 
 use crate::app::{App, PreviewState};
+use crate::wizard::{Focus, WizardKind};
 use cx_proto::control::HistorySummary;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -53,6 +54,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if let Some(position) = app.pending_delete {
         draw_confirm_delete(frame, area, position);
+    }
+    if app.wizard.is_some() {
+        draw_wizard(frame, area, app);
     }
 }
 
@@ -442,7 +446,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
     } else if app.filter_active() {
         " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　/ 改过滤　Esc 清过滤　? 帮助　q 退出 "
     } else {
-        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　d 删除　b 后端状态　/ 过滤　? 帮助　q 退出 "
+        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　d 删除　b 后端状态　a 添加后端　/ 过滤　? 帮助　q 退出 "
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -453,6 +457,158 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
     );
 }
 
+/// 添加后端表单：像网页表单一样，一屏内看到类型、全部字段与按钮。
+///
+/// 布局是"标签列 + 输入框列"，焦点行用高亮标出；密文字段只回显 ●；
+/// 提交失败时在字段右侧就地标红，并在下方给一行整体提示。
+fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(form) = app.wizard.as_ref() else {
+        return;
+    };
+    let popup = centered(area, 86, 84);
+    frame.render_widget(Clear, popup);
+
+    let fields = form.fields();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " 添加同步后端",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // 类型单选行
+    let mut kind_line = vec![Span::styled(
+        format!("{:<10}", "类型"),
+        Style::default().fg(Color::DarkGray),
+    )];
+    for (index, kind) in WizardKind::ALL.iter().enumerate() {
+        let selected = index == form.kind_index();
+        let focused = matches!(form.focus(), Focus::Kind);
+        let style = match (selected, focused) {
+            (true, true) => Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            (true, false) => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            (false, _) => Style::default().fg(Color::DarkGray),
+        };
+        kind_line.push(Span::styled(
+            format!(" {} {} ", if selected { "◉" } else { "○" }, kind.label()),
+            style,
+        ));
+    }
+    lines.push(Line::from(kind_line));
+    lines.push(Line::from(Span::styled(
+        format!("           {}", form.kind().hint()),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    // 字段：标签列 + 输入框
+    for (index, field) in fields.iter().enumerate() {
+        let focused = form.focused_field() == Some(index);
+        let invalid = form.is_invalid(index);
+        let label_style = if invalid {
+            Style::default().fg(Color::Red)
+        } else if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let raw = form.value(index);
+        let shown = if field.secret {
+            // 密文只显示长度，既不回显内容也能让人确认"确实输入了"
+            if raw.is_empty() {
+                String::new()
+            } else {
+                format!("{}{}", "●".repeat(raw.chars().count().min(16)), "")
+            }
+        } else {
+            raw.to_string()
+        };
+        let value_style = if invalid {
+            Style::default().fg(Color::Red)
+        } else if focused {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<10}", field.label), label_style),
+            Span::styled(
+                format!("{} ", if field.required() { "*" } else { " " }),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                if focused {
+                    format!("{shown}▏")
+                } else if shown.is_empty() {
+                    "（未填）".to_string()
+                } else {
+                    shown
+                },
+                value_style,
+            ),
+            Span::styled(
+                format!("   {}", field.help),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    // 按钮
+    let save_style = if matches!(form.focus(), Focus::Save) {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    let cancel_style = if matches!(form.focus(), Focus::Cancel) {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Gray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("          ", Style::default()),
+        Span::styled(" [ 保存并测试 ] ", save_style),
+        Span::raw("  "),
+        Span::styled(" [ 取消 ] ", cancel_style),
+    ]));
+    if let Some(message) = &form.message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {message}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Tab/↑↓ 换行　←→ 选类型　直接输入　Ctrl+Y 填示例　Ctrl+L 清空　回车 保存　Esc 取消　（也可用鼠标点行）",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" 添加后端 ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
 /// "后端与连接"面板：后端健康、局域网对端、以及 doctor 里的其余检查。
 ///
 /// 为什么需要它：TUI 原来只看得到"后端 N 个"，看不出**哪个后端在失败、退避到什么时候、
@@ -478,6 +634,25 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines.push(Line::from(Span::styled(
                 "还没有配置同步后端：内容只留在本机历史里。",
                 Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(" 按 ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "a",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " 在界面里直接填表添加（类型、字段、密钥都在表单里填，保存前自测）",
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                " 下面是等价的命令行做法，适合脚本化或批量配置：",
+                Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -679,7 +854,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  p                立即发布本机剪贴板"),
         Line::from("  r                刷新状态与历史"),
         Line::from("  R                重新读取配置"),
-        Line::from("  鼠标             滚轮翻列表；左键点某一行即选中它"),
+        Line::from("  a                添加同步后端（表单：类型 / 字段 / 密钥，保存前自测）"),
+        Line::from("  鼠标             滚轮翻列表；左键点某一行即选中它；表单里点某行即聚焦"),
         Line::from("  d                删除选中项（本机历史，会先确认）"),
         Line::from("  b                后端与连接面板（各后端健康、局域网对端）"),
         Line::from("  ?                帮助（本页）"),

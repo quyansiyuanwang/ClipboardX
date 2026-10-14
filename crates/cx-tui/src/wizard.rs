@@ -1,0 +1,558 @@
+//! 添加后端的表单（单页，像网页表单那样填）。
+//!
+//! 设计要点：
+//! - **一屏看到全部字段**，不做"一步一步问答"；类型是单选行，换类型时下方字段跟着换；
+//! - **焦点清晰**：Tab / ↑↓ 在类型与字段间移动，也可以**用鼠标点**某一行直接定位；
+//! - **校验就地提示**：提交时一次标出所有没填的必填项，不跳步、不丢已填内容；
+//! - **按钮**：[保存并测试] 与 [取消]，同样支持点与键（Enter / Esc）；
+//! - **密钥类字段密文回显**（只显示 ● 与长度），避免肩窥，也不写日志。
+//!
+//! 这里只产出草稿，不碰配置文件、不碰网络：落盘与连通性自测由 `cx` 命令层完成
+//! （`cx tui` 与 `cx backend add` 本来就是同一个二进制，同进程内的库调用）。
+
+/// 表单支持的后端类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WizardKind {
+    /// 自建服务端 `cx-server`。
+    Server,
+    /// WebDAV（Nextcloud 等）。
+    Webdav,
+    /// S3 兼容（AWS / MinIO / R2 / 阿里云 OSS）。
+    S3,
+}
+
+const SERVER_FIELDS: [Field; 4] = [
+    Field::text("后端名", "home", "唯一名字，用于 cx backend list / test"),
+    Field::text(
+        "服务端地址",
+        "http://192.168.1.9:8688",
+        "cx-server 监听的地址",
+    ),
+    Field::text(
+        "空间 id",
+        "（cx space init 输出的那个）",
+        "要同步到服务端上的哪个空间",
+    ),
+    Field::secret("注册密钥", "cx-server token issue 生成；密文输入，不回显"),
+];
+
+const WEBDAV_FIELDS: [Field; 4] = [
+    Field::text("后端名", "dav", "唯一名字"),
+    Field::text(
+        "URL",
+        "https://cloud.example.com/remote.php/dav/files/me/clipboardx",
+        "WebDAV 目录地址",
+    ),
+    Field::text("用户名", "me", "留空表示匿名访问"),
+    Field::secret("口令", "建议用应用专用密码；密文输入，不回显"),
+];
+
+const S3_FIELDS: [Field; 7] = [
+    Field::text("后端名", "oss", "唯一名字"),
+    Field::text("桶名", "clipboardx", "已存在的桶"),
+    Field::text(
+        "端点",
+        "https://oss-cn-hangzhou.aliyuncs.com",
+        "AWS 官方留空",
+    ),
+    Field::text(
+        "区域",
+        "cn-hangzhou",
+        "必须与端点同区域（阿里云杭州 = cn-hangzhou）",
+    ),
+    Field::text("AccessKeyId", "（RAM 控制台创建）", "只给该桶读写权限即可"),
+    Field::secret("SecretAccessKey", "与 AccessKeyId 配对；密文输入，不回显"),
+    Field::text("前缀", "clipboardx", "对象名会落在该前缀下"),
+];
+
+impl WizardKind {
+    /// 全部类型（界面上的顺序）。
+    pub const ALL: [WizardKind; 3] = [WizardKind::Server, WizardKind::Webdav, WizardKind::S3];
+
+    /// 名字。
+    pub fn label(self) -> &'static str {
+        match self {
+            WizardKind::Server => "自建服务端",
+            WizardKind::Webdav => "WebDAV",
+            WizardKind::S3 => "S3 兼容",
+        }
+    }
+
+    /// 一句话用途。
+    pub fn hint(self) -> &'static str {
+        match self {
+            WizardKind::Server => "自己掌控，需要先跑 cx-server",
+            WizardKind::Webdav => "Nextcloud / ownCloud 等现成网盘",
+            WizardKind::S3 => "AWS / MinIO / R2 / 阿里云 OSS",
+        }
+    }
+
+    /// 该类型的字段表。
+    pub fn fields(self) -> &'static [Field] {
+        match self {
+            WizardKind::Server => &SERVER_FIELDS,
+            WizardKind::Webdav => &WEBDAV_FIELDS,
+            WizardKind::S3 => &S3_FIELDS,
+        }
+    }
+}
+
+/// 表单里的一个字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    /// 显示名。
+    pub label: &'static str,
+    /// 输入示例（可一键填入）。
+    pub sample: &'static str,
+    /// 说明。
+    pub help: &'static str,
+    /// 是否密文（只回显 ●）。
+    pub secret: bool,
+}
+
+impl Field {
+    const fn text(label: &'static str, sample: &'static str, help: &'static str) -> Field {
+        Field {
+            label,
+            sample,
+            help,
+            secret: false,
+        }
+    }
+
+    const fn secret(label: &'static str, help: &'static str) -> Field {
+        Field {
+            label,
+            sample: "",
+            help,
+            secret: true,
+        }
+    }
+
+    /// 是否必填（端点 / 用户名 / 前缀可空）。
+    pub fn required(&self) -> bool {
+        !matches!(self.label, "端点" | "用户名" | "前缀")
+    }
+}
+
+/// 表单收集出来的草稿。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendDraft {
+    /// 类型。
+    pub kind: WizardKind,
+    /// 字段值，顺序与 `WizardKind::fields()` 一致。
+    pub values: Vec<String>,
+}
+
+impl BackendDraft {
+    /// 按标签取值。
+    pub fn get(&self, label: &str) -> &str {
+        self.kind
+            .fields()
+            .iter()
+            .position(|field| field.label == label)
+            .and_then(|index| self.values.get(index))
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// 后端名（第一个字段恒为后端名）。
+    pub fn name(&self) -> &str {
+        self.values.first().map(String::as_str).unwrap_or("")
+    }
+}
+
+/// 焦点落在哪一行（键盘移动与鼠标点击都落到这里）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// 类型单选行。
+    Kind,
+    /// 第 N 个字段。
+    Field(usize),
+    /// [保存并测试] 按钮。
+    Save,
+    /// [取消] 按钮。
+    Cancel,
+}
+
+/// 表单状态。
+#[derive(Debug, Clone)]
+pub struct Wizard {
+    kind_index: usize,
+    /// 每种类型各自的值，切换类型不丢已填内容。
+    values: [Vec<String>; 3],
+    focus: Focus,
+    /// 提交时仍为空、需要标红的字段下标。
+    invalid: Vec<usize>,
+    /// 提交失败的整体提示。
+    pub message: Option<String>,
+}
+
+impl Default for Wizard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Wizard {
+    /// 新建：默认第一种类型，后端名预填示例值（少一个必填项要敲）。
+    pub fn new() -> Self {
+        let mut values: [Vec<String>; 3] = Default::default();
+        for (index, kind) in WizardKind::ALL.iter().enumerate() {
+            let mut row: Vec<String> = kind.fields().iter().map(|_| String::new()).collect();
+            if let Some(first) = kind.fields().first() {
+                row[0] = first.sample.to_string();
+            }
+            values[index] = row;
+        }
+        Self {
+            kind_index: 0,
+            values,
+            focus: Focus::Kind,
+            invalid: Vec::new(),
+            message: None,
+        }
+    }
+
+    /// 当前类型。
+    pub fn kind(&self) -> WizardKind {
+        WizardKind::ALL[self.kind_index]
+    }
+
+    /// 当前类型的字段。
+    pub fn fields(&self) -> &'static [Field] {
+        self.kind().fields()
+    }
+
+    /// 当前焦点。
+    pub fn focus(&self) -> Focus {
+        self.focus
+    }
+
+    /// 当前类型下标（渲染单选行用）。
+    pub fn kind_index(&self) -> usize {
+        self.kind_index
+    }
+
+    /// 字段值。
+    pub fn value(&self, index: usize) -> &str {
+        self.values[self.kind_index]
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// 该字段是否被判为非法（提交后仍为空）。
+    pub fn is_invalid(&self, index: usize) -> bool {
+        self.invalid.contains(&index)
+    }
+
+    /// 当前焦点字段（焦点不在字段上时为 None）。
+    pub fn focused_field(&self) -> Option<usize> {
+        match self.focus {
+            Focus::Field(index) => Some(index),
+            _ => None,
+        }
+    }
+
+    /// 切到另一种类型。
+    pub fn set_kind(&mut self, index: usize) {
+        if index < WizardKind::ALL.len() {
+            self.kind_index = index;
+            // 换类型后字段数会变，焦点可能越界：回到类型行最安全
+            if matches!(self.focus, Focus::Field(_)) {
+                self.focus = Focus::Kind;
+            }
+            self.invalid.clear();
+        }
+    }
+
+    /// 类型左移。
+    pub fn kind_left(&mut self) {
+        self.set_kind(self.kind_index.saturating_sub(1));
+    }
+
+    /// 类型右移。
+    pub fn kind_right(&mut self) {
+        self.set_kind((self.kind_index + 1).min(WizardKind::ALL.len() - 1));
+    }
+
+    /// 焦点移到下一行（Tab / ↓）：类型 → 字段… → 两个按钮 → 回到类型。
+    pub fn focus_next(&mut self) {
+        let fields = self.fields().len();
+        self.focus = match self.focus {
+            Focus::Kind => Focus::Field(0),
+            Focus::Field(index) if index + 1 < fields => Focus::Field(index + 1),
+            Focus::Field(_) => Focus::Save,
+            Focus::Save => Focus::Cancel,
+            Focus::Cancel => Focus::Kind,
+        };
+    }
+
+    /// 焦点移到上一行（Shift+Tab / ↑）。
+    pub fn focus_prev(&mut self) {
+        let fields = self.fields().len();
+        self.focus = match self.focus {
+            Focus::Kind => Focus::Cancel,
+            Focus::Field(0) => Focus::Kind,
+            Focus::Field(index) => Focus::Field(index - 1),
+            Focus::Save => Focus::Field(fields - 1),
+            Focus::Cancel => Focus::Save,
+        };
+    }
+
+    /// 把焦点放到某字段（鼠标点击用）。
+    pub fn focus_field(&mut self, index: usize) {
+        if index < self.fields().len() {
+            self.focus = Focus::Field(index);
+        }
+    }
+
+    /// 聚焦按钮（鼠标点击用）。
+    pub fn focus_button(&mut self, save: bool) {
+        self.focus = if save { Focus::Save } else { Focus::Cancel };
+    }
+
+    /// 往当前字段输入一个字符。
+    pub fn push_char(&mut self, ch: char) {
+        if let Focus::Field(index) = self.focus {
+            // 一动手输入就消掉该字段的红标
+            self.invalid.retain(|invalid| *invalid != index);
+            if let Some(value) = self.values[self.kind_index].get_mut(index) {
+                value.push(ch);
+            }
+            self.message = None;
+        }
+    }
+
+    /// 删掉当前字段末尾一个字符。
+    pub fn backspace(&mut self) {
+        if let Focus::Field(index) = self.focus
+            && let Some(value) = self.values[self.kind_index].get_mut(index)
+        {
+            value.pop();
+        }
+    }
+
+    /// 用示例值填充当前字段。
+    pub fn fill_sample(&mut self) {
+        if let Focus::Field(index) = self.focus {
+            let sample = self.fields()[index].sample;
+            if let Some(value) = self.values[self.kind_index].get_mut(index) {
+                *value = sample.to_string();
+            }
+        }
+    }
+
+    /// 清空当前字段。
+    pub fn clear_field(&mut self) {
+        if let Focus::Field(index) = self.focus
+            && let Some(value) = self.values[self.kind_index].get_mut(index)
+        {
+            value.clear();
+        }
+    }
+
+    /// 提交：校验必填项，通过则给出草稿。
+    ///
+    /// **一次标出所有空的必填项**并把焦点落到第一个上：像表单一样改完再交，
+    /// 而不是"问答式"一步一拦、还把已填内容丢掉。
+    pub fn submit(&mut self) -> Result<BackendDraft, Vec<usize>> {
+        let missing: Vec<usize> = self
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(index, field)| field.required() && self.value(*index).trim().is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        if !missing.is_empty() {
+            self.invalid = missing.clone();
+            self.message = Some(format!("还有 {} 个必填项没填", missing.len()));
+            self.focus = Focus::Field(missing[0]);
+            return Err(missing);
+        }
+        self.invalid.clear();
+        self.message = None;
+        Ok(BackendDraft {
+            kind: self.kind(),
+            values: self.values[self.kind_index].clone(),
+        })
+    }
+
+    /// 鼠标命中测试：表单内容区的相对行 → 该聚焦的行。
+    ///
+    /// 0 = 类型行，1..=N = 字段，接着是 [保存] 与 [取消]；由渲染层把屏幕坐标换算成相对行。
+    pub fn row_at(&self, row: usize) -> Option<Focus> {
+        let fields = self.fields().len();
+        if row == 0 {
+            return Some(Focus::Kind);
+        }
+        let index = row - 1;
+        if index < fields {
+            return Some(Focus::Field(index));
+        }
+        match index - fields {
+            0 => Some(Focus::Save),
+            1 => Some(Focus::Cancel),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn type_into(form: &mut Wizard, index: usize, text: &str) {
+        form.focus_field(index);
+        form.clear_field();
+        for ch in text.chars() {
+            form.push_char(ch);
+        }
+    }
+
+    #[test]
+    fn 一屏之内有类型行_全部字段与两个按钮() {
+        for kind in WizardKind::ALL {
+            assert!(kind.fields().len() >= 4, "{} 字段太少", kind.label());
+            assert_eq!(kind.fields()[0].label, "后端名");
+            assert!(!kind.hint().is_empty());
+        }
+        let form = Wizard::new();
+        let fields = form.fields().len();
+        assert_eq!(form.row_at(0), Some(Focus::Kind));
+        assert_eq!(form.row_at(1), Some(Focus::Field(0)));
+        assert_eq!(form.row_at(fields), Some(Focus::Field(fields - 1)));
+        assert_eq!(form.row_at(fields + 1), Some(Focus::Save));
+        assert_eq!(form.row_at(fields + 2), Some(Focus::Cancel));
+        assert_eq!(form.row_at(fields + 3), None, "越界行没有焦点");
+    }
+
+    #[test]
+    fn 密钥类字段是密文输入() {
+        assert!(
+            WizardKind::S3
+                .fields()
+                .iter()
+                .any(|f| f.label == "SecretAccessKey" && f.secret)
+        );
+        assert!(
+            WizardKind::Webdav
+                .fields()
+                .iter()
+                .any(|f| f.label == "口令" && f.secret)
+        );
+        assert!(
+            WizardKind::Server
+                .fields()
+                .iter()
+                .any(|f| f.label == "注册密钥" && f.secret)
+        );
+    }
+
+    #[test]
+    fn 焦点在类型_字段_按钮之间循环() {
+        let mut form = Wizard::new();
+        assert_eq!(form.focus(), Focus::Kind);
+        form.focus_next();
+        assert_eq!(form.focus(), Focus::Field(0));
+        for _ in 1..form.fields().len() {
+            form.focus_next();
+        }
+        assert_eq!(form.focus(), Focus::Field(form.fields().len() - 1));
+        form.focus_next();
+        assert_eq!(form.focus(), Focus::Save);
+        form.focus_next();
+        assert_eq!(form.focus(), Focus::Cancel);
+        form.focus_next();
+        assert_eq!(form.focus(), Focus::Kind, "循环回到类型行");
+
+        form.focus_prev();
+        assert_eq!(form.focus(), Focus::Cancel, "反向同样循环");
+        form.focus_prev();
+        assert_eq!(form.focus(), Focus::Save);
+        form.focus_prev();
+        assert_eq!(form.focus(), Focus::Field(form.fields().len() - 1));
+    }
+
+    #[test]
+    fn 鼠标点某一行就聚焦它_点越界不动() {
+        let mut form = Wizard::new();
+        form.focus_field(2);
+        assert_eq!(form.focus(), Focus::Field(2));
+        form.focus_button(false);
+        assert_eq!(form.focus(), Focus::Cancel);
+        form.focus_button(true);
+        assert_eq!(form.focus(), Focus::Save);
+        let before = form.focus();
+        form.focus_field(99);
+        assert_eq!(form.focus(), before, "点空白处不该改变焦点");
+    }
+
+    #[test]
+    fn 提交时一次标出所有缺失必填项且不丢已填内容() {
+        let mut form = Wizard::new();
+        form.set_kind(2); // S3
+        type_into(&mut form, 1, "clipboardx");
+        type_into(&mut form, 4, "AKID");
+        let missing = form.submit().unwrap_err();
+        assert!(missing.contains(&3), "区域必填：{missing:?}");
+        assert!(missing.contains(&5), "密钥必填：{missing:?}");
+        assert_eq!(form.value(1), "clipboardx", "已填内容不该被清掉");
+        assert_eq!(form.message.as_deref(), Some("还有 2 个必填项没填"));
+        assert!(form.is_invalid(3) && form.is_invalid(5));
+        assert_eq!(form.focus(), Focus::Field(3), "焦点落到第一个缺失项");
+    }
+
+    #[test]
+    fn 补齐后可提交_端点可空() {
+        let mut form = Wizard::new();
+        form.set_kind(2);
+        type_into(&mut form, 1, "bucket");
+        type_into(&mut form, 3, "cn-hangzhou");
+        type_into(&mut form, 4, "AKID");
+        type_into(&mut form, 5, "SECRET");
+        let draft = form.submit().unwrap();
+        assert_eq!(draft.kind, WizardKind::S3);
+        assert_eq!(draft.name(), "oss");
+        assert_eq!(draft.get("桶名"), "bucket");
+        assert_eq!(draft.get("区域"), "cn-hangzhou");
+        assert_eq!(draft.get("SecretAccessKey"), "SECRET");
+        assert_eq!(draft.get("端点"), "", "端点可空");
+        assert!(form.message.is_none());
+    }
+
+    #[test]
+    fn 一动手输入就消掉红标() {
+        let mut form = Wizard::new();
+        form.set_kind(1); // WebDAV：URL 必填
+        form.submit().unwrap_err();
+        assert!(form.is_invalid(1));
+        form.focus_field(1);
+        form.push_char('h');
+        assert!(!form.is_invalid(1));
+    }
+
+    #[test]
+    fn 换类型时字段跟着换且焦点回到安全位置() {
+        let mut form = Wizard::new();
+        form.set_kind(2);
+        form.focus_field(5);
+        form.set_kind(1);
+        assert_eq!(form.fields().len(), 4);
+        assert_eq!(form.focus(), Focus::Kind);
+        assert_eq!(form.value(0), "dav", "每种类型的后端名各自预填");
+    }
+
+    #[test]
+    fn 按示例一键填入() {
+        let mut form = Wizard::new();
+        form.set_kind(2);
+        form.focus_field(2);
+        form.fill_sample();
+        assert_eq!(form.value(2), "https://oss-cn-hangzhou.aliyuncs.com");
+        form.focus_field(3);
+        form.fill_sample();
+        assert_eq!(form.value(3), "cn-hangzhou");
+    }
+}
