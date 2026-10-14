@@ -256,6 +256,18 @@ try {
     Step 'cx reload'
     Assert-True ((Invoke-Cx reload).Code -eq 0) 'cx reload 退出码 0'
 
+    Step 'cx tui --snapshot（不需要终端：渲染一帧后退出）'
+    $snapshot = Invoke-Cx tui --snapshot
+    Assert-True ($snapshot.Code -eq 0) 'cx tui --snapshot 退出码 0'
+    # 宽字符在快照里会带占位空格（测试/文本后端的行为），比较前先去掉空白
+    $flat = ($snapshot.Output -replace '\s', '')
+    Assert-True ($flat.Contains('ClipboardX')) '快照里有标题'
+    Assert-True ($flat.Contains('历史')) '快照里有历史面板'
+    Assert-True ($flat.Contains('写回剪贴板')) '快照里有快捷键提示'
+    # 界面读的是守护进程实时状态：刚 push 的内容应当出现在预览里
+    Assert-True ($flat.Contains(($pushed -replace '\s', ''))) "快照预览里能看到刚推送的内容（$pushed）"
+
+
     Step 'cx stop'
     $result = Invoke-Cx stop
     Assert-True ($result.Code -eq 0) 'cx stop 退出码 0'
