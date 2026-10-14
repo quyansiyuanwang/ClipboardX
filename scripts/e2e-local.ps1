@@ -234,34 +234,6 @@ try {
         Assert-True (-not (AsJson (Invoke-Cx status --json).Output).paused) '恢复后 status 不再暂停'
     }
 
-    Step 'cx delete 只删本机历史的那一条'
-    # 先确保有足够的条目：直接发布两条固定内容
-    foreach ($marker in @('待删除的内容 A', '保留的内容 B')) {
-        Invoke-Cx push --text $marker | Out-Null
-    }
-    Start-Sleep -Seconds $WaitSeconds
-    $beforeDelete = AsJson (Invoke-Cx history --json).Output
-    $targetText = (AsJson (Invoke-Cx show 0 --json).Output).text
-    $result = Invoke-Cx delete 0
-    Assert-True ($result.Code -eq 0) 'cx delete 退出码 0'
-    $afterDelete = AsJson (Invoke-Cx history --json).Output
-    Assert-True ($afterDelete.Count -eq ($beforeDelete.Count - 1)) "删除后少一条（$($beforeDelete.Count) → $($afterDelete.Count)）"
-    $remaining = (AsJson (Invoke-Cx show 0 --json).Output).text
-    Assert-True ($remaining -ne $targetText) "被删的那条不在最新位置了（现在是 $remaining）"
-    # 剩下条目的内容必须仍读得回来：删除会重写日志并重算偏移，这里正是在验这一点
-    $allReadable = $true
-    for ($i = 0; $i -lt $afterDelete.Count; $i++) {
-        $item = AsJson (Invoke-Cx show $i --json).Output
-        if ($null -eq $item -or [string]::IsNullOrEmpty($item.text)) { $allReadable = $false }
-    }
-    Assert-True $allReadable '删除后其余条目仍能完整读回'
-    # 越界删除应当失败且不改动历史
-    $result = Invoke-Cx delete 999
-    Assert-True ($result.Code -ne 0) '越界删除退出码非 0'
-    $afterBadDelete = AsJson (Invoke-Cx history --json).Output
-    Assert-True ($afterBadDelete.Count -eq $afterDelete.Count) '失败的删除不该改动历史'
-
-
     Step '重复启动不产生第二个实例'
     $pidBefore = (AsJson (Invoke-Cx status --json).Output).pid
     $result = Invoke-Cx start --silent
@@ -294,6 +266,35 @@ try {
     Assert-True ($flat.Contains('写回剪贴板')) '快照里有快捷键提示'
     # 界面读的是守护进程实时状态：刚 push 的内容应当出现在预览里
     Assert-True ($flat.Contains(($pushed -replace '\s', ''))) "快照预览里能看到刚推送的内容（$pushed）"
+
+
+    Step 'cx delete 只删本机历史的那一条'
+    # 先确保有足够的条目：直接发布两条固定内容
+    foreach ($marker in @('待删除的内容 A', '保留的内容 B')) {
+        Invoke-Cx push --text $marker | Out-Null
+    }
+    Start-Sleep -Seconds $WaitSeconds
+    $beforeDelete = AsJson (Invoke-Cx history --json).Output
+    $targetText = (AsJson (Invoke-Cx show 0 --json).Output).text
+    $result = Invoke-Cx delete 0
+    Assert-True ($result.Code -eq 0) 'cx delete 退出码 0'
+    $afterDelete = AsJson (Invoke-Cx history --json).Output
+    Assert-True ($afterDelete.Count -eq ($beforeDelete.Count - 1)) "删除后少一条（$($beforeDelete.Count) → $($afterDelete.Count)）"
+    $remaining = (AsJson (Invoke-Cx show 0 --json).Output).text
+    Assert-True ($remaining -ne $targetText) "被删的那条不在最新位置了（现在是 $remaining）"
+    # 剩下条目的内容必须仍读得回来：删除会重写日志并重算偏移，这里正是在验这一点
+    $allReadable = $true
+    for ($i = 0; $i -lt $afterDelete.Count; $i++) {
+        $item = AsJson (Invoke-Cx show $i --json).Output
+        if ($null -eq $item -or [string]::IsNullOrEmpty($item.text)) { $allReadable = $false }
+    }
+    Assert-True $allReadable '删除后其余条目仍能完整读回'
+    # 越界删除应当失败且不改动历史
+    $result = Invoke-Cx delete 999
+    Assert-True ($result.Code -ne 0) '越界删除退出码非 0'
+    $afterBadDelete = AsJson (Invoke-Cx history --json).Output
+    Assert-True ($afterBadDelete.Count -eq $afterDelete.Count) '失败的删除不该改动历史'
+
 
 
     Step 'cx stop'
