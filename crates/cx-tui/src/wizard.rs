@@ -52,11 +52,15 @@ const WEBDAV_FIELDS: [Field; 4] = [
 
 const S3_FIELDS: [Field; 7] = [
     Field::text("后端名", "oss", "唯一名字"),
-    Field::text("桶名", "clipboardx", "已存在的桶"),
+    Field::text(
+        "桶名",
+        "clipboardx",
+        "桶不存在时会尝试自动创建（需要建桶权限）",
+    ),
     Field::text(
         "端点",
         "https://oss-cn-hangzhou.aliyuncs.com",
-        "AWS 官方留空",
+        "AWS 官方留空；自建端点默认按 path-style 访问（MinIO / 阿里云 OSS 都支持）",
     ),
     Field::text(
         "区域",
@@ -429,6 +433,24 @@ mod tests {
         assert_eq!(form.row_at(fields + 1), Some(Focus::Save));
         assert_eq!(form.row_at(fields + 2), Some(Focus::Cancel));
         assert_eq!(form.row_at(fields + 3), None, "越界行没有焦点");
+    }
+
+    #[test]
+    fn s3_字段说明覆盖最容易踩的两点() {
+        let fields = WizardKind::S3.fields();
+        let bucket = fields.iter().find(|f| f.label == "桶名").unwrap();
+        assert!(
+            bucket.help.contains("自动创建"),
+            "桶不存在时会自动创建，这一点要说明：{}",
+            bucket.help
+        );
+        let endpoint = fields.iter().find(|f| f.label == "端点").unwrap();
+        assert!(
+            endpoint.help.contains("path-style"),
+            "自建端点的默认寻址方式要说明：{}",
+            endpoint.help
+        );
+        assert!(endpoint.help.contains("留空"), "AWS 官方该留空也要说明");
     }
 
     #[test]
