@@ -136,7 +136,7 @@ jobs:
 
       - name: 挂载验收
         shell: bash
-        run: bash packaging/macos/verify-dmg.sh dist/*.dmg
+        run: sudo bash packaging/macos/verify-dmg.sh "$(ls dist/*.dmg | head -n1)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -154,6 +154,9 @@ jobs:
       - name: 安装验收所需依赖
         run: sudo apt-get update && sudo apt-get install -y xvfb dbus-x11 xclip
 
+      - name: 安装验收所需依赖（Xvfb 冒烟用）
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb dbus-x11 xclip
+
       - name: 构建 deb
         shell: bash
         env:
@@ -162,7 +165,7 @@ jobs:
 
       - name: 安装验收（安装 → 冒烟 → 卸载）
         shell: bash
-        run: bash packaging/linux/verify-deb.sh dist/*.deb
+        run: sudo bash packaging/linux/verify-deb.sh "$(ls dist/*.deb | head -n1)"
 
       - uses: actions/upload-artifact@v4
         with:
