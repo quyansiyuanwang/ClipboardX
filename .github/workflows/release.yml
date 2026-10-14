@@ -106,9 +106,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
+          # 必须限定版本：升级验收会顺手构建一个 0.0.9 的 MSI（那是测试道具，
+          # 不能混进发布产物——上一轮就是这里多捞了一个文件，平铺后变成 4 个）
           path: |
-            dist/ClipboardX-*-x64.msi
+            dist/ClipboardX-${{ needs.version.outputs.version }}-x64.msi
           if-no-files-found: error
 
   macos:
