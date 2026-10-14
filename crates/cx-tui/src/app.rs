@@ -522,6 +522,34 @@ impl App {
 
     // ---------------------------------------------------------------- 按键
 
+    /// 处理一次粘贴（括号粘贴：终端把整段文本一次送过来）。
+    ///
+    /// 为什么值得单独处理：
+    /// - 逐字符按键路径下，长粘贴会变成几十上百次「按键 → 重绘」，慢且在部分终端会丢字符；
+    /// - 粘贴密钥时经常会**带上末尾换行**，直接塞进字段会污染密钥、连不上还很难查——
+    ///   所以这里统一去掉换行与首尾空白。
+    ///
+    /// 路由规则：表单字段优先（正在填表），其次是过滤输入框；其它情况忽略
+    /// （在列表上粘贴不该改变任何东西）。
+    pub fn on_paste(&mut self, text: &str) {
+        let cleaned = text.replace(['\r', '\n'], "");
+        if cleaned.is_empty() {
+            return;
+        }
+        if let Some(form) = self.wizard.as_mut() {
+            if form.focused_field().is_some() {
+                for ch in cleaned.trim().chars() {
+                    form.push_char(ch);
+                }
+            }
+            return;
+        }
+        if self.filter_input {
+            let mut query = self.filter.clone();
+            query.push_str(cleaned.trim());
+            self.set_filter(query);
+        }
+    }
     /// 处理一个按键。
     pub fn on_key(&mut self, key: crossterm::event::KeyEvent) -> KeyOutcome {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -1785,6 +1813,65 @@ mod tests {
         );
         app.on_key(ctrl(KeyCode::Char('u')));
         assert_eq!(app.panel_scroll(), 0);
+    }
+    #[test]
+    fn 粘贴进表单字段_并去掉末尾换行() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.wizard.is_some());
+        // 焦点先落到第一个字段（类型行 → Tab 到字段）
+        app.on_key(key(KeyCode::Tab));
+
+        // 先清空（后端名预填了示例值），再粘贴一段带换行的密钥：不能把换行带进字段
+        app.on_key(ctrl(KeyCode::Char('l')));
+        app.on_paste("AKID-1234\n");
+        let form = app.wizard.as_ref().unwrap();
+        let index = form.focused_field().unwrap();
+        assert_eq!(form.value(index), "AKID-1234", "换行必须被去掉");
+
+        // 再粘一段（模拟分两次粘贴）应当追加到已填内容后面
+        app.on_paste("SECOND");
+        let form = app.wizard.as_ref().unwrap();
+        assert_eq!(form.value(index), "AKID-1234SECOND");
+        assert!(app.notice.is_none(), "粘贴不该留下提示");
+    }
+
+    #[test]
+    fn 粘贴进过滤框() {
+        let mut app = app_with(3);
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(app.filter_input);
+        app.on_paste("关键词\n");
+        assert_eq!(app.filter(), "关键词", "过滤词同样不该带换行");
+    }
+
+    #[test]
+    fn 没有输入目标时粘贴不改变任何东西() {
+        let mut app = app_with(3);
+        app.down();
+        let before = (app.cursor, app.filter().to_string(), app.wizard.is_some());
+        app.on_paste("随便粘点什么");
+        assert_eq!(
+            (app.cursor, app.filter().to_string(), app.wizard.is_some()),
+            before,
+            "列表上粘贴不该有任何副作用"
+        );
+
+        // 表单开着但焦点在按钮上：也不该写进任何字段
+        let mut form_app = App::new();
+        form_app.on_key(key(KeyCode::Char('a')));
+        let fields = form_app.wizard.as_ref().unwrap().fields().len();
+        for _ in 0..=fields {
+            form_app.on_key(key(KeyCode::Tab)); // 走到按钮
+        }
+        form_app.on_paste("不该落进去");
+        let form = form_app.wizard.as_ref().unwrap();
+        for index in 0..fields {
+            assert!(
+                !form.value(index).contains("不该落进去"),
+                "焦点在按钮上时粘贴不该写进字段 {index}"
+            );
+        }
     }
     #[test]
     fn 状态行包含关键信息() {
