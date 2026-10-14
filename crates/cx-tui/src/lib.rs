@@ -93,6 +93,17 @@ fn run_loop(
         {
             let event =
                 event::read().map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))?;
+            // 滚轮翻列表：EnableMouseCapture 早就开了，但一直没处理鼠标事件，
+            // 于是滚轮在界面里完全没反应。
+            if let TermEvent::Mouse(mouse) = event {
+                use crossterm::event::MouseEventKind;
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => app.on_scroll(3),
+                    MouseEventKind::ScrollUp => app.on_scroll(-3),
+                    _ => {}
+                }
+                continue;
+            }
             if let TermEvent::Key(key) = event {
                 // Windows 上按键会同时报 Press 与 Release，只处理按下
                 if key.kind != KeyEventKind::Press {
@@ -110,6 +121,7 @@ fn run_loop(
                         // 历史整体重来，摘要缓存也重来
                         app.forget_previews();
                     }
+                    KeyOutcome::Doctor => client.request_doctor(),
                     KeyOutcome::Push => client.request_push(),
                     KeyOutcome::Reload => client.request("reload"),
                 }

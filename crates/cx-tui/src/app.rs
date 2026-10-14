@@ -13,7 +13,7 @@
 //!   都会平移，按位置缓存会张冠李戴。对象名是稳定的。
 
 use crate::client::UiEvent;
-use cx_proto::control::{HistoryPreview, HistorySummary, StatusReport};
+use cx_proto::control::{DoctorReport, HistoryPreview, HistorySummary, StatusReport};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 一次可见窗口最多请求多少条预览（防止窄屏/大屏差异导致请求风暴）。
@@ -40,6 +40,8 @@ pub enum KeyOutcome {
     Push,
     /// 重新读取配置。
     Reload,
+    /// 拉一次诊断（后端面板要用）。
+    Doctor,
 }
 
 /// 一条提示信息。
@@ -130,6 +132,10 @@ pub struct App {
     pub notice: Option<Notice>,
     /// 是否显示帮助。
     pub show_help: bool,
+    /// 是否显示"后端与连接"面板。
+    pub show_panel: bool,
+    /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
+    pub doctor: Option<DoctorReport>,
     /// 后台线程是否还在跑。
     pub running: bool,
 }
@@ -182,6 +188,9 @@ impl App {
             }
             UiEvent::Failure { command, message } => {
                 self.warn(format!("{command} 失败：{message}"));
+            }
+            UiEvent::Doctor(report) => {
+                self.doctor = Some(*report);
             }
             UiEvent::Disconnected => {
                 self.running = false;
@@ -455,6 +464,22 @@ impl App {
             return KeyOutcome::None;
         }
 
+        // 面板与帮助页都是"看一眼就关"的浮层：任意键关闭（q 退出）
+        if self.show_panel {
+            return match key.code {
+                KeyCode::Char('q') => KeyOutcome::Quit,
+                // b 是开关：再按一次就关掉（不能变成"先被任意键关掉、再按又打开"）
+                KeyCode::Char('b') | KeyCode::Esc => {
+                    self.show_panel = false;
+                    KeyOutcome::None
+                }
+                _ => {
+                    self.show_panel = false;
+                    KeyOutcome::None
+                }
+            };
+        }
+
         if self.show_help {
             // 帮助页里任意键返回（q 直接退出，避免"被困在帮助页"）
             return match key.code {
@@ -482,6 +507,11 @@ impl App {
             KeyCode::Char('?') | KeyCode::Char('h') => {
                 self.show_help = true;
                 KeyOutcome::None
+            }
+            KeyCode::Char('b') => {
+                self.show_panel = true;
+                // 打开时拉一次诊断：后端面板要显示局域网对端等只有 doctor 才知道的信息
+                KeyOutcome::Doctor
             }
             KeyCode::Char('/') => {
                 self.filter_input = true;
@@ -561,6 +591,90 @@ impl App {
             KeyCode::Char('p') => KeyOutcome::Push,
             KeyCode::Char('R') => KeyOutcome::Reload,
             _ => KeyOutcome::None,
+        }
+    }
+
+    /// 后端健康统计：`(正常, 有失败, 已禁用)`。
+    pub fn backend_health(&self) -> (usize, usize, usize) {
+        let Some(status) = &self.status else {
+            return (0, 0, 0);
+        };
+        let mut healthy = 0;
+        let mut failing = 0;
+        let mut disabled = 0;
+        for backend in &status.backends {
+            if !backend.enabled {
+                disabled += 1;
+            } else if backend.failures > 0 || backend.last_error.is_some() {
+                failing += 1;
+            } else {
+                healthy += 1;
+            }
+        }
+        (healthy, failing, disabled)
+    }
+
+    /// 头部第二行要显示的健康提示（没什么可说时返回 None，别占地方）。
+    ///
+    /// 空后端是最容易让人困惑的状态——"我明明开着，为什么不同步"，
+    /// 所以这里给出可执行的下一步，而不是只报个 0。
+    pub fn health_line(&self) -> Option<(String, bool)> {
+        let status = self.status.as_ref()?;
+        let (healthy, failing, disabled) = self.backend_health();
+        if status.backends.is_empty() {
+            return Some((
+                "还没有配置同步后端：内容只留在本机。用 cx backend add … 添加（按 b 看详情）"
+                    .to_string(),
+                true,
+            ));
+        }
+        if failing > 0 {
+            return Some((
+                format!(
+                    "后端 {} 个：{} 个正在失败（按 b 看错误与退避时间）",
+                    status.backends.len(),
+                    failing
+                ),
+                true,
+            ));
+        }
+        let latest = status
+            .backends
+            .iter()
+            .filter_map(|backend| backend.last_ok_ms)
+            .max();
+        let tail = match latest {
+            Some(ms) => format!("最近成功 {}", crate::ui::relative_time(ms)),
+            None => "还没有成功过".to_string(),
+        };
+        let extra = if disabled > 0 {
+            format!("，{disabled} 个已禁用")
+        } else {
+            String::new()
+        };
+        Some((
+            format!("后端 {healthy} 个正常{extra}｜{tail}（按 b 看详情）"),
+            false,
+        ))
+    }
+
+    /// 鼠标滚轮：按行移动光标（滚轮是最自然的翻列表方式）。
+    pub fn on_scroll(&mut self, delta: i32) {
+        if self.show_help || self.show_panel {
+            return;
+        }
+        match delta.cmp(&0) {
+            std::cmp::Ordering::Less => {
+                for _ in delta..0 {
+                    self.up();
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                for _ in 0..delta {
+                    self.down();
+                }
+            }
+            std::cmp::Ordering::Equal => {}
         }
     }
 
@@ -970,6 +1084,164 @@ mod tests {
         app.apply(UiEvent::Disconnected);
         assert!(!app.running);
         assert!(app.notice.as_ref().unwrap().is_error);
+    }
+
+    /// 带后端的诊断状态：用 JSON 构造，字段增删时测试不会碎。
+    fn status_with_backends(paused: bool, backends: serde_json::Value) -> StatusReport {
+        serde_json::from_value(serde_json::json!({
+            "version": "0.1.0",
+            "pid": 42,
+            "started_ms": 1_759_323_000_000u64,
+            "paused": paused,
+            "device_id": "ab12cd34ef567890",
+            "device_name": "笔记本",
+            "space_id": "space-1",
+            "encrypted": true,
+            "backends": backends,
+            "history_len": 3,
+            "seen_len": 0,
+            "skipped_oversize": 0,
+            "skipped_ignored": 0,
+            "last_published_hash": null,
+            "clipboard": "系统剪贴板（测试）",
+            "watch": "平台事件通知",
+            "no_clipboard": false
+        }))
+        .expect("状态 JSON 应当能反序列化")
+    }
+
+    fn backend(name: &str, enabled: bool, failures: u32, error: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "kind": "server",
+            "enabled": enabled,
+            "last_ok_ms": cx_core::now_ms() - 60_000,
+            "last_error": error,
+            "failures": failures,
+            "next_attempt_ms": cx_core::now_ms() + 30_000,
+            "published": 3,
+            "applied": 2
+        })
+    }
+
+    #[test]
+    fn 空后端给出可执行的下一步而不是只报零() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status(false))));
+        let (text, warn) = app.health_line().expect("空后端应当有提示");
+        assert!(warn, "这是需要用户处理的提示");
+        assert!(text.contains("cx backend add"), "要给出下一步：{text}");
+        assert_eq!(app.backend_health(), (0, 0, 0));
+    }
+
+    #[test]
+    fn 有后端在失败时提示条数与去看详情() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([
+                backend("home", true, 0, None),
+                backend("oss", true, 4, Some("连接超时")),
+            ]),
+        ))));
+        assert_eq!(app.backend_health(), (1, 1, 0));
+        let (text, warn) = app.health_line().unwrap();
+        assert!(warn);
+        assert!(text.contains("1 个正在失败"), "{text}");
+        assert!(text.contains("按 b"), "{text}");
+    }
+
+    #[test]
+    fn 全部正常时给出最近成功时间且不算警告() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([
+                backend("home", true, 0, None),
+                backend("dav", false, 0, None)
+            ]),
+        ))));
+        assert_eq!(app.backend_health(), (1, 0, 1));
+        let (text, warn) = app.health_line().unwrap();
+        assert!(!warn, "正常状态不该是警告色：{text}");
+        assert!(text.contains("1 个正常"), "{text}");
+        assert!(text.contains("1 个已禁用"), "{text}");
+        assert!(text.contains("最近成功"), "{text}");
+    }
+
+    #[test]
+    fn 未连上时没有健康行() {
+        let app = App::new();
+        assert!(app.health_line().is_none(), "状态本身已经说了未连接");
+    }
+
+    #[test]
+    fn b_键打开面板并拉诊断() {
+        let mut app = app_with(2);
+        assert_eq!(app.on_key(key(KeyCode::Char('b'))), KeyOutcome::Doctor);
+        assert!(app.show_panel);
+        // 面板里任意键关闭；q 直接退出（与帮助页一致，别把人困住）
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
+        assert!(!app.show_panel);
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('q'))), KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn 面板打开时按键不会误触列表操作() {
+        let mut app = app_with(3);
+        assert_eq!(app.on_key(key(KeyCode::Char('b'))), KeyOutcome::Doctor);
+        assert!(app.show_panel);
+        // 面板开着时 j 不该移动列表光标
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.cursor, 0, "面板打开时 j 不该移动列表光标");
+        assert!(!app.show_panel, "任意键应当关掉面板");
+
+        // b 是开关：再按一次直接关闭（而不是"被任意键关掉后又被它打开"）
+        app.on_key(key(KeyCode::Char('b')));
+        assert!(app.show_panel);
+        app.on_key(key(KeyCode::Char('b')));
+        assert!(!app.show_panel);
+
+        // 关掉之后 j 恢复正常
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.cursor, 1, "关掉面板后 j 恢复正常");
+    }
+
+    #[test]
+    fn 滚轮按行移动且浮层打开时不动() {
+        let mut app = app_with(10);
+        app.on_scroll(3);
+        assert_eq!(app.cursor, 3);
+        app.on_scroll(-2);
+        assert_eq!(app.cursor, 1);
+        // 到顶后再往上滚不越界
+        app.on_scroll(-10);
+        assert_eq!(app.cursor, 0);
+        // 浮层打开时滚轮不该改列表
+        app.on_key(key(KeyCode::Char('?')));
+        app.on_scroll(5);
+        assert_eq!(app.cursor, 0);
+        app.on_key(key(KeyCode::Char('?')));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_scroll(5);
+        assert_eq!(app.cursor, 0, "面板打开时滚轮也不该动列表");
+    }
+
+    #[test]
+    fn 诊断报告到达后面板能读到局域网信息() {
+        let mut app = App::new();
+        app.apply(UiEvent::Doctor(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "checks": [
+                    {"name": "局域网", "ok": true, "detail": "已启用（端口 8699），ALEXLAPTOP（a5af2a1b）"},
+                    {"name": "密钥权限", "ok": true, "detail": "1 个密钥文件都没有组/其他权限"}
+                ]
+            }))
+            .expect("诊断 JSON 应当能反序列化"),
+        )));
+        let doctor = app.doctor.as_ref().expect("应当存下诊断报告");
+        assert!(doctor.checks.iter().any(|check| check.name == "局域网"));
     }
 
     #[test]

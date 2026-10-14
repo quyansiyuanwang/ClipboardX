@@ -23,10 +23,19 @@ const NARROW_WIDTH: u16 = 84;
 /// 这样布局只有一个权威来源，不必在别处再算一遍。
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    // 头部高度按内容算：标题 + 状态（+ 健康提示 + 最近一条提示），**再加一行下边框**。
+    // 少算边框那一行会把状态行直接裁掉——这个错误在"未连接"的渲染测试里被抓到了。
+    let mut header = 3u16;
+    if app.health_line().is_some() {
+        header += 1;
+    }
+    if app.notice.is_some() {
+        header += 1;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // 标题 + 状态（必要时 + 提示）
+            Constraint::Length(header),
             Constraint::Min(6),    // 历史 + 预览
             Constraint::Length(1), // 快捷键 / 过滤输入
         ])
@@ -38,6 +47,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     if app.show_help {
         draw_help(frame, area);
+    }
+    if app.show_panel {
+        draw_panel(frame, area, app);
     }
 }
 
@@ -78,6 +90,17 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Some(_) => Style::default().fg(Color::Green),
     };
     let mut lines = vec![title, Line::from(Span::styled(state, state_style))];
+    // 健康行：空后端 / 有后端在失败时出现（都是"我明明开着为什么不同步"的答案）
+    if let Some((text, warn)) = app.health_line() {
+        lines.push(Line::from(Span::styled(
+            format!(" {text}"),
+            if warn {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        )));
+    }
     if let Some(notice) = &app.notice {
         lines.push(Line::from(Span::styled(
             format!(" {}", notice.text),
@@ -349,7 +372,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
     } else if app.filter_active() {
         " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　/ 改过滤　Esc 清过滤　? 帮助　q 退出 "
     } else {
-        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　p 发布　/ 过滤　r 刷新　R 重载配置　? 帮助　q 退出 "
+        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　b 后端状态　/ 过滤　? 帮助　q 退出 "
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -360,6 +383,153 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
     );
 }
 
+/// "后端与连接"面板：后端健康、局域网对端、以及 doctor 里的其余检查。
+///
+/// 为什么需要它：TUI 原来只看得到"后端 N 个"，看不出**哪个后端在失败、退避到什么时候、
+/// 局域网到底连上没有**——而这些恰恰是"同步不工作"时最先要问的问题。
+fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let popup = centered(area, 78, 74);
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            "后端与连接",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    match &app.status {
+        None => lines.push(Line::from(Span::styled(
+            "还没连上守护进程，看不到后端状态。",
+            Style::default().fg(Color::Red),
+        ))),
+        Some(status) if status.backends.is_empty() => {
+            lines.push(Line::from(Span::styled(
+                "没有配置任何同步后端：内容只留在本机历史里。",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from("  添加一个，例如："));
+            lines.push(Line::from(
+                "    cx backend add server home http://<主机>:8688 --space <空间 id>",
+            ));
+            lines.push(Line::from("    cx backend add webdav dav https://… "));
+            lines.push(Line::from(
+                "    cx backend add s3 oss --bucket <桶> --endpoint <地址>",
+            ));
+        }
+        Some(status) => {
+            for backend in &status.backends {
+                let (mark, style) = if !backend.enabled {
+                    ("○", Style::default().fg(Color::DarkGray))
+                } else if backend.failures > 0 || backend.last_error.is_some() {
+                    ("●", Style::default().fg(Color::Red))
+                } else {
+                    ("●", Style::default().fg(Color::Green))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{mark} "), style),
+                    Span::styled(
+                        format!("{:<10}", backend.name),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{:<8}", backend.kind), Style::default()),
+                    Span::raw(format!(
+                        "发布 {:<5} 接收 {:<5} ",
+                        backend.published, backend.applied
+                    )),
+                    if !backend.enabled {
+                        Span::styled("已禁用".to_string(), Style::default().fg(Color::DarkGray))
+                    } else if backend.failures > 0 {
+                        Span::styled(
+                            format!("失败 {} 次，{} 后重试", backend.failures, retry_in(backend)),
+                            Style::default().fg(Color::Red),
+                        )
+                    } else {
+                        Span::styled(
+                            match backend.last_ok_ms {
+                                Some(ms) => format!("最近成功 {}", relative_time(ms)),
+                                None => "还没成功过".to_string(),
+                            },
+                            Style::default().fg(Color::DarkGray),
+                        )
+                    },
+                ]));
+                if let Some(error) = &backend.last_error {
+                    lines.push(Line::from(Span::styled(
+                        format!("    └ {error}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+            }
+        }
+    }
+
+    // doctor 里那些 TUI 看不到、但排查时最先要问的几项
+    if let Some(doctor) = &app.doctor {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "连接与安全",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for check in &doctor.checks {
+            if !matches!(
+                check.name.as_str(),
+                "局域网" | "密钥权限" | "剪贴板" | "监听方式"
+            ) {
+                continue;
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    // 形状与颜色一起变：只靠颜色区分，色觉障碍的用户就看不出来了
+                    if check.ok { "● " } else { "▲ " },
+                    if check.ok {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+                Span::styled(format!("{:<8}", check.name), Style::default()),
+                Span::raw(check.detail.clone()),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "（正在读取诊断…）",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  b / Esc 关闭　（面板里的错误信息来自各后端最近一次失败）",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(" 后端与连接 "))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+/// 退避还剩多久。
+fn retry_in(backend: &cx_proto::control::BackendStatus) -> String {
+    let now = cx_core::now_ms();
+    if backend.next_attempt_ms <= now {
+        "立即".to_string()
+    } else {
+        let seconds = (backend.next_attempt_ms - now) / 1000;
+        if seconds < 60 {
+            format!("{seconds} 秒")
+        } else {
+            format!("{} 分钟", seconds / 60)
+        }
+    }
+}
 fn draw_help(frame: &mut Frame<'_>, area: Rect) {
     let popup = centered(area, 66, 80);
     frame.render_widget(Clear, popup);
@@ -384,6 +554,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  p                立即发布本机剪贴板"),
         Line::from("  r                刷新状态与历史"),
         Line::from("  R                重新读取配置"),
+        Line::from("  b                后端与连接面板（各后端健康、局域网对端）"),
         Line::from("  ?                帮助（本页）"),
         Line::from("  q                退出"),
         Line::from(""),
@@ -434,7 +605,7 @@ fn short_hash(hash: &str) -> String {
 }
 
 /// 相对时间：列表里"多久以前"比绝对时间好读。
-fn relative_time(ms: u64) -> String {
+pub(crate) fn relative_time(ms: u64) -> String {
     let now = cx_core::now_ms();
     if ms == 0 || ms > now {
         return "--".to_string();
@@ -868,5 +1039,117 @@ mod tests {
         let mut app = App::new();
         let screen = render(&mut app, 100, 20);
         assert!(has(&screen, "0/0"), "{screen}");
+    }
+
+    // ------------------------------------------------------------ 后端面板
+
+    fn backend(
+        name: &str,
+        kind: &str,
+        enabled: bool,
+        failures: u32,
+        error: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "enabled": enabled,
+            "last_ok_ms": cx_core::now_ms() - 120_000,
+            "last_error": error,
+            "failures": failures,
+            "next_attempt_ms": cx_core::now_ms() + 45_000,
+            "published": 12,
+            "applied": 5
+        })
+    }
+
+    fn doctor() -> UiEvent {
+        UiEvent::Doctor(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "checks": [
+                    {"name": "目录", "ok": true, "detail": "可写"},
+                    {"name": "局域网", "ok": true, "detail": "已启用（端口 8699），ALEXLAPTOP（a5af2a1b）"},
+                    {"name": "密钥权限", "ok": true, "detail": "1 个密钥文件都没有组/其他权限"},
+                    {"name": "剪贴板", "ok": true, "detail": "系统剪贴板；平台事件通知：可用"}
+                ]
+            }))
+            .expect("诊断 JSON 应当能反序列化"),
+        ))
+    }
+
+    #[test]
+    fn 面板列出后端健康与错误原因() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": [
+                    backend("home", "server", true, 0, None),
+                    backend("oss", "s3", true, 4, Some("连接超时：dial tcp 10.0.0.9:9000")),
+                    backend("dav", "webdav", false, 0, None)
+                ],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        app.apply(doctor());
+        app.show_panel = true;
+        let screen = render(&mut app, 120, 30);
+
+        assert!(has(&screen, "后端与连接"), "{screen}");
+        assert!(has(&screen, "home"), "{screen}");
+        assert!(has(&screen, "oss"), "{screen}");
+        assert!(has(&screen, "已禁用"), "禁用的后端要标出来：{screen}");
+        assert!(has(&screen, "失败 4 次"), "要给出失败次数：{screen}");
+        assert!(has(&screen, "连接超时"), "要给出最近一次错误：{screen}");
+        assert!(has(&screen, "秒后重试"), "要给出退避时间：{screen}");
+        // 局域网对端只有 doctor 知道，面板里必须能看到
+        assert!(has(&screen, "局域网"), "{screen}");
+        assert!(has(&screen, "ALEXLAPTOP"), "{screen}");
+        assert!(has(&screen, "密钥权限"), "{screen}");
+    }
+
+    #[test]
+    fn 面板在没有后端时给出添加命令() {
+        let mut app = app_with(1);
+        app.show_panel = true;
+        let screen = render(&mut app, 120, 30);
+        assert!(has(&screen, "没有配置任何同步后端"), "{screen}");
+        assert!(
+            has(&screen, "cx backend add"),
+            "要给出可执行的命令：{screen}"
+        );
+    }
+
+    #[test]
+    fn 头部健康提示在空后端与失败时都出现() {
+        // 空后端
+        let mut app = app_with(1);
+        let screen = render(&mut app, 130, 24);
+        assert!(has(&screen, "还没有配置同步后端"), "{screen}");
+
+        // 有后端在失败
+        let mut failing = App::new();
+        failing.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": [backend("oss", "s3", true, 2, Some("连接超时"))],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        let screen = render(&mut failing, 130, 24);
+        assert!(has(&screen, "1 个正在失败"), "{screen}");
+        assert!(has(&screen, "按 b"), "{screen}");
+        // 状态行本身还在（动态头部高度不能把它挤掉）
+        assert!(has(&screen, "同步中"), "状态行不该被裁掉：{screen}");
     }
 }

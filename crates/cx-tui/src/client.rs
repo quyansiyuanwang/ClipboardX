@@ -11,7 +11,9 @@
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use cx_core::Paths;
 use cx_daemon::ControlClient;
-use cx_proto::control::{HistoryPreview, HistorySummary, StatusReport, cmd as commands};
+use cx_proto::control::{
+    DoctorReport, HistoryPreview, HistorySummary, StatusReport, cmd as commands,
+};
 use serde_json::{Map, json};
 use std::time::{Duration, Instant};
 
@@ -39,6 +41,8 @@ pub enum UiEvent {
     },
     /// 连接断开（界面据此退出）。
     Disconnected,
+    /// 诊断报告（后端面板用它显示局域网对端等只有 doctor 才知道的信息）。
+    Doctor(Box<DoctorReport>),
     /// 一条普通提示。
     Info(String),
 }
@@ -55,6 +59,7 @@ enum Request {
     Copy(usize),
     Push,
     Simple(&'static str),
+    Doctor,
     /// 守护进程推来事件后触发的刷新。
     ExternalRefresh,
     Stop,
@@ -105,6 +110,11 @@ impl DaemonClient {
     /// 请求历史列表。
     pub fn request_history(&self, limit: usize) {
         let _ = self.tx.send(Request::History(limit));
+    }
+
+    /// 请求一次诊断（后端面板显示"局域网连上几个对端"要用）。
+    pub fn request_doctor(&self) {
+        let _ = self.tx.send(Request::Doctor);
     }
 
     /// 请求某条内容的完整预览。
@@ -189,6 +199,25 @@ fn worker(
                 Err(err) => {
                     let _ = events.send(UiEvent::Failure {
                         command: "status".to_string(),
+                        message: err.to_string(),
+                    });
+                }
+            },
+            Request::Doctor => match client.simple(commands::DOCTOR) {
+                Ok(value) => match serde_json::from_value::<DoctorReport>(value) {
+                    Ok(report) => {
+                        let _ = events.send(UiEvent::Doctor(Box::new(report)));
+                    }
+                    Err(err) => {
+                        let _ = events.send(UiEvent::Failure {
+                            command: "doctor".to_string(),
+                            message: format!("诊断字段解析失败：{err}"),
+                        });
+                    }
+                },
+                Err(err) => {
+                    let _ = events.send(UiEvent::Failure {
+                        command: "doctor".to_string(),
                         message: err.to_string(),
                     });
                 }
