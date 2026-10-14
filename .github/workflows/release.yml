@@ -99,9 +99,10 @@ jobs:
       - name: 升级验收（装旧版 → 装新版 → 只留一份 → 卸载干净）
         shell: pwsh
         run: |
-          $msi = Get-ChildItem dist/ClipboardX-*-x64.msi | Select-Object -First 1
-          $new = ($msi.BaseName -replace '^ClipboardX-', '') -replace '-x64$', ''
-          ./scripts/verify-msi-upgrade.ps1 -OldVersion 0.0.9 -NewVersion $new -SkipBuild
+          $msi = Get-ChildItem dist/ClipboardX-${{ needs.version.outputs.version }}-x64.msi | Select-Object -First 1
+          # 不加 -SkipBuild：CI 里没有旧版 MSI，脚本会自己把 0.0.9 也构建出来
+          # （版本号只影响 MSI 元数据，二进制是同一份，因此这一步很快）
+          ./scripts/verify-msi-upgrade.ps1 -OldVersion 0.0.9 -NewVersion ${{ needs.version.outputs.version }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -135,7 +136,7 @@ jobs:
 
       - name: 挂载验收
         shell: bash
-        run: bash packaging/macos/verify-dmg.sh
+        run: bash packaging/macos/verify-dmg.sh dist/*.dmg
 
       - uses: actions/upload-artifact@v4
         with:
@@ -161,7 +162,7 @@ jobs:
 
       - name: 安装验收（安装 → 冒烟 → 卸载）
         shell: bash
-        run: bash packaging/linux/verify-deb.sh
+        run: bash packaging/linux/verify-deb.sh dist/*.deb
 
       - uses: actions/upload-artifact@v4
         with:
