@@ -622,6 +622,9 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                     .map_err(|err| DaemonError::Protocol(format!("渲染快照失败：{err}")))?;
                 return Ok(ExitCode::SUCCESS);
             }
+            // 从快捷方式启动时守护进程通常还没起来。这里先确保它在跑，
+            // 否则界面会停在"未连接"上，用户看到的就是"黑窗一闪"。
+            ensure_daemon_running(paths)?;
             cx_tui::run(paths)
                 .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?;
             Ok(ExitCode::SUCCESS)
@@ -747,6 +750,24 @@ fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<
 /// 设计取舍：这里**只改配置与凭据文件**，不碰网络（`Test` 例外——它存在的意义
 /// 就是"守护进程没起来时也能排障"，因此直接连一次）。附带的好处是"添加后端"
 /// 不需要守护进程在运行，安装脚本可以先写好配置再启动。
+/// 确保守护进程在运行（TUI 入口用）。
+///
+/// 已经连得上就直接返回；连不上就按 `cx start` 的方式拉起一个后台守护进程，
+/// 最多等 5 秒等它开始监听。
+fn ensure_daemon_running(paths: &Paths) -> Result<(), DaemonError> {
+    if ControlClient::connect(paths).is_ok() {
+        return Ok(());
+    }
+    cx_daemon::spawn_background(paths, false)?;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if ControlClient::connect(paths).is_ok() {
+            return Ok(());
+        }
+    }
+    // 起不来也不拦着进界面：界面会显示"未连接"并持续重试
+    Ok(())
+}
 fn run_backend(paths: &Paths, command: BackendCommand) -> Result<ExitCode, DaemonError> {
     match command {
         BackendCommand::List { json } => {
