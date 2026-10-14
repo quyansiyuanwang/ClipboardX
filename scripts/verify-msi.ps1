@@ -63,8 +63,9 @@ try {
     $json = & $exe version --json
     Assert-True ($LASTEXITCODE -eq 0) 'cx version 退出码为 0'
     Assert-True (Test-Path $serverExe) '自建服务端 cx-server.exe 也已安装'
-    &  version | Out-Null
-    Assert-True ($LASTEXITCODE -eq 0) 'cx-server version 退出码为 0'
+    $serverVersion = & $serverExe version
+    Assert-True ($LASTEXITCODE -eq 0) "cx-server version 退出码为 0（$serverVersion）"
+    Assert-True (($serverVersion -join ' ') -match '^cx-server ') 'cx-server version 输出形如 cx-server X.Y.Z'
     $info = ($json -join [Environment]::NewLine) | ConvertFrom-Json
     Assert-True ($info.name -eq 'cx') 'cx version --json 输出 name=cx'
     Assert-True ($info.store_layout -ge 1) 'cx version --json 报告了 store_layout'
