@@ -85,6 +85,12 @@
       <Component Id="CxExe" Guid="5496894D-B94F-47F0-AFF3-4EE38F700A75">
         <File Id="CxExeFile" Source="$(var.BinDir)\cx.exe" KeyPath="yes" />
       </Component>
+      <!-- 自建服务端一起装：它不依赖剪贴板与图形会话，装在桌面机上完全合理
+           （同一台机器既当服务端又当客户端是官方支持的用法），
+           单独发行只会让人多一步下载。 -->
+      <Component Id="CxServerExe" Guid="7F3C2A64-1B95-4E28-9D71-6C0E5A8B42D3">
+        <File Id="CxServerExeFile" Source="$(var.BinDir)\cx-server.exe" KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
     <!-- 用户级 PATH（HKCU\Environment），卸载时由 MSI 自动还原 -->

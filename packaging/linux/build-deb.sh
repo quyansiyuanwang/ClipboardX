@@ -38,22 +38,31 @@ trap 'rm -rf "$PKGROOT"' EXIT
 echo "==> ClipboardX $VERSION ($ARCH / $TARGET)"
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
   [ -n "${CX_BIN:-}" ] || { echo "错误：SKIP_BUILD=1 需要 CX_BIN" >&2; exit 1; }
+  [ -n "${CX_SERVER_BIN:-}" ] || { echo "错误：SKIP_BUILD=1 需要 CX_SERVER_BIN" >&2; exit 1; }
   BIN="$CX_BIN"
+  SERVER_BIN="$CX_SERVER_BIN"
 else
-  cargo build --release --target "$TARGET" --bin cx
+  cargo build --release --target "$TARGET" --bin cx --bin cx-server
   BIN="target/$TARGET/release/cx"
+  SERVER_BIN="target/$TARGET/release/cx-server"
 fi
 [ -f "$BIN" ] || { echo "错误：找不到二进制 $BIN" >&2; exit 1; }
+[ -f "$SERVER_BIN" ] || { echo "错误：找不到二进制 $SERVER_BIN" >&2; exit 1; }
 
 echo "==> 组装包内容"
 mkdir -p "$PKGROOT/DEBIAN" \
          "$PKGROOT/usr/bin" \
          "$PKGROOT/usr/lib/systemd/user" \
+         "$PKGROOT/lib/systemd/system" \
          "$PKGROOT/usr/share/applications" \
          "$PKGROOT/usr/share/doc/clipboardx"
 
 install -m 755 "$BIN" "$PKGROOT/usr/bin/cx"
 install -m 644 packaging/linux/clipboardx.service "$PKGROOT/usr/lib/systemd/user/clipboardx.service"
+install -m 755 "$SERVER_BIN" "$PKGROOT/usr/bin/cx-server"
+# 系统级 unit：**默认不启用**。自建服务端是可选部署（通常也装在服务器上，
+# 而不是桌面机上），装了就地自动起服务才是更糟的默认。
+install -m 644 packaging/linux/clipboardx-server.service "$PKGROOT/lib/systemd/system/clipboardx-server.service"
 install -m 644 packaging/linux/clipboardx.desktop "$PKGROOT/usr/share/applications/clipboardx.desktop"
 install -m 644 packaging/linux/README-install.zh-CN.txt "$PKGROOT/usr/share/doc/clipboardx/README.zh-CN.txt"
 install -m 644 README.md "$PKGROOT/usr/share/doc/clipboardx/README.md"
@@ -92,12 +101,27 @@ fi
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database -q || true
 fi
+# 自建服务端要用的系统账号与数据目录（幂等）。
+# 服务本身**不自动启用**：它通常装在服务器上，装完就监听端口是更糟的默认。
+if ! getent group clipboardx >/dev/null 2>&1; then
+  addgroup --system clipboardx >/dev/null 2>&1 || true
+fi
+if ! getent passwd clipboardx >/dev/null 2>&1; then
+  adduser --system --ingroup clipboardx --home /var/lib/clipboardx \
+          --no-create-home --disabled-login clipboardx >/dev/null 2>&1 || true
+fi
+install -d -o clipboardx -g clipboardx -m 0700 /var/lib/clipboardx 2>/dev/null || true
+
 echo "ClipboardX 已安装。新开终端后运行：cx version / cx status / cx tui"
 if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
   echo "如需立即启动：systemctl --user start clipboardx.service"
 else
   echo "当前无图形会话，桌面登录后守护进程会随 graphical-session.target 启动。"
 fi
+echo
+echo "自建服务端（可选）：cx-server 已就位，默认未启用。"
+echo "  启用一个本地服务端：sudo systemctl enable --now clipboardx-server"
+echo "  或前台试跑：        cx-server serve --data ~/.local/share/cx-server"
 exit 0
 EOF
 

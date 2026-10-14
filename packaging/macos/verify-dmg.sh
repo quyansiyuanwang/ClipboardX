@@ -41,6 +41,7 @@ pkgutil --check-signature "$MOUNT_POINT/ClipboardX.pkg" || echo "    [warn] pkg 
 PKG_PAYLOAD="$(pkgutil --payload-files "$MOUNT_POINT/ClipboardX.pkg" 2>&1 || true)"
 printf '%s\n' "$PKG_PAYLOAD" | sed 's/^/        /'
 printf '%s' "$PKG_PAYLOAD" | grep -q 'usr/local/bin/cx' || fail "pkg payload 中没有 cx"
+printf '%s' "$PKG_PAYLOAD" | grep -q 'usr/local/bin/cx-server' || fail "pkg payload 中没有 cx-server"
 printf '%s' "$PKG_PAYLOAD" | grep -q 'com.clipboardx.agent.plist' || fail "pkg payload 中没有 LaunchAgent"
 ok "pkg payload 含二进制与 LaunchAgent"
 
@@ -58,6 +59,7 @@ pkgutil --pkgs 2>&1 | grep -i clipboardx | sed 's/^/        /' || echo "        
 pkgutil --files com.clipboardx.cli 2>&1 | sed 's/^/        cli 收据: /' | head -n 10
 
 [ -x /usr/local/bin/cx ] || fail "/usr/local/bin/cx 未安装或不可执行"
+[ -x /usr/local/bin/cx-server ] || fail "/usr/local/bin/cx-server 未安装或不可执行"
 [ -f /Library/LaunchAgents/com.clipboardx.agent.plist ] || fail "LaunchAgent 未安装"
 ok "二进制与 LaunchAgent 均已落位"
 

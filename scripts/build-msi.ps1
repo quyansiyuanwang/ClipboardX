@@ -32,13 +32,15 @@ try {
 
     if (-not $SkipBuild) {
         Write-Host '==> cargo build --release'
-        & cargo build --release --target $Target --bin cx
+        & cargo build --release --target $Target --bin cx --bin cx-server
         if ($LASTEXITCODE -ne 0) { throw "cargo build 失败 (exit $LASTEXITCODE)" }
     }
 
     $binDir = Join-Path $repo "target\$Target\release"
     $cxExe = Join-Path $binDir 'cx.exe'
+    $cxServerExe = Join-Path $binDir 'cx-server.exe'
     if (-not (Test-Path $cxExe)) { throw "找不到 $cxExe，请先构建（去掉 -SkipBuild）" }
+    if (-not (Test-Path $cxServerExe)) { throw "找不到 $cxServerExe，请先构建（去掉 -SkipBuild）" }
 
     $distDir = Join-Path $repo 'dist'
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null

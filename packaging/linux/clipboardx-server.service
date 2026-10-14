@@ -1,0 +1,44 @@
+[Unit]
+# ClipboardX 自建同步服务端（系统级单元）
+#
+# 注意：这个单元**默认不启用**。自建服务端是可选部署，通常装在服务器上而不是桌面机；
+# 装完包就地把服务起起来是更糟的默认（会悄悄监听端口）。
+#
+# 启用：
+#   sudo systemctl enable --now clipboardx-server
+# 改监听地址/数据目录：
+#   sudo systemctl edit clipboardx-server     # 覆盖下面的 Environment / ExecStart
+Description=ClipboardX 同步服务端
+Documentation=https://github.com/quyansiyuanwang/ClipboardX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 专用账号：数据目录不该由 root 拥有
+User=clipboardx
+Group=clipboardx
+Environment=CX_SERVER_DATA=/var/lib/clipboardx
+ExecStart=/usr/bin/cx-server serve --listen 127.0.0.1:8688 --quiet
+Restart=on-failure
+RestartSec=3
+# 收尾信号用 INT：cx-server 的退出路径监听 Ctrl+C（见 bin/cx-server 的说明），
+# 用默认的 SIGTERM 会被直接杀掉，来不及刷日志。
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+# 加固：只写自己的数据目录，其余只读
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/clipboardx
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+
+[Install]
+WantedBy=multi-user.target

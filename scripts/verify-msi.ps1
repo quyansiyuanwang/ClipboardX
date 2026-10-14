@@ -23,6 +23,7 @@ $Msi = (Resolve-Path $Msi).Path
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\ClipboardX'
 $exe = Join-Path $installDir 'cx.exe'
+$serverExe = Join-Path $installDir 'cx-server.exe'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 
 if ($Mode -eq 'Extract') {
@@ -61,6 +62,9 @@ try {
     # 二进制可运行
     $json = & $exe version --json
     Assert-True ($LASTEXITCODE -eq 0) 'cx version 退出码为 0'
+    Assert-True (Test-Path $serverExe) '自建服务端 cx-server.exe 也已安装'
+    &  version | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'cx-server version 退出码为 0'
     $info = ($json -join [Environment]::NewLine) | ConvertFrom-Json
     Assert-True ($info.name -eq 'cx') 'cx version --json 输出 name=cx'
     Assert-True ($info.store_layout -ge 1) 'cx version --json 报告了 store_layout'

@@ -54,20 +54,27 @@ mkdir -p "$ROOT/usr/local/bin" "$ROOT/Library/LaunchAgents" "$SCRIPTS"
 echo "==> ClipboardX $VERSION macOS 通用二进制"
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
   [ -n "${CX_BIN:-}" ] || { echo "错误：SKIP_BUILD=1 需要 CX_BIN" >&2; exit 1; }
+  [ -n "${CX_SERVER_BIN:-}" ] || { echo "错误：SKIP_BUILD=1 需要 CX_SERVER_BIN" >&2; exit 1; }
   cp "$CX_BIN" "$ROOT/usr/local/bin/cx"
+  cp "$CX_SERVER_BIN" "$ROOT/usr/local/bin/cx-server"
 else
   rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
-  cargo build --release --target aarch64-apple-darwin --bin cx
-  cargo build --release --target x86_64-apple-darwin --bin cx
+  cargo build --release --target aarch64-apple-darwin --bin cx --bin cx-server
+  cargo build --release --target x86_64-apple-darwin --bin cx --bin cx-server
   if command -v lipo >/dev/null; then
     lipo -create -output "$ROOT/usr/local/bin/cx" \
       target/aarch64-apple-darwin/release/cx \
       target/x86_64-apple-darwin/release/cx
+    # 自建服务端一起装（同一台机器既当服务端又当客户端是受支持的用法）
+    lipo -create -output "$ROOT/usr/local/bin/cx-server" \
+      target/aarch64-apple-darwin/release/cx-server \
+      target/x86_64-apple-darwin/release/cx-server
   else
     cp target/aarch64-apple-darwin/release/cx "$ROOT/usr/local/bin/cx"
+    cp target/aarch64-apple-darwin/release/cx-server "$ROOT/usr/local/bin/cx-server"
   fi
 fi
-chmod 755 "$ROOT/usr/local/bin/cx"
+chmod 755 "$ROOT/usr/local/bin/cx" "$ROOT/usr/local/bin/cx-server"
 
 # 硬断言：这一步曾经静默产出空 payload，导致安装"成功"但 /usr/local/bin/cx 不存在
 BIN_SIZE="$(stat -f%z "$ROOT/usr/local/bin/cx" 2>/dev/null || echo 0)"
