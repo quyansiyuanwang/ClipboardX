@@ -214,3 +214,32 @@ pwsh scripts/verify-msi-upgrade.ps1            # 升级验收（自动构建 0.0
 bash packaging/linux/verify-deb.sh
 bash packaging/macos/verify-dmg.sh
 ```
+## 9. Windows 安装失败排查
+
+安装/卸载反复失败时，最常见的是 Windows Installer 自己的临时目录被搞脏，而不是包有问题。
+以下两种现象都在真机上复现过。
+
+### 9.1 `Could not set file security for file … Error: 1307`
+
+`1307` 是 `ERROR_INVALID_SID`：Installer 无法给它的**回滚脚本**设置安全描述符。
+这个回滚脚本位于安装盘根目录的 `Config.Msi`（隐藏+系统目录），常见成因：
+
+- 上一次安装被中断/被杀，留下了残缺的 `Config.Msi`（**重复安装时最容易遇到**）；
+- 杀毒软件锁住或改写了 `Config.Msi` 里的 `.rbf` 文件；
+- 该目录里的文件属于已不存在的账户（换过用户、清理过账户）。
+
+处理顺序（每步都需要管理员权限）：
+
+1. 先卸掉旧产品：`msiexec /x <ProductCode或MSI路径> /qn`（从"应用和功能"里卸载也行）；
+2. 停掉 Installer 服务：`net stop msiserver`；
+3. 清掉残留目录（两个盘都要看，报错里写的是哪个盘就是哪个）：
+   `attrib -h -s C:\Config.Msi` / `attrib -h -s D:\Config.Msi`，然后 `rd /s /q C:\Config.Msi`；
+   删不动就重命名为 `Config.Msi.old` 后重启一次；
+4. 重新安装。失败时带日志重试，日志里会直接写出是哪一步失败：
+   `msiexec /i ClipboardX-<版本>-x64.msi /l*v %TEMP%\clipboardx-msi.log`
+
+### 9.2 `已安装更高版本的 ClipboardX`
+
+nightly 的版本号是 `0.1.<一年中的第几天>.<构建序号>`，**数字上大于正式版 `0.1.0`**，
+因此"装过 nightly 之后再装正式版"曾会被直接拒绝。包已改为允许降级
+（`MajorUpgrade AllowDowngrades="yes"`）：这种情况会先移除旧版本再安装你指定的版本。
