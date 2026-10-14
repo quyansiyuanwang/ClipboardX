@@ -846,8 +846,12 @@ fn add_backend_from_draft(
     use cx_tui::WizardKind;
 
     let name = draft.name().trim().to_string();
-    if name.is_empty() {
-        return Err(DaemonError::Protocol("后端名不能为空".to_string()));
+    // 后端名会被用作凭据文件名，因此必须在**写任何文件之前**校验：
+    // 含路径分隔符或 `..` 的名字可能把凭据写到 secrets/ 之外。
+    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
+        return Err(DaemonError::Protocol(format!(
+            "后端名不合法（不能为空，也不能含路径分隔符或 ..）：{name}"
+        )));
     }
     let mut config = Config::load_or_create(paths)?;
     if config.backends.iter().any(|backend| backend.name == name) {
@@ -1448,6 +1452,45 @@ mod backend_tests {
         assert!(err.to_string().contains("没有名为 nope"), "{err}");
         let _ = std::fs::remove_dir_all(&paths.data_dir);
     }
+    #[test]
+    fn 表单会拒绝会写到_secrets_之外的后端名() {
+        use cx_tui::{BackendDraft, WizardKind};
+        let paths = temp_paths("draft-bad-name");
+        for name in ["", "a/b", "a\\b", "../escape"] {
+            let draft = BackendDraft {
+                kind: WizardKind::S3,
+                values: vec![
+                    name.to_string(),
+                    "bucket".to_string(),
+                    "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+                    "cn-hangzhou".to_string(),
+                    "AKID".to_string(),
+                    "SECRET".to_string(),
+                    "clipboardx".to_string(),
+                ],
+            };
+            let err = super::add_backend_from_draft(&paths, &draft).unwrap_err();
+            assert!(
+                err.to_string().contains("后端名不合法"),
+                "名字 {name:?} 应当被拒绝：{err}"
+            );
+        }
+        // 关键断言：一个文件都不该被写出去
+        let lingering: Vec<String> = std::fs::read_dir(paths.secrets_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            lingering.is_empty(),
+            "被拒绝的名字不该留下任何凭据文件：{lingering:?}"
+        );
+        let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap_or(&paths.data_dir));
+    }
+
     #[test]
     fn 表单添加服务端会真的去自助注册而不是把密钥当令牌() {
         use cx_tui::{BackendDraft, WizardKind};
