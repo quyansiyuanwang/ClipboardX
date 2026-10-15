@@ -141,31 +141,21 @@ fn 特殊字符的键名也能正确签名与往返() {
 }
 
 #[test]
-fn 服务端不支持条件写时退化为先查再写() {
+fn unsupported_conditional_write_fails_closed_without_head_or_put_retry() {
     let server = TestS3Server::start(ACCESS_KEY, SECRET_KEY, BUCKET);
     let mut backend = backend_for(&server, "space-a");
-
     server.force_next_put_not_implemented();
-    let outcome = backend.put("v1/manifests/b.json", b"first", true).unwrap();
-    assert!(matches!(outcome, PutOutcome::Created { .. }), "{outcome:?}");
-    assert_eq!(server.get("space-a/v1/manifests/b.json").unwrap(), b"first");
-
-    // 第二次：对象已存在 ⇒ 退化路径里的 HEAD 会看到它
-    server.force_next_put_not_implemented();
-    let outcome = backend.put("v1/manifests/b.json", b"second", true).unwrap();
-    assert_eq!(outcome, PutOutcome::AlreadyExists);
-    assert_eq!(server.get("space-a/v1/manifests/b.json").unwrap(), b"first");
-
-    // 覆盖写仍然生效。注意 S3 对"新建"与"覆盖"都返回 200、无法区分，
-    // 因此统一报 Created（WebDAV 能靠 201/204 区分，才报 Replaced）
-    let outcome = backend.put("v1/manifests/b.json", b"third", false).unwrap();
-    assert!(matches!(outcome, PutOutcome::Created { .. }), "{outcome:?}");
-    assert_eq!(server.get("space-a/v1/manifests/b.json").unwrap(), b"third");
-    assert!(
-        server.signature_failures().is_empty(),
-        "{:?}",
-        server.signature_failures()
+    let err = backend
+        .put("v1/manifests/b.json", b"first", true)
+        .unwrap_err();
+    assert!(matches!(err, BackendError::Config(_)), "{err}");
+    assert!(!server.has("space-a/v1/manifests/b.json"));
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "must not race HEAD + unconditional PUT"
     );
+    assert!(server.signature_failures().is_empty());
 }
 
 #[test]
@@ -193,13 +183,17 @@ fn 分页列举能把所有对象取全() {
     let server = TestS3Server::start(ACCESS_KEY, SECRET_KEY, BUCKET);
     let mut backend = backend_for(&server, "space-a");
 
-    // 120 个对象 > 一页（服务端 max-keys 上限 1000，这里用 120 仍然只有一页；
-    // 真正验证分页靠下面的"前缀+多页"场景，需要客户端按令牌继续请求）
-    for index in 0..120 {
+    for index in 0..1001 {
         server.seed(&format!("space-a/v1/items/20251001/{index:03}.cxi"), b"x");
     }
     let objects = backend.list("v1/items/20251001/").unwrap();
-    assert_eq!(objects.len(), 120, "应取全 120 个对象");
+    assert_eq!(objects.len(), 1001);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.contains("continuation-token="))
+    );
 
     // 前缀过滤：只取 manifests 下的
     server.seed("space-a/v1/manifests/a.json", b"{}");
@@ -308,7 +302,7 @@ fn 空前缀时直接列桶根() {
 }
 
 #[test]
-fn 桶不存在时会自动创建再写入() {
+fn absent_bucket_is_never_created_implicitly() {
     // 自建 MinIO 上"还没有桶"是常态：首次使用应当把桶建出来，而不是让用户去别处建
     let server = TestS3Server::start(ACCESS_KEY, SECRET_KEY, "fresh-bucket");
     let mut backend = S3Backend::new(S3Options {
@@ -327,15 +321,20 @@ fn 桶不存在时会自动创建再写入() {
     })
     .unwrap();
 
-    // 桶还不存在：先通过 ensure_root 建出来（`cx backend test` / probe 走的就是它）
-    let created = backend.ensure_root().unwrap();
-
-    assert!(created, "首次调用应当创建桶");
+    server.set_bucket_exists(false);
+    assert!(backend.ensure_root().is_err());
+    assert!(backend.put("v1/manifests/a.json", b"{}", true).is_err());
+    assert_eq!(server.buckets_created(), 0);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| !request.starts_with("PUT /fresh-bucket/ "))
+    );
+    assert!(backend.create_bucket().unwrap());
     assert_eq!(server.buckets_created(), 1);
-
-    // 再调用一次：桶已存在，不再重复创建
-    let created_again = backend.ensure_root().unwrap();
-    assert!(!created_again, "桶已存在时不该重复创建");
+    assert!(!backend.create_bucket().unwrap());
+    assert!(!backend.ensure_root().unwrap());
 
     // 写入与读取都正常
     let outcome = backend.put("v1/manifests/a.json", b"{}", true).unwrap();

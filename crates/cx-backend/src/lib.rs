@@ -29,7 +29,7 @@ mod xml;
 pub use error::BackendError;
 pub use http::{DEFAULT_TIMEOUT, HttpSettings};
 pub use memory::MemoryBackend;
-pub use s3::{MAX_LIST_OBJECTS, S3Backend, S3Options};
+pub use s3::{MAX_LIST_OBJECTS, S3Backend, S3Options, default_path_style};
 pub use server::{ServerBackend, ServerOptions, enroll};
 pub use webdav::{PROPFIND_BODY, WebDavBackend, WebDavOptions};
 
@@ -150,9 +150,8 @@ pub trait RemoteBackend: Send {
 
     /// 确保"根"存在（S3 的桶、WebDAV 的根集合）。
     ///
-    /// 默认什么都不做：多数后端（WebDAV）的根由用户事先配好，写对象时遇到
-    /// 目录缺失会自己补建。S3 的桶不一样——自建 MinIO 上第一次用常常还没有桶，
-    /// 而"桶不存在"无法在写单个对象时顺手解决，所以单独留这个口子。
+    /// 默认什么都不做。S3 只读 LIST 检查既有桶，不隐式创建桶；
+    /// 创建必须由调用方显式选择 [`S3Backend::create_bucket`]。
     ///
     /// 返回 `true` 表示这次真的创建了。
     fn ensure_root(&mut self) -> Result<bool, BackendError> {
@@ -243,8 +242,9 @@ pub fn build_backend(
                     section.name
                 ))
             })?;
-            // 没显式配置时：自建端点（MinIO 等）默认 path-style；AWS 官方端点默认 virtual-host
-            let path_style = section.path_style.unwrap_or(section.endpoint.is_some());
+            let path_style = section
+                .path_style
+                .unwrap_or_else(|| default_path_style(section.endpoint.as_deref()));
             let ca_file = section.ca_file.as_ref().map(|name| paths.secret_file(name));
 
             let backend = S3Backend::new(S3Options {

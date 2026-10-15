@@ -25,6 +25,10 @@ quick-xml.workspace = true
 # attohttpc 的 rustls 后端接受 rustls 自己的 DER 证书类型；
 # 该类型来自 rustls-pki-types，而 attohttpc 的 tls 模块是私有的，只能直接依赖它。
 rustls-pki-types = "1"
+# Explicit roots avoid attohttpc 0.31's ring-feature root-loading cfg gap.
+rustls-native-certs = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+url = "2"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -33,3 +37,4 @@ thiserror.workspace = true
 [dev-dependencies]
 # 集成测试会起一个真实 cx-server（同进程、真实监听端口）
 cx-server.workspace = true
+rcgen = "0.13"
