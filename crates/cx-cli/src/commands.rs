@@ -100,6 +100,9 @@ pub enum Command {
     Delete {
         /// 位置：0 = 最新
         position: usize,
+        /// 跳过交互确认（脚本/无终端环境必须显式给出）
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// 立即发布内容（默认发布当前剪贴板）
@@ -423,22 +426,30 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             Ok(ExitCode::SUCCESS)
         }
 
-        Command::Delete { position } => {
+        Command::Delete { position, yes } => {
             let mut client = ControlClient::connect(paths)?;
             let args = checked_history_args(&mut client, position)?;
-            eprint!(
-                "删除第 {position} 条本机历史 {}？云端及其他设备不受影响。[y/N] ",
-                args.get("expected_name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-            );
-            let mut answer = String::new();
-            std::io::stdin()
-                .read_line(&mut answer)
-                .map_err(DaemonError::io)?;
-            if !answer.trim().eq_ignore_ascii_case("y") {
-                println!("已取消删除");
-                return Ok(ExitCode::SUCCESS);
+            if !yes {
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    return Err(DaemonError::Protocol(
+                        "当前输入不是交互终端，无法确认删除；确认后请显式加 --yes".to_string(),
+                    ));
+                }
+                eprint!(
+                    "删除第 {position} 条本机历史 {}？云端及其他设备不受影响。[y/N] ",
+                    args.get("expected_name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                );
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(DaemonError::io)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    println!("已取消删除");
+                    return Ok(ExitCode::SUCCESS);
+                }
             }
             client.request(commands::HISTORY_DELETE_CHECKED, args)?;
             // 删除只作用于本机历史：把边界说清楚，别让人以为别的设备上也没了

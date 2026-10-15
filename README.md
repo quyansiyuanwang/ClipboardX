@@ -48,7 +48,7 @@ cx status                # 设备、后端、历史、各后端计数
 cx tui                   # 全屏终端界面（历史、行内内容摘要、预览滚动、过滤、写回剪贴板）
 cx history --limit 20
 cx copy 0                # 把最新一条写回剪贴板
-cx delete 0              # 删除最新一条（只删本机历史，会先确认）
+cx delete 0 --yes        # 删除最新一条（只删本机历史）；交互终端里省略 --yes 会先确认
 cx pause / cx resume
 cx doctor                # 守护进程起不来时也能跑（本地回退检查，含密钥权限检查）
 cx stop
@@ -117,9 +117,12 @@ cx backend test <名字>    # 只读列举/元数据检查；不建桶、不验�
 局域网直连（不经过服务端）：
 
 ```toml
+[space]
+encrypt = false                # 明文空间必须显式声明；默认 true 且没有空间密钥时局域网会被禁用
+
 [lan]
 enabled = true
-pairing_code = "自定的配对码"   # 未加密空间必须配；有空间密钥时由密钥派生 PSK
+pairing_code = "自定的配对码"   # 明文空间必须配；有空间密钥时由密钥派生 PSK
 peers = ["192.168.1.23:8699"]   # 可选：mDNS 被禁的网络里用显式地址
 ```
 

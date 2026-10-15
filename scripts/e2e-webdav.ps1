@@ -54,7 +54,13 @@ function New-DeviceEnv([string]$name, [string]$baseUrl) {
     $cache = Join-Path $deviceRoot 'cache'
     New-Item -ItemType Directory -Force -Path $config, $data, $cache | Out-Null
     # 缩短轮询间隔，让验收不必等太久
+    # [space] encrypt = false：本脚本验的是 WebDAV 传输层与跨设备同步，
+    # 显式选择明文空间（默认的 encrypt=true 需要空间密钥，否则拒绝外发）。
+    # 加密链路的端到端覆盖由 e2e-server（真密文断言）与 cargo 集成测试负责。
     @"
+[space]
+encrypt = false
+
 [sync]
 poll_active_ms = 1000
 poll_idle_ms = 2000

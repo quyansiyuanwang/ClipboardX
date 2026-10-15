@@ -55,6 +55,9 @@ function New-DeviceEnv([string]$name, [string]$endpoint, [string]$bucket, [strin
     $cache = Join-Path $deviceRoot 'cache'
     New-Item -ItemType Directory -Force -Path $config, $data, $cache, (Join-Path $config 'secrets') | Out-Null
     @"
+[space]
+encrypt = false
+
 [sync]
 poll_active_ms = 1000
 poll_idle_ms = 2000
@@ -129,13 +132,32 @@ try {
     Assert-True $ready "S3 服务端已就绪：$endpoint"
     if (-not $ready) { throw 'S3 服务端未就绪' }
 
+    Step '显式创建桶（连接检查与对象写入都不再隐式建桶）'
+    $python = Join-Path $venv 'Scripts/python.exe'
+    if (-not (Test-Path $python)) { $python = Join-Path $venv 'bin/python' }
+    $createScript = Join-Path $root 'create-bucket.py'
+    @"
+import boto3
+boto3.client(
+    "s3",
+    endpoint_url="$endpoint",
+    region_name="us-east-1",
+    aws_access_key_id="$accessKey",
+    aws_secret_access_key="$secretKey",
+).create_bucket(Bucket="$bucket")
+print("bucket ready")
+"@ | Set-Content $createScript
+    $created = & $python $createScript 2>&1
+    Assert-True ($LASTEXITCODE -eq 0) "桶已创建：$($created | Select-Object -Last 1)"
+    if ($LASTEXITCODE -ne 0) { throw '创建桶失败' }
+
     Step '准备两台设备的隔离目录'
     $deviceA = New-DeviceEnv 'device-a' $endpoint $bucket 'oss.key'
     $deviceB = New-DeviceEnv 'device-b' $endpoint $bucket 'oss.key'
     Assert-True (Test-Path (Join-Path $deviceA.Config 'config.toml')) 'A 的配置已写入'
     Assert-True (Test-Path (Join-Path $deviceB.Config 'secrets/oss.key')) 'A 的凭据已写入'
 
-    Step '直连测试后端（会顺手把桶建出来）'
+    Step '直连测试后端（只读：列举前缀 + 空间元数据，不建桶）'
     $probe = Invoke-Device $deviceA @('backend', 'test', 'oss')
     Assert-True ($probe.Code -eq 0) "backend test 通过：$($probe.Output)"
 
