@@ -27,6 +27,12 @@ pub mod cmd {
     pub const HISTORY_LIST: &str = "history.list";
     /// 查看某条历史的内容预览。
     pub const HISTORY_SHOW: &str = "history.show";
+    /// 需 expected_name 的预览；老守护进程必须拒绝未知命令，不能降级。
+    pub const HISTORY_SHOW_CHECKED: &str = "history.show.checked";
+    /// 需 expected_name 的复制。
+    pub const COPY_CHECKED: &str = "copy.checked";
+    /// 需 expected_name 的删除。
+    pub const HISTORY_DELETE_CHECKED: &str = "history.delete.checked";
     /// 把历史中的某条写回本机剪贴板。
     pub const COPY: &str = "copy";
     /// 删除一条本机历史（位置 0 = 最新）。只动本机，不传播给其他设备。

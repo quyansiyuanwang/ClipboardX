@@ -47,6 +47,8 @@ pub struct PollOutcome {
     pub incoming: Vec<(String, Item)>,
     /// 本轮是否有 manifest 发生变化。
     pub manifest_changed: bool,
+    /// 未完成对象的错误；这些名字不提交进度，但不阻止其他设备的健康内容。
+    pub errors: Vec<String>,
 }
 
 impl RemoteSync {
@@ -105,26 +107,17 @@ impl RemoteSync {
 
     /// 探活（`cx backend test` / doctor 用）。
     pub fn probe(&mut self) -> Result<String, BackendError> {
-        // 先确保"根"可用：S3 上桶可能还不存在（自建 MinIO 首次使用很常见），
-        // 这一步会顺手把桶建出来；WebDAV 的根集合由用户事先配好，这里什么都不做。
-        let created = match self.backend.ensure_root() {
-            Ok(created) => created,
-            Err(err) => {
-                return Err(err);
-            }
-        };
-        let root_note = if created {
-            "；已自动创建根（S3 的桶）"
-        } else {
-            ""
-        };
-
+        // 只读：不调用 ensure_root，不建桶，也不把读取元数据当成写权限验证。
+        self.backend.list(layout::MANIFESTS_PREFIX)?;
         let space = if cx_backend::load_space_meta(&mut *self.backend)?.is_some() {
-            "空间元数据：已存在"
+            "空间元数据：已存在（仍需本机加入空间）"
         } else {
-            "空间元数据：尚未写入（需要 cx space init/join）"
+            "空间元数据：尚未写入（需要 cx space init/publish 或 join）"
         };
-        Ok(format!("{}；{space}{root_note}", self.backend.describe()))
+        Ok(format!(
+            "{}；列举/读取通过；{space}；写入/删除未验证",
+            self.backend.describe()
+        ))
     }
 
     /// 发布一个对象，并把它记进自己的 manifest。
@@ -174,72 +167,100 @@ impl RemoteSync {
         let objects = list_manifests(&mut *self.backend)?;
         let mut incoming = Vec::new();
         let mut manifest_changed = false;
+        let mut errors = Vec::new();
+        // 下载成功的逐项进度，仍须由调用方等待引擎确认后持久化。
+        let mut cursors = self.cursors.clone();
 
         for object in objects {
             let Some(device_id) = layout::device_id_from_manifest_path(&object.path) else {
                 continue;
             };
             if device_id == self.device_id {
-                continue; // 自己的 manifest 不用读
-            }
-
-            let cursor = self.cursors.entry(device_id.clone()).or_default();
-            if object.matches_etag(cursor.etag.as_deref()) {
-                continue; // ETag 没变 ⇒ 整份跳过
-            }
-
-            let Some(raw) = self.backend.get(&object.path)? else {
                 continue;
-            };
-            let text = match String::from_utf8(raw) {
-                Ok(text) => text,
+            }
+            let cursor = cursors.entry(device_id.clone()).or_default();
+            if cursor.progress_v != 1 {
+                // 旧算法可能已越过未取条目，不能沿用旧 ETag/时间戳承诺。
+                *cursor = DeviceCursor {
+                    progress_v: 1,
+                    ..Default::default()
+                };
+            }
+            if object.matches_etag(cursor.etag.as_deref()) {
+                continue;
+            }
+            let raw = match self.backend.get(&object.path) {
+                Ok(Some(raw)) => raw,
+                Ok(None) => continue,
                 Err(err) => {
-                    log::warn!("{device_id} 的 manifest 不是 UTF-8：{err}");
+                    errors.push(err.to_string());
                     continue;
                 }
             };
-            let manifest = match Manifest::from_json(&text) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    // 别人的 manifest 坏了不该拖垮我们：记一笔，下次再说
-                    log::warn!("{device_id} 的 manifest 无法解析：{err}");
-                    continue;
-                }
-            };
-
-            manifest_changed = true;
-            cursor.etag = object.etag.clone();
-            let since = cursor.items_ms;
-            let mut newest = since;
-
-            for entry in manifest
-                .items
-                .iter()
-                .filter(|entry| entry.created_ms > since)
+            let manifest = match String::from_utf8(raw)
+                .ok()
+                .and_then(|text| Manifest::from_json(&text).ok())
             {
-                newest = newest.max(entry.created_ms);
-                if incoming.len() >= max_fetch {
+                Some(manifest) if manifest.device_id == device_id => manifest,
+                _ => {
+                    log::warn!("{device_id} 的 manifest 无法解析或设备标识不一致");
                     continue;
+                }
+            };
+            manifest_changed = true;
+            // 仅保留当前清单中的进度，大小受远端保留策略限制。
+            cursor
+                .completed_names
+                .retain(|name| manifest.items.iter().any(|entry| &entry.name == name));
+            for entry in &manifest.items {
+                if cursor.completed_names.contains(&entry.name) {
+                    continue;
+                }
+                if incoming.len() >= max_fetch {
+                    break;
                 }
                 let Some(path) = layout::item_path(&entry.name) else {
+                    errors.push("manifest 包含非法对象名".into());
                     continue;
                 };
-                let Some(bytes) = self.backend.get(&path)? else {
-                    log::debug!("manifest 里提到了 {} 但对象不存在", entry.name);
-                    continue;
+                let bytes = match self.backend.get(&path) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        errors.push(format!("manifest 引用的对象尚不存在：{}", entry.name));
+                        continue;
+                    }
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
                 };
-                match Item::decode(&bytes) {
-                    Ok(item) => incoming.push((entry.name.clone(), item)),
-                    Err(err) => log::warn!("对象 {} 解码失败：{err}", entry.name),
-                }
+                let item = match Item::decode(&bytes) {
+                    Ok(item) => item,
+                    Err(err) => {
+                        errors.push(format!("对象 {} 解码失败：{err}", entry.name));
+                        continue;
+                    }
+                };
+                incoming.push((entry.name.clone(), item));
+                cursor.completed_names.push(entry.name.clone());
+                cursor.items_ms = cursor.items_ms.max(entry.created_ms);
             }
-
-            cursor.items_ms = newest;
+            if manifest
+                .items
+                .iter()
+                .all(|entry| cursor.completed_names.contains(&entry.name))
+            {
+                cursor.etag = object.etag.clone();
+                cursor.updated_ms = manifest.updated_ms;
+            } else {
+                cursor.etag = None;
+            }
         }
-
+        self.cursors = cursors;
         Ok(PollOutcome {
             incoming,
             manifest_changed,
+            errors,
         })
     }
 
@@ -250,13 +271,20 @@ impl RemoteSync {
         }
         let path = layout::manifest_path(&self.device_id);
         let manifest = match self.backend.get(&path)? {
-            Some(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => Manifest::from_json(&text).unwrap_or_else(|err| {
-                    log::warn!("本机 manifest 解析失败（{err}），从空开始");
-                    Manifest::new(&self.device_id, &self.device_name, cx_core::now_ms())
-                }),
-                Err(_) => Manifest::new(&self.device_id, &self.device_name, cx_core::now_ms()),
-            },
+            Some(bytes) => {
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    BackendError::Malformed("本机远端 manifest 不是 UTF-8，拒绝覆盖".into())
+                })?;
+                let manifest = Manifest::from_json(&text).map_err(|err| {
+                    BackendError::Malformed(format!("本机远端 manifest 损坏，拒绝覆盖：{err}"))
+                })?;
+                if manifest.device_id != self.device_id {
+                    return Err(BackendError::Malformed(
+                        "远端 manifest 设备身份不一致，拒绝覆盖".into(),
+                    ));
+                }
+                manifest
+            }
             None => Manifest::new(&self.device_id, &self.device_name, cx_core::now_ms()),
         };
         self.own_manifest = Some(manifest.clone());
@@ -438,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn 游标注入后跳过历史条目() {
+    fn 旧游标升级会重新扫描补齐漏项() {
         let store = MemoryBackend::new("mem");
         let mut a = RemoteSync::new(Box::new(store.shared("a")), DEV_A, "boxA");
         let old = 1_759_299_998_712u64;
@@ -457,11 +485,95 @@ mod tests {
             DeviceCursor {
                 etag: None,
                 updated_ms: 0,
-                items_ms: old + 1, // 比条目更新
+                items_ms: old + 1,
+                ..Default::default()
             },
         )]));
         let outcome = b.poll(DEFAULT_MAX_FETCH).unwrap();
-        assert!(outcome.incoming.is_empty(), "游标之前的内容不该再下载");
+        assert_eq!(
+            outcome.incoming.len(),
+            1,
+            "旧游标必须重新扫描，不能继承漏同步"
+        );
+    }
+
+    #[test]
+    fn 超过批次上限且同毫秒的对象可以全部续取() {
+        let store = MemoryBackend::new("mem");
+        let mut a = RemoteSync::new(Box::new(store.shared("a")), DEV_A, "boxA");
+        let ts = 1_759_299_998_712;
+        for index in 0..40u64 {
+            let name =
+                cx_proto::ItemName::build(ts, DEV_A, &format!("{index:08x}{}", "a".repeat(56)));
+            a.publish(
+                &name,
+                &item_for(&name, b"fake", ts).encode().unwrap(),
+                entry(&name, ts),
+                limits(100),
+            )
+            .unwrap();
+        }
+        let mut b = RemoteSync::new(Box::new(store.shared("b")), DEV_B, "boxB");
+        assert_eq!(b.poll(32).unwrap().incoming.len(), 32);
+        let saved = b.cursors().clone();
+        let mut restarted = RemoteSync::new(Box::new(store.shared("restart")), DEV_B, "boxB");
+        restarted.set_cursors(saved);
+        assert_eq!(restarted.poll(32).unwrap().incoming.len(), 8);
+        assert!(restarted.poll(32).unwrap().incoming.is_empty());
+    }
+
+    #[test]
+    fn 清单引用对象暂缺时不提交半轮游标() {
+        let mut store = MemoryBackend::new("mem");
+        let mut a = RemoteSync::new(Box::new(store.shared("a")), DEV_A, "boxA");
+        let ts = 1_759_299_998_712;
+        let name = cx_proto::ItemName::build(ts, DEV_A, &"c".repeat(64));
+        let bytes = item_for(&name, b"fake", ts).encode().unwrap();
+        a.publish(&name, &bytes, entry(&name, ts), limits(100))
+            .unwrap();
+        let path = layout::item_path(&name).unwrap();
+        store.delete(&path).unwrap();
+        let mut b = RemoteSync::new(Box::new(store.shared("b")), DEV_B, "boxB");
+        let outcome = b.poll(32).unwrap();
+        assert!(outcome.incoming.is_empty());
+        assert!(!outcome.errors.is_empty());
+        assert!(b.cursors()[DEV_A].completed_names.is_empty());
+        store.seed(&path, &bytes);
+        assert_eq!(b.poll(32).unwrap().incoming.len(), 1);
+    }
+
+    #[test]
+    fn 缺失对象不阻塞同设备及其他设备的健康内容() {
+        let store = MemoryBackend::new("mem");
+        let mut a = RemoteSync::new(Box::new(store.shared("a")), DEV_A, "boxA");
+        let mut x = RemoteSync::new(Box::new(store.shared("x")), DEV_X, "boxX");
+        let ts = 1_759_299_998_712;
+        let good = cx_proto::ItemName::build(ts, DEV_A, &"a".repeat(64));
+        let bad = cx_proto::ItemName::build(ts + 1, DEV_A, &"b".repeat(64));
+        let other = cx_proto::ItemName::build(ts + 2, DEV_X, &"c".repeat(64));
+        for name in [&good, &bad] {
+            a.publish(
+                name,
+                &item_for(name, b"fake", ts).encode().unwrap(),
+                entry(name, ts),
+                limits(100),
+            )
+            .unwrap();
+        }
+        x.publish(
+            &other,
+            &item_for(&other, b"fake", ts + 2).encode().unwrap(),
+            entry(&other, ts + 2),
+            limits(100),
+        )
+        .unwrap();
+        store.seed(&layout::item_path(&bad).unwrap(), b"broken");
+        let mut b = RemoteSync::new(Box::new(store.shared("b")), DEV_B, "boxB");
+        let outcome = b.poll(32).unwrap();
+        assert_eq!(outcome.incoming.len(), 2);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(!b.cursors()[DEV_A].completed_names.contains(&bad));
+        assert_eq!(b.poll(32).unwrap().incoming.len(), 0);
     }
 
     #[test]
