@@ -276,7 +276,7 @@ try {
     Start-Sleep -Seconds $WaitSeconds
     $beforeDelete = AsJson (Invoke-Cx history --json).Output
     $targetText = (AsJson (Invoke-Cx show 0 --json).Output).text
-    $result = Invoke-Cx delete 0
+    $result = Invoke-Cx delete 0 --yes
     Assert-True ($result.Code -eq 0) 'cx delete 退出码 0'
     $afterDelete = AsJson (Invoke-Cx history --json).Output
     Assert-True ($afterDelete.Count -eq ($beforeDelete.Count - 1)) "删除后少一条（$($beforeDelete.Count) → $($afterDelete.Count)）"
@@ -290,7 +290,8 @@ try {
     }
     Assert-True $allReadable '删除后其余条目仍能完整读回'
     # 越界删除应当失败且不改动历史
-    $result = Invoke-Cx delete 999
+    # 越界删除应当失败且不改动历史（--yes 只是跳过确认，不改变范围校验）
+    $result = Invoke-Cx delete 999 --yes
     Assert-True ($result.Code -ne 0) '越界删除退出码非 0'
     $afterBadDelete = AsJson (Invoke-Cx history --json).Output
     Assert-True ($afterBadDelete.Count -eq $afterDelete.Count) '失败的删除不该改动历史'

@@ -49,6 +49,9 @@ function New-Device([string]$name, [int]$port, [string[]]$peers, [string]$code) 
     New-Item -ItemType Directory -Force -Path $config, $data, $cache | Out-Null
     $peerList = ($peers | ForEach-Object { "`"$_`"" }) -join ', '
     @"
+[space]
+encrypt = false
+
 [sync]
 poll_active_ms = 1000
 poll_idle_ms = 2000

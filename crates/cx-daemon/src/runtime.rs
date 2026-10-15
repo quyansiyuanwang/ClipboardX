@@ -620,7 +620,11 @@ fn start_lan(
 
     let space = cx_core::LocalSpace::load(paths).ok();
     if config.space.encrypt && space.as_ref().and_then(|s| s.cipher.space_key()).is_none() {
-        log::warn!("要求加密但空间密钥未就绪：禁用局域网同步，请先创建或加入空间");
+        log::warn!(
+            "要求加密（[space] encrypt = true）但空间密钥未就绪：禁用局域网同步，避免明文外发。\
+             请先 `cx space init/join` 取得密钥；确实要用明文空间时，按文档显式设 [space] encrypt = false \
+             并在 [lan] 配 pairing_code"
+        );
         return Ok(None);
     }
     let (psk_hex, space_id) = match (&space, config.lan.pairing_code.as_deref()) {
