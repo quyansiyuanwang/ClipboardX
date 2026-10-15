@@ -8,8 +8,8 @@
 //! - **ETag 天然适合做增量判断**：非分片上传的 ETag 就是内容 MD5，内容不变则不变，
 //!   这与我们在 WebDAV 里用 ETag 做增量的思路一致。
 //!
-//! 条件写（`If-None-Match: *`）在 S3 与 MinIO 上都支持；若不支持（返回 501/400），
-//! 退化为"HEAD 看存在不存在，再决定是 AlreadyExists 还是普通 PUT"。
+//! 条件写使用 `If-None-Match: *`；显式不支持时 fail-closed，
+//! 不用有覆盖竞态的 HEAD + 无条件 PUT 冒充不可变对象写入。
 
 use crate::date::parse_http_date;
 use crate::error::BackendError;
@@ -65,8 +65,6 @@ pub struct S3Backend {
     name: String,
     /// 端点（`scheme://host[:port]`，无尾斜杠）。
     endpoint: String,
-    /// 用于 Host 头与签名的主机部分。
-    host: String,
     region: String,
     bucket: String,
     /// 规范化前缀：无前后斜杠（空表示桶根）。
@@ -90,6 +88,7 @@ struct S3Reply {
     /// 服务端 `Date` 头（校正时钟用）。
     server_date_ms: Option<u64>,
     body: Vec<u8>,
+    hints: std::collections::BTreeMap<String, String>,
 }
 
 impl S3Backend {
@@ -111,12 +110,43 @@ impl S3Backend {
 
         let endpoint = match &options.endpoint {
             Some(endpoint) => normalize_endpoint(endpoint)?,
-            None => format!("https://s3.{region}.amazonaws.com"),
+            None => normalize_endpoint(&format!("https://s3.{region}.amazonaws.com"))?,
         };
-        let host = endpoint
-            .split_once("://")
-            .map(|(_, rest)| rest.to_string())
-            .ok_or_else(|| BackendError::Config(format!("端点缺少协议：{endpoint}")))?;
+        let parsed = url::Url::parse(&endpoint)
+            .map_err(|_| BackendError::Config("S3 endpoint URL 非法".into()))?;
+        let bucket = options.bucket.trim();
+        if bucket
+            .chars()
+            .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '.' && ch != '_')
+        {
+            return Err(BackendError::Config("S3 桶名包含非法字符".into()));
+        }
+        if !options.path_style {
+            if parsed
+                .host()
+                .is_some_and(|host| !matches!(host, url::Host::Domain(_)))
+            {
+                return Err(BackendError::Config(
+                    "virtual-host 寻址需要 DNS endpoint；IP endpoint 请显式使用 path_style=true"
+                        .into(),
+                ));
+            }
+            if parsed
+                .host_str()
+                .is_some_and(|host| host.starts_with(&format!("{bucket}.")))
+            {
+                return Err(BackendError::Config(
+                    "S3 endpoint 已包含桶名；请配置服务 endpoint，避免重复桶前缀".into(),
+                ));
+            }
+            let mut virtual_url = parsed.clone();
+            virtual_url
+                .set_host(Some(&format!(
+                    "{bucket}.{}",
+                    parsed.host_str().unwrap_or_default()
+                )))
+                .map_err(|_| BackendError::Config("virtual-host 桶名或 endpoint 非法".into()))?;
+        }
 
         let settings = HttpSettings {
             timeout: options.timeout,
@@ -130,7 +160,6 @@ impl S3Backend {
         Ok(Self {
             name: options.name,
             endpoint,
-            host,
             region,
             bucket: options.bucket.trim().to_string(),
             prefix: options.prefix.trim().trim_matches('/').to_string(),
@@ -154,51 +183,55 @@ impl S3Backend {
         if self.prefix.is_empty() {
             relative.to_string()
         } else if relative.is_empty() {
-            self.prefix.clone()
+            format!("{}/", self.prefix)
         } else {
             format!("{}/{}", self.prefix, relative)
         }
     }
 
     /// 把服务端返回的键名还原成相对路径。
-    fn relative_key(&self, key: &str) -> String {
+    fn relative_key(&self, key: &str) -> Result<String, BackendError> {
         if self.prefix.is_empty() {
-            return key.to_string();
+            return Ok(key.to_string());
         }
-        let with_slash = format!("{}/", self.prefix);
-        key.strip_prefix(&with_slash)
-            .or_else(|| key.strip_prefix(&self.prefix))
-            .unwrap_or(key)
-            .to_string()
+        key.strip_prefix(&format!("{}/", self.prefix))
+            .map(str::to_string)
+            .ok_or_else(|| BackendError::Malformed("LIST 返回了配置前缀之外的对象".into()))
     }
 
-    /// 构造请求 URL 与规范化路径。
-    fn target(&self, key: &str, query: &[(String, String)]) -> (String, String) {
+    /// Build one final URL; its authority is also used verbatim for signing.
+    fn target(
+        &self,
+        key: &str,
+        _query: &[(String, String)],
+    ) -> Result<(String, String), BackendError> {
+        // URL libraries normalize dot segments; never sign one path and send another.
+        if key
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        {
+            return Err(BackendError::Config(
+                "S3 key 不能包含 . 或 .. 路径段".into(),
+            ));
+        }
         let encoded_key = canonical_uri(key);
-        let (url, path) = if self.path_style || key.is_empty() {
-            // path-style：https://host/bucket/key
-            let path = format!("/{}/{}", self.bucket, encoded_key.trim_start_matches('/'));
-            let path = if encoded_key.is_empty() {
-                format!("/{}/", self.bucket)
-            } else {
-                path
-            };
-            (format!("{}{}", self.endpoint, path), path)
+        let path = if self.path_style {
+            format!("/{}/{}", self.bucket, encoded_key.trim_start_matches('/'))
         } else {
-            // virtual-host：https://bucket.host/key
-            let host = format!("{}.{}", self.bucket, self.host);
-            let path = if encoded_key.is_empty() {
-                "/".to_string()
-            } else {
-                format!("/{encoded_key}")
-            };
-            (
-                format!("{}://{}{}", scheme_of(&self.endpoint), host, path),
-                path,
-            )
+            format!("/{}", encoded_key.trim_start_matches('/'))
         };
-        let _ = query;
-        (url, path)
+        let mut url = url::Url::parse(&self.endpoint)
+            .map_err(|_| BackendError::Config("S3 endpoint URL 非法".into()))?;
+        if !self.path_style {
+            let host = format!("{}.{}", self.bucket, url.host_str().unwrap_or_default());
+            url.set_host(Some(&host))
+                .map_err(|_| BackendError::Config("S3 virtual-host URL 非法".into()))?;
+        }
+        url.set_path(&path);
+        if url.path() != path {
+            return Err(BackendError::Config("S3 key 无法无损表示为 URL".into()));
+        }
+        Ok((url.to_string(), path))
     }
 
     /// 发一次已签名的请求。
@@ -249,13 +282,10 @@ impl S3Backend {
             headers.push((name.to_string(), value.to_string()));
         }
 
-        let (url, path) = self.target(key, query);
-        // 签名用的 Host 必须与真正发出的 Host 一致（virtual-host 下含桶名）
-        let signing_host = if self.path_style || key.is_empty() {
-            self.host.clone()
-        } else {
-            format!("{}.{}", self.bucket, self.host)
-        };
+        let (url, path) = self.target(key, query)?;
+        let parsed =
+            url::Url::parse(&url).map_err(|_| BackendError::Config("S3 请求 URL 非法".into()))?;
+        let signing_host = parsed[url::Position::BeforeHost..url::Position::AfterPort].to_string();
 
         let request = SignableRequest {
             method: method.to_string(),
@@ -282,7 +312,8 @@ impl S3Backend {
         };
         let http_method = attohttpc::Method::from_bytes(method.as_bytes())
             .map_err(|err| BackendError::Config(format!("非法 HTTP 方法 {method}：{err}")))?;
-        let mut builder = attohttpc::RequestBuilder::new(http_method, &url);
+        let mut builder = attohttpc::RequestBuilder::try_new(http_method, &url)
+            .map_err(|_| BackendError::Config("S3 请求 URL 非法".into()))?;
         builder = configure(builder, &self.settings)?;
         for (name, value) in &signed.headers {
             let header_name = attohttpc::header::HeaderName::from_bytes(name.as_bytes())
@@ -292,10 +323,9 @@ impl S3Backend {
             builder = builder.header(header_name, header_value);
         }
 
-        let response = builder
-            .bytes(body)
-            .send()
-            .map_err(|err| BackendError::Transport(format!("{method} {url}：{err}")))?;
+        let response = builder.bytes(body).send().map_err(|err| {
+            BackendError::Transport(self.redact(&format!("S3 {method} 请求失败：{err}")))
+        })?;
 
         let status = response.status().as_u16();
         let header = |name: &str| {
@@ -309,8 +339,18 @@ impl S3Backend {
         let last_modified_ms = header("last-modified").and_then(|text| parse_http_date(&text));
         let size = header("content-length").and_then(|text| text.parse::<u64>().ok());
         let server_date_ms = header("date").and_then(|text| parse_http_date(&text));
+        let hints = [
+            ("RequestId", "x-oss-request-id"),
+            ("RequestId", "x-amz-request-id"),
+            ("EC", "x-oss-ec"),
+            ("Region", "x-amz-bucket-region"),
+            ("Endpoint", "x-oss-endpoint"),
+        ]
+        .into_iter()
+        .filter_map(|(field, name)| header(name).map(|value| (field.to_string(), value)))
+        .collect();
         let body = response.bytes().map_err(|err| {
-            BackendError::Transport(format!("读取 {method} {url} 响应体失败：{err}"))
+            BackendError::Transport(self.redact(&format!("读取 S3 {method} 响应体失败：{err}")))
         })?;
 
         Ok(S3Reply {
@@ -320,7 +360,40 @@ impl S3Backend {
             size,
             server_date_ms,
             body,
+            hints,
         })
+    }
+
+    fn redact(&self, value: &str) -> String {
+        let lower = value.to_ascii_lowercase();
+        if [
+            "authorization",
+            "credential=",
+            "signature=",
+            "security-token",
+            "accesskeysecret",
+            "secretaccesskey",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            return "[redacted sensitive server detail]".into();
+        }
+        let mut clean = value.to_string();
+        for secret in [&self.access_key_id, &self.secret_access_key]
+            .into_iter()
+            .chain(self.session_token.iter())
+        {
+            if !secret.is_empty() {
+                clean = clean.replace(secret, "[redacted]");
+                clean = clean.replace(&crate::signing::uri_encode(secret, true), "[redacted]");
+            }
+        }
+        clean
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(512)
+            .collect()
     }
 
     /// 把非 2xx 响应变成错误（`ok_statuses` 之外的状态都算失败）。
@@ -328,15 +401,30 @@ impl S3Backend {
         if (200..300).contains(&reply.status) {
             return Ok(());
         }
-        let (code, message) = parse_error(&reply.body);
-        let is_clock_skew = code.as_deref() == Some("RequestTimeTooSkewed");
-        let detail = match (code, message) {
-            (Some(code), Some(message)) => format!("{code}: {message}"),
-            (Some(code), None) => code,
-            (None, Some(message)) => message,
-            (None, None) => format!("HTTP {}", reply.status),
-        };
-        log::debug!("S3 {method} {key} 失败：{} {detail}", reply.status);
+        let info = parse_error_fields(&reply.body);
+        let code = info.get("Code").map(String::as_str);
+        let is_clock_skew = code == Some("RequestTimeTooSkewed");
+        let mut detail = format!("S3 {method} HTTP {}", reply.status);
+        for field in [
+            "Code",
+            "Message",
+            "EC",
+            "RequestId",
+            "HostId",
+            "Endpoint",
+            "Region",
+        ] {
+            if let Some(value) = info.get(field) {
+                detail.push_str(&format!("; {field}={}", self.redact(value)));
+            }
+        }
+        for (field, value) in &reply.hints {
+            if !info.contains_key(field) {
+                detail.push_str(&format!("; {field}={}", self.redact(value)));
+            }
+        }
+        let _ = key; // Object names and opaque pagination tokens are not diagnostic output.
+        log::debug!("{detail}");
         // 时钟偏差不是认证问题：报成认证失败会让用户去改密钥，方向完全错了
         if is_clock_skew {
             return Err(BackendError::Status {
@@ -358,94 +446,137 @@ impl S3Backend {
     }
 }
 
-/// 端点规范化：补协议、去尾斜杠。
+/// Shared addressing default: OSS and AWS service endpoints use virtual hosts;
+/// preserve path-style for other custom services (MinIO, Ceph, local servers).
+pub fn default_path_style(endpoint: Option<&str>) -> bool {
+    let Some(endpoint) = endpoint else {
+        return false;
+    };
+    let Ok(endpoint) = normalize_endpoint(endpoint) else {
+        return true;
+    };
+    let Ok(url) = url::Url::parse(&endpoint) else {
+        return true;
+    };
+    let host = url.host_str().unwrap_or_default();
+    !(host.ends_with(".aliyuncs.com") && (host.starts_with("oss-") || host.starts_with("s3.oss-"))
+        || host == "s3.amazonaws.com"
+        || host.starts_with("s3.") && host.ends_with(".amazonaws.com"))
+}
+
+/// Endpoint must be a service origin, never credentials, a bucket path or query.
 fn normalize_endpoint(endpoint: &str) -> Result<String, BackendError> {
-    let trimmed = endpoint.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err(BackendError::Config("S3 端点不能为空".to_string()));
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) || trimmed.contains('\\') {
+        return Err(BackendError::Config(
+            "S3 endpoint 为空或包含非法字符".into(),
+        ));
     }
     let with_scheme = if trimmed.contains("://") {
         trimmed.to_string()
     } else {
-        // 没写协议时：本地/内网默认 http，其余默认 https
-        let host = trimmed.split('/').next().unwrap_or(trimmed);
-        let local = host.starts_with("127.0.0.1")
-            || host.starts_with("localhost")
-            || host.starts_with("192.168.")
-            || host.starts_with("10.")
-            || host.starts_with("[::1]");
-        format!("{}://{}", if local { "http" } else { "https" }, trimmed)
+        let local = trimmed.starts_with("127.0.0.1")
+            || trimmed.starts_with("localhost")
+            || trimmed.starts_with("192.168.")
+            || trimmed.starts_with("10.")
+            || trimmed.starts_with("[::1]");
+        format!("{}://{trimmed}", if local { "http" } else { "https" })
     };
-    let scheme = with_scheme
+    let raw_origin = with_scheme
         .split_once("://")
-        .map(|(scheme, _)| scheme.to_string());
-    match scheme.as_deref() {
-        Some("http") | Some("https") => Ok(with_scheme),
-        other => Err(BackendError::Config(format!(
-            "S3 端点协议必须是 http 或 https（实际是 {}）",
-            other.unwrap_or("缺失")
-        ))),
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    let (authority, raw_path) = raw_origin.split_once('/').unwrap_or((raw_origin, ""));
+    if authority.is_empty() || authority.contains('@') || !raw_path.is_empty() {
+        return Err(BackendError::Config(
+            "S3 endpoint 只能是服务 origin，不能包含凭据或路径".into(),
+        ));
     }
+    let parsed = url::Url::parse(&with_scheme).map_err(|_| {
+        BackendError::Config("S3 endpoint URL 非法；请使用 http(s)://host[:port]".into())
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(BackendError::Config("S3 endpoint 必须是 http(s)://host[:port] 服务地址，不能含凭据、路径、query 或 fragment".into()));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
-fn scheme_of(endpoint: &str) -> &str {
-    endpoint
-        .split_once("://")
-        .map(|(scheme, _)| scheme)
-        .unwrap_or("https")
-}
-
-/// 解析 S3 错误响应里的 `<Code>` 与 `<Message>`。
-fn parse_error(body: &[u8]) -> (Option<String>, Option<String>) {
+/// Parse a diagnostic whitelist, never raw headers/body or credential echo fields.
+fn parse_error_fields(body: &[u8]) -> std::collections::BTreeMap<String, String> {
     let mut reader = Reader::from_reader(body);
-    let mut buffer = Vec::new();
-    let mut code = None;
-    let mut message = None;
-    let mut current: Option<bool> = None; // true = Code, false = Message
+    let mut fields = std::collections::BTreeMap::new();
+    let mut current = None;
     let mut text = String::new();
     loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(XmlEvent::Start(event)) => match event.local_name().into_inner() {
-                "Code" => {
-                    current = Some(true);
-                    text.clear();
-                }
-                "Message" => {
-                    current = Some(false);
-                    text.clear();
-                }
-                _ => current = None,
-            },
-            Ok(XmlEvent::Text(chunk)) => {
-                if current.is_some()
-                    && let Ok(decoded) = quick_xml::escape::unescape(&chunk.into_inner())
-                {
-                    text.push_str(&decoded);
+        match reader.read_event() {
+            Ok(XmlEvent::Start(event)) => {
+                let name = event.local_name();
+                current = Some(name.as_ref())
+                    .filter(|name| {
+                        [
+                            "Code",
+                            "Message",
+                            "EC",
+                            "RequestId",
+                            "HostId",
+                            "Endpoint",
+                            "Region",
+                        ]
+                        .contains(name)
+                    })
+                    .map(str::to_string);
+                text.clear();
+            }
+            Ok(XmlEvent::Text(chunk)) if current.is_some() => {
+                if let Ok(value) = quick_xml::escape::unescape(&chunk.into_inner()) {
+                    text.push_str(&value);
                 }
             }
-            Ok(XmlEvent::GeneralRef(reference)) => {
-                if current.is_some()
-                    && let Some(resolved) = resolve_entity(&reference.into_inner())
-                {
-                    text.push_str(&resolved);
+            Ok(XmlEvent::CData(chunk)) if current.is_some() => {
+                text.push_str(chunk.as_ref());
+            }
+            Ok(XmlEvent::GeneralRef(reference)) if current.is_some() => {
+                if let Some(value) = resolve_entity(&reference.into_inner()) {
+                    text.push_str(&value);
                 }
             }
             Ok(XmlEvent::End(event)) => {
-                if let Some(active) = current.take() {
-                    match event.local_name().into_inner() {
-                        "Code" if active => code = Some(std::mem::take(&mut text)),
-                        "Message" if !active => message = Some(std::mem::take(&mut text)),
-                        _ => {}
-                    }
+                if let Some(name) = current.take()
+                    && event.local_name().as_ref() == name.as_str()
+                {
+                    fields.insert(name, std::mem::take(&mut text));
                 }
             }
-            Ok(XmlEvent::Eof) => break,
-            Ok(_) => {}
-            Err(_) => break,
+            Ok(XmlEvent::Eof) | Err(_) => break,
+            _ => {}
         }
-        buffer.clear();
     }
-    (code, message)
+    fields
+}
+
+fn parse_error(body: &[u8]) -> (Option<String>, Option<String>) {
+    let mut fields = parse_error_fields(body);
+    (fields.remove("Code"), fields.remove("Message"))
+}
+
+fn conditional_write_unsupported(body: &[u8]) -> bool {
+    let (code, message) = parse_error(body);
+    matches!(
+        code.as_deref(),
+        Some("NotImplemented" | "NotSupported" | "UnsupportedHeader" | "UnsupportedOperation")
+    ) && message.is_some_and(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("if-none-match")
+            || message.contains("conditional write")
+            || message.contains("conditional request")
+    })
 }
 
 /// ListObjectsV2 的一页结果。
@@ -466,6 +597,10 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, BackendError> {
     let mut field: Option<Field> = None;
     let mut text = String::new();
     let mut entry = Entry::default();
+    let mut depth = 0usize;
+    let mut root_seen = false;
+    let mut root_closed = false;
+    let mut truncated_seen = false;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Field {
@@ -493,7 +628,6 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, BackendError> {
         in_contents: bool,
     ) {
         let value = std::mem::take(text);
-        let value = value.trim().to_string();
         match field {
             Field::Key => {
                 if in_contents {
@@ -507,7 +641,7 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, BackendError> {
             }
             Field::Size => {
                 if in_contents {
-                    entry.size = value.parse::<u64>().ok();
+                    entry.size = value.trim().parse::<u64>().ok();
                 }
             }
             Field::LastModified => {
@@ -515,27 +649,73 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, BackendError> {
                     entry.modified_ms = parse_http_date(&value);
                 }
             }
-            Field::Truncated => page.truncated = value.eq_ignore_ascii_case("true"),
+            Field::Truncated => page.truncated = value.trim() == "true",
             Field::NextToken => page.next_token = Some(value),
         }
     }
 
     loop {
         match reader.read_event_into(&mut buffer) {
-            Ok(XmlEvent::Start(event)) => match event.local_name().into_inner() {
-                "Contents" => {
-                    in_contents = true;
-                    entry = Entry::default();
+            Ok(XmlEvent::Start(event)) => {
+                if depth == 0 {
+                    if root_seen || event.local_name().as_ref() != "ListBucketResult" {
+                        return Err(BackendError::Malformed(
+                            "LIST 响应根节点不是 ListBucketResult".into(),
+                        ));
+                    }
+                    root_seen = true;
                 }
-                "Key" => field = Some(Field::Key),
-                "ETag" => field = Some(Field::Etag),
-                "Size" => field = Some(Field::Size),
-                "LastModified" => field = Some(Field::LastModified),
-                "IsTruncated" => field = Some(Field::Truncated),
-                "NextContinuationToken" => field = Some(Field::NextToken),
-                _ => field = None,
-            },
+                let name = event.local_name().into_inner();
+                if field.is_some()
+                    || matches!(name, "Contents" | "IsTruncated" | "NextContinuationToken")
+                        && depth != 1
+                    || matches!(name, "Key" | "ETag" | "Size" | "LastModified")
+                        && (depth != 2 || !in_contents)
+                    || name == "IsTruncated" && truncated_seen
+                {
+                    return Err(BackendError::Malformed(
+                        "LIST 字段嵌套、重复或层级非法".into(),
+                    ));
+                }
+                depth += 1;
+                if name == "IsTruncated" {
+                    truncated_seen = true;
+                }
+                match name {
+                    "Contents" => {
+                        in_contents = true;
+                        entry = Entry::default();
+                    }
+                    "Key" => field = Some(Field::Key),
+                    "ETag" => field = Some(Field::Etag),
+                    "Size" => field = Some(Field::Size),
+                    "LastModified" => field = Some(Field::LastModified),
+                    "IsTruncated" => field = Some(Field::Truncated),
+                    "NextContinuationToken" => field = Some(Field::NextToken),
+                    _ => field = None,
+                }
+            }
+            Ok(XmlEvent::Empty(event)) => {
+                if depth == 0
+                    || ["Contents", "Key", "IsTruncated"].contains(&event.local_name().as_ref())
+                {
+                    return Err(BackendError::Malformed("LIST 响应包含空或非法节点".into()));
+                }
+            }
+            Ok(XmlEvent::CData(chunk)) => {
+                if field.is_some() {
+                    text.push_str(chunk.as_ref());
+                }
+            }
             Ok(XmlEvent::Text(chunk)) => {
+                if depth == 0
+                    && chunk
+                        .as_ref()
+                        .bytes()
+                        .any(|byte| !byte.is_ascii_whitespace())
+                {
+                    return Err(BackendError::Malformed("LIST 响应包含根节点外文本".into()));
+                }
                 if field.is_some()
                     && let Ok(decoded) = quick_xml::escape::unescape(&chunk.into_inner())
                 {
@@ -551,6 +731,18 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, BackendError> {
             }
             Ok(XmlEvent::End(event)) => {
                 let name = event.local_name().into_inner();
+                if depth == 0 {
+                    return Err(BackendError::Malformed("LIST XML 节点层级非法".into()));
+                }
+                depth -= 1;
+                if depth == 0 {
+                    root_closed = true;
+                }
+                if field == Some(Field::Truncated) && !matches!(text.trim(), "true" | "false") {
+                    return Err(BackendError::Malformed(
+                        "LIST IsTruncated 不是布尔值".into(),
+                    ));
+                }
                 if let Some(active) = field
                     && match active {
                         Field::Key => name == "Key",
@@ -566,6 +758,9 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, BackendError> {
                 }
                 if name == "Contents" && in_contents {
                     in_contents = false;
+                    if entry.key.is_empty() {
+                        return Err(BackendError::Malformed("LIST Contents 缺少有效 Key".into()));
+                    }
                     if !entry.key.is_empty() {
                         page.objects.push(RemoteObject {
                             path: std::mem::take(&mut entry.key),
@@ -588,6 +783,16 @@ fn parse_list_page(body: &[u8]) -> Result<ListPage, BackendError> {
         }
         buffer.clear();
     }
+    if !root_seen || !root_closed || depth != 0 || !truncated_seen {
+        return Err(BackendError::Malformed(
+            "LIST 响应为空、不完整或缺少 IsTruncated".into(),
+        ));
+    }
+    if page.truncated && page.next_token.as_ref().is_none_or(String::is_empty) {
+        return Err(BackendError::Malformed(
+            "LIST 已截断但缺少 continuation token".into(),
+        ));
+    }
     Ok(page)
 }
 
@@ -597,27 +802,47 @@ impl S3Backend {
     /// `target("")` 已经处理好两种寻址：path-style 会请求 `PUT /bucket/`，
     /// virtual-host 会请求 `PUT /`（桶名在 Host 里）。
     pub fn create_bucket(&mut self) -> Result<bool, BackendError> {
-        let reply = self.request("PUT", "", &[], Vec::new(), &[])?;
+        let endpoint = url::Url::parse(&self.endpoint)
+            .map_err(|_| BackendError::Config("S3 endpoint URL 非法".into()))?;
+        let is_oss = endpoint
+            .host_str()
+            .is_some_and(|host| host.ends_with(".aliyuncs.com"));
+        let body = if self.region != "us-east-1" && !is_oss {
+            if self
+                .region
+                .chars()
+                .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-')
+            {
+                return Err(BackendError::Config("建桶 region 包含非法字符".into()));
+            }
+            format!("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>", self.region).into_bytes()
+        } else {
+            Vec::new()
+        };
+        let reply = self.request("PUT", "", &[], body, &[])?;
         match reply.status {
             200 | 204 => Ok(true),
-            // 桶已存在（BucketAlreadyOwnedByYou 是 409，部分实现给 200/403）
-            409 => Ok(false),
-            403 => {
-                let (code, _) = parse_error(&reply.body);
-                if code.as_deref() == Some("BucketAlreadyOwnedByYou") {
-                    Ok(false)
-                } else {
-                    self.expect(&reply, "PUT", "（建桶）").map(|_| false)
-                }
+            409 | 403
+                if parse_error(&reply.body).0.as_deref() == Some("BucketAlreadyOwnedByYou") =>
+            {
+                Ok(false)
             }
-            _ => self.expect(&reply, "PUT", "（建桶）").map(|_| false),
+            _ => self.expect(&reply, "PUT create_bucket", "").map(|_| false),
         }
     }
 }
 
 impl RemoteBackend for S3Backend {
     fn ensure_root(&mut self) -> Result<bool, BackendError> {
-        self.create_bucket()
+        let query = vec![
+            ("list-type".into(), "2".into()),
+            ("max-keys".into(), "1".into()),
+            ("prefix".into(), self.full_key("")),
+        ];
+        let reply = self.request("GET", "", &query, Vec::new(), &[])?;
+        self.expect(&reply, "GET ensure_root LIST", "")?;
+        parse_list_page(&reply.body)?;
+        Ok(false)
     }
 
     fn name(&self) -> &str {
@@ -650,8 +875,16 @@ impl RemoteBackend for S3Backend {
         let list_prefix = self.full_key(prefix);
         let mut objects = Vec::new();
         let mut token: Option<String> = None;
+        let mut seen_tokens = std::collections::HashSet::new();
+        let mut pages = 0;
 
         loop {
+            pages += 1;
+            if pages > MAX_LIST_OBJECTS {
+                return Err(BackendError::Malformed(
+                    "LIST 分页次数超过安全上限；未返回不完整结果".into(),
+                ));
+            }
             let mut query: Vec<(String, String)> = vec![
                 ("list-type".to_string(), "2".to_string()),
                 ("max-keys".to_string(), LIST_PAGE_SIZE.to_string()),
@@ -665,24 +898,37 @@ impl RemoteBackend for S3Backend {
 
             let reply = self.request("GET", "", &query, Vec::new(), &[])?;
 
-            self.expect(&reply, "GET", &format!("?list-type=2&prefix={list_prefix}"))?;
+            self.expect(&reply, "GET LIST", "")?;
 
             let page = parse_list_page(&reply.body)?;
             for mut object in page.objects {
-                object.path = self.relative_key(&object.path);
+                if !object.path.starts_with(&list_prefix) {
+                    return Err(BackendError::Malformed(
+                        "LIST 返回了请求前缀之外的对象".into(),
+                    ));
+                }
+                object.path = self.relative_key(&object.path)?;
                 objects.push(object);
             }
-            if objects.len() >= MAX_LIST_OBJECTS {
-                log::warn!("列举结果超过 {MAX_LIST_OBJECTS} 个对象，先按当前批次处理");
-                break;
+            if objects.len() > MAX_LIST_OBJECTS
+                || objects.len() == MAX_LIST_OBJECTS && page.truncated
+            {
+                return Err(BackendError::Malformed(format!(
+                    "LIST 超过 {MAX_LIST_OBJECTS} 个对象；未返回不完整结果"
+                )));
             }
             if !page.truncated {
                 break;
             }
-            match page.next_token {
-                Some(next) => token = Some(next),
-                None => break,
+            let next = page
+                .next_token
+                .ok_or_else(|| BackendError::Malformed("LIST 缺少 continuation token".into()))?;
+            if !seen_tokens.insert(next.clone()) {
+                return Err(BackendError::Malformed(
+                    "LIST continuation token 重复；未返回不完整结果".into(),
+                ));
             }
+            token = Some(next);
         }
 
         Ok(objects)
@@ -751,16 +997,7 @@ impl RemoteBackend for S3Backend {
             Vec::new()
         };
 
-        let mut reply = self.request("PUT", &key, &[], bytes.to_vec(), &extra)?;
-
-        // 桶还不存在（自建 MinIO 的首次使用）：建桶后重试一次。
-        // 这与 WebDAV 侧"父目录缺失 → MKCOL → 重试"是同一套思路。
-        if reply.status == 404 && parse_error(&reply.body).0.as_deref() == Some("NoSuchBucket") {
-            if self.create_bucket()? {
-                log::info!("后端 {} 的桶 {} 不存在，已创建", self.name, self.bucket);
-            }
-            reply = self.request("PUT", &key, &[], bytes.to_vec(), &extra)?;
-        }
+        let reply = self.request("PUT", &key, &[], bytes.to_vec(), &extra)?;
 
         match reply.status {
             // S3 对"新建"与"覆盖"都返回 200，无法区分；调用方只关心 AlreadyExists，
@@ -769,23 +1006,18 @@ impl RemoteBackend for S3Backend {
                 etag: reply.etag.clone(),
             }),
             412 => Ok(PutOutcome::AlreadyExists),
-            // 有些实现不支持条件写：退化为"先查再写"
-            400 | 501 if only_if_absent => {
-                log::debug!("后端 {} 不支持 If-None-Match，退化为 HEAD + PUT", self.name);
-                match self.head(path)? {
-                    Some(_) => Ok(PutOutcome::AlreadyExists),
-                    None => {
-                        let reply = self.request("PUT", &key, &[], bytes.to_vec(), &[])?;
-                        self.expect(&reply, "PUT", &key)?;
-                        Ok(PutOutcome::Created {
-                            etag: reply.etag.clone(),
-                        })
-                    }
-                }
+            // An explicitly unsupported condition is a capability failure, not
+            // permission to race HEAD against an unconditional overwriting PUT.
+            400 | 501 if only_if_absent && conditional_write_unsupported(&reply.body) => {
+                let provider_error = self
+                    .expect(&reply, "PUT conditional", "")
+                    .err()
+                    .map(|err| err.to_string())
+                    .unwrap_or_default();
+                Err(BackendError::Config(format!(
+                    "{provider_error}；S3 条件写能力不受支持；为避免覆盖不可变对象，拒绝非原子 HEAD+PUT 降级"
+                )))
             }
-            409 => Err(BackendError::Conflict(format!(
-                "写入 {key} 冲突（HTTP 409，检查桶是否存在/是否有权限）"
-            ))),
 
             _ => {
                 self.expect(&reply, "PUT", &key)?;
@@ -874,11 +1106,12 @@ mod tests {
             "space-a/v1/items/x.cxi"
         );
         assert_eq!(
-            backend.relative_key("space-a/v1/manifests/a.json"),
+            backend.relative_key("space-a/v1/manifests/a.json").unwrap(),
             "v1/manifests/a.json"
         );
-        // 前缀外的键原样返回（不该发生，但不要静默丢数据）
-        assert_eq!(backend.relative_key("other/key"), "other/key");
+        assert!(backend.relative_key("other/key").is_err());
+        assert!(backend.relative_key("space-ab/key").is_err());
+        assert_eq!(backend.full_key(""), "space-a/");
 
         let mut no_prefix = options();
         no_prefix.prefix = String::new();
@@ -888,7 +1121,7 @@ mod tests {
             "v1/manifests/a.json"
         );
         assert_eq!(
-            backend.relative_key("v1/manifests/a.json"),
+            backend.relative_key("v1/manifests/a.json").unwrap(),
             "v1/manifests/a.json"
         );
     }
@@ -896,7 +1129,7 @@ mod tests {
     #[test]
     fn url_构造_path_style_与_virtual_host() {
         let backend = S3Backend::new(options()).unwrap();
-        let (url, path) = backend.target("v1/items/a b.cxi", &[]);
+        let (url, path) = backend.target("v1/items/a b.cxi", &[]).unwrap();
         assert_eq!(url, "http://127.0.0.1:9000/clipboardx/v1/items/a%20b.cxi");
         assert_eq!(path, "/clipboardx/v1/items/a%20b.cxi");
 
@@ -904,7 +1137,7 @@ mod tests {
         virtual_host.path_style = false;
         virtual_host.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
         let backend = S3Backend::new(virtual_host).unwrap();
-        let (url, path) = backend.target("v1/items/a.cxi", &[]);
+        let (url, path) = backend.target("v1/items/a.cxi", &[]).unwrap();
         assert_eq!(
             url,
             "https://clipboardx.s3.us-east-1.amazonaws.com/v1/items/a.cxi"
@@ -984,6 +1217,7 @@ mod tests {
             size: None,
             server_date_ms: None,
             body: body.to_vec(),
+            hints: Default::default(),
         };
         let unauthorized = backend
             .expect(&make(403, br#"<Error><Code>SignatureDoesNotMatch</Code><Message>bad sig</Message></Error>"#), "GET", "k")
@@ -1005,6 +1239,127 @@ mod tests {
         assert!(text.contains("127.0.0.1:9000"), "{text}");
         assert!(text.contains("clipboardx"), "{text}");
         assert!(text.contains("path-style"), "{text}");
+    }
+
+    #[test]
+    fn oss_defaults_and_bucket_level_virtual_host_urls() {
+        assert!(!default_path_style(None));
+        for endpoint in [
+            "https://oss-cn-beijing.aliyuncs.com",
+            "https://s3.oss-cn-beijing.aliyuncs.com",
+            "https://oss-cn-beijing-internal.aliyuncs.com",
+            "https://s3.eu-west-1.amazonaws.com",
+        ] {
+            assert!(!default_path_style(Some(endpoint)), "{endpoint}");
+        }
+        assert!(default_path_style(Some("http://localhost:9000")));
+        assert!(default_path_style(Some(
+            "https://oss-cn-beijing.aliyuncs.com.attacker.example"
+        )));
+        let mut opts = options();
+        opts.endpoint = Some("https://oss-cn-beijing.aliyuncs.com:9443".into());
+        opts.path_style = false;
+        let backend = S3Backend::new(opts).unwrap();
+        let (target, path) = backend.target("", &[]).unwrap();
+        assert_eq!(
+            target,
+            "https://clipboardx.oss-cn-beijing.aliyuncs.com:9443/"
+        );
+        assert_eq!(path, "/");
+        let parsed = url::Url::parse(&target).unwrap();
+        assert_eq!(
+            &parsed[url::Position::BeforeHost..url::Position::AfterPort],
+            "clipboardx.oss-cn-beijing.aliyuncs.com:9443"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_endpoints_without_echoing_secrets_or_panicking() {
+        for endpoint in [
+            "https://",
+            "https://a:b@host",
+            "https://host/bucket",
+            "https://host?token=secret",
+            "https://host#secret",
+            "https://[broken",
+            "https://host:bad",
+            "https://host/../bucket",
+            "https://host\\evil",
+            "https://host\nsecret",
+        ] {
+            let err = normalize_endpoint(endpoint).unwrap_err();
+            assert!(matches!(err, BackendError::Config(_)));
+            assert!(!err.to_string().contains("secret"));
+        }
+        let backend = S3Backend::new(options()).unwrap();
+        assert!(backend.target("a/../b", &[]).is_err());
+        let mut opts = options();
+        opts.path_style = false;
+        opts.endpoint = Some("https://clipboardx.oss-cn-beijing.aliyuncs.com".into());
+        assert!(S3Backend::new(opts).is_err());
+    }
+
+    #[test]
+    fn list_parser_preserves_opaque_whitespace_and_rejects_non_list_documents() {
+        let page = parse_list_page(b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken> token &amp; </NextContinuationToken><Contents><Key> key </Key></Contents></ListBucketResult>").unwrap();
+        assert_eq!(page.next_token.as_deref(), Some(" token & "));
+        assert_eq!(page.objects[0].path, " key ");
+        for body in [
+            "",
+            "<html></html>",
+            "<Error><Code>AccessDenied</Code></Error>",
+            "<ListBucketResult>",
+            "<ListBucketResult/>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><IsTruncated>true</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><Other><IsTruncated>false</IsTruncated></Other></ListBucketResult>",
+        ] {
+            assert!(parse_list_page(body.as_bytes()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_bad_request_is_not_a_capability_failure() {
+        assert!(!conditional_write_unsupported(
+            b"<Error><Code>InvalidArgument</Code><Message>if-none-match invalid</Message></Error>"
+        ));
+        assert!(!conditional_write_unsupported(
+            b"<Error><Code>NotImplemented</Code><Message>other operation</Message></Error>"
+        ));
+        assert!(conditional_write_unsupported(b"<Error><Code>NotImplemented</Code><Message>conditional writes are not supported</Message></Error>"));
+    }
+
+    #[test]
+    fn diagnostics_preserve_ec_request_id_endpoint_but_redact_secrets() {
+        let backend = S3Backend::new(options()).unwrap();
+        let reply = S3Reply {
+            status: 403, etag: None, last_modified_ms: None, size: None, server_date_ms: None,
+            body: b"<Error><Code>SecondLevelDomainForbidden</Code><Message>use virtual host minioadmin</Message><EC>0003-00001401</EC><RequestId>test-request</RequestId><Endpoint>oss-cn-beijing.aliyuncs.com</Endpoint><Authorization>DO-NOT-LOG</Authorization></Error>".to_vec(),
+            hints: [("Region".into(), "cn-beijing".into())].into_iter().collect(),
+        };
+        let err = backend
+            .expect(&reply, "GET LIST", "private/object")
+            .unwrap_err()
+            .to_string();
+        for expected in [
+            "403",
+            "GET LIST",
+            "SecondLevelDomainForbidden",
+            "0003-00001401",
+            "test-request",
+            "oss-cn-beijing.aliyuncs.com",
+            "cn-beijing",
+        ] {
+            assert!(err.contains(expected), "{err}");
+        }
+        for secret in ["minioadmin", "DO-NOT-LOG", "private/object"] {
+            assert!(!err.contains(secret), "{err}");
+        }
+        assert_eq!(
+            backend.redact("Authorization: AWS4 foo"),
+            "[redacted sensitive server detail]"
+        );
     }
 
     #[test]

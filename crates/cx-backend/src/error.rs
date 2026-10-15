@@ -2,7 +2,7 @@
 //!
 //! 分类原则：**调用方要能据此决定"重试还是放弃"**。
 //! - [`BackendError::is_retryable`]：网络抖动、5xx、429 —— 退避后重试；
-//! - [`BackendError::is_auth`]：401/403 —— 需要用户重新配置凭据，重试没意义。
+//! - [`BackendError::is_auth`]：401/403 —— 认证、授权或 provider 请求策略失败，需检查详细错误码。
 
 /// 后端操作的失败。
 #[derive(Debug, thiserror::Error)]
@@ -21,7 +21,7 @@ pub enum BackendError {
     },
 
     /// 认证失败（401/403）。
-    #[error("认证失败（{status}）：{detail}")]
+    #[error("认证/权限失败（{status}）：{detail}")]
     Unauthorized {
         /// HTTP 状态码。
         status: u16,

@@ -92,7 +92,7 @@ impl TestS3Server {
             signature_failures: Vec::new(),
             skew_offset_ms: 0,
             buckets_created: 0,
-            bucket_exists: false,
+            bucket_exists: true,
             clock: 1_759_323_998_000,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -130,6 +130,11 @@ impl TestS3Server {
             shutdown,
             thread: Some(thread),
         }
+    }
+
+    /// Control initial bucket existence without issuing a cloud-like mutation.
+    pub fn set_bucket_exists(&self, exists: bool) {
+        self.state.lock().unwrap().bucket_exists = exists;
     }
 
     /// 端点 URL（`http://127.0.0.1:port`）。
