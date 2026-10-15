@@ -42,18 +42,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(area);
 
-    let preview_rows = draw_body(frame, chunks[1], app);
+    draw_body(frame, chunks[1], app);
     draw_header(frame, chunks[0], app);
-    draw_footer(frame, chunks[2], app, preview_rows);
+    draw_footer(frame, chunks[2], app);
 
+    app.wizard_hits.clear();
+    app.wizard_kinds.clear();
     if app.show_help {
-        draw_help(frame, area);
+        draw_help(frame, area, app);
     }
     if app.show_panel {
         draw_panel(frame, area, app);
     }
     if let Some(position) = app.pending_delete {
-        draw_confirm_delete(frame, area, position);
+        draw_confirm_delete(frame, area, position, app.pending_delete_name.as_deref());
     }
     if app.wizard.is_some() {
         draw_wizard(frame, area, app);
@@ -65,7 +67,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
 /// 移除后端的确认：与删除历史条目一样，破坏性操作默认"不删"。
 fn draw_confirm_remove(frame: &mut Frame<'_>, area: Rect, name: &str) {
-    let popup = centered(area, 64, 30);
+    let popup = centered(area, 90, 60);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
@@ -97,15 +99,15 @@ fn draw_confirm_remove(frame: &mut Frame<'_>, area: Rect, name: &str) {
 }
 
 /// 删除确认：唯一会真的丢内容的操作，因此单独一个浮层，且默认是"不删"。
-fn draw_confirm_delete(frame: &mut Frame<'_>, area: Rect, position: usize) {
-    let popup = centered(area, 62, 30);
+fn draw_confirm_delete(frame: &mut Frame<'_>, area: Rect, position: usize, name: Option<&str>) {
+    let popup = centered(area, 90, 60);
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
             format!("删除第 {position} 条？"),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
+        Line::from(format!("对象 {}", name.unwrap_or("未知；请重新选择"))),
         Line::from("  只从本机历史里移除。后端对象与其他设备上的副本不受影响，"),
         Line::from("  已复制到别处的内容也不会被追回。"),
         Line::from(""),
@@ -144,10 +146,10 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> usize {
             .split(area)
     };
 
+    app.set_viewport_rows(panes[0].height.saturating_sub(2) as usize);
     draw_history(frame, panes[0], app);
     draw_preview(frame, panes[1], app);
 
-    // 列表内高（去掉上下边框）
     panes[0].height.saturating_sub(2) as usize
 }
 
@@ -161,6 +163,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ]);
     let state = app.status_line();
     let state_style = match &app.status {
+        _ if !app.connected => Style::default().fg(Color::Red),
         None => Style::default().fg(Color::Red),
         Some(status) if status.paused => Style::default().fg(Color::Yellow),
         Some(_) => Style::default().fg(Color::Green),
@@ -224,6 +227,12 @@ fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let inner_top = area.y.saturating_add(1);
     let inner_rows = area.height.saturating_sub(2);
     app.set_list_geometry(inner_top, inner_rows, state.offset());
+    app.list_rect = Rect::new(
+        area.x.saturating_add(1),
+        inner_top,
+        area.width.saturating_sub(2),
+        inner_rows,
+    );
 }
 
 /// 列表标题：条数 + 光标位置，过滤生效时把过滤词也写出来。
@@ -338,7 +347,7 @@ fn kind_label(kind: &str) -> &str {
     }
 }
 
-fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let item = app.selected_item();
     let title = match (item, app.preview_scroll()) {
         (Some(item), 0) => format!(" 内容预览（第 {} 条）", item.position),
@@ -370,10 +379,24 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))]),
     };
 
-    let block = Paragraph::new(text)
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let lines = wrapped_lines(text, inner.width);
+    app.set_preview_geometry(inner, lines.len());
+    let block = Paragraph::new(Text::from(lines))
         .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false })
-        .scroll((app.preview_scroll(), 0));
+        .scroll((
+            if app.selected_preview_state().is_some() {
+                app.preview_scroll()
+            } else {
+                0
+            },
+            0,
+        ));
     frame.render_widget(block, area);
 }
 
@@ -461,7 +484,30 @@ fn preview_text(
     Text::from(lines)
 }
 
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
+/// 显式按终端列宽包装；滚动上限与实际绘制使用同一份行。
+fn wrapped_lines(text: Text<'static>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut result = Vec::new();
+    for line in text.lines {
+        let mut spans = Vec::new();
+        let mut used = 0;
+        for span in line.spans {
+            for ch in span.content.chars() {
+                let columns = Line::from(ch.to_string()).width();
+                if used + columns > width && used > 0 {
+                    result.push(Line::from(std::mem::take(&mut spans)));
+                    used = 0;
+                }
+                spans.push(Span::styled(ch.to_string(), span.style));
+                used += columns;
+            }
+        }
+        result.push(Line::from(spans));
+    }
+    result
+}
+
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.filter_input {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -498,159 +544,227 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, _rows: usize) {
 /// 布局是"标签列 + 输入框列"，焦点行用高亮标出；密文字段只回显 ●；
 /// 提交失败时在字段右侧就地标红，并在下方给一行整体提示。
 fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let Some(form) = app.wizard.as_ref() else {
+    let popup = centered(area, 92, 92);
+    app.modal_rect = popup;
+    frame.render_widget(Clear, popup);
+    let inner = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1),
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
+    let Some(form) = app.wizard.as_mut() else {
         return;
     };
-    let popup = centered(area, 86, 84);
-    frame.render_widget(Clear, popup);
-
-    let fields = form.fields();
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        " 添加同步后端",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-
-    // 类型单选行
-    let mut kind_line = vec![Span::styled(
-        format!("{:<10}", "类型"),
-        Style::default().fg(Color::DarkGray),
-    )];
+    let mut lines = Vec::new();
+    let mut hits: Vec<(usize, u16, u16, Focus)> = Vec::new();
+    let mut kinds = Vec::new();
+    let mut kind_spans = Vec::new();
+    let mut x = 0u16;
     for (index, kind) in WizardKind::ALL.iter().enumerate() {
-        let selected = index == form.kind_index();
-        let focused = matches!(form.focus(), Focus::Kind);
-        let style = match (selected, focused) {
-            (true, true) => Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            (true, false) => Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            (false, _) => Style::default().fg(Color::DarkGray),
+        let label = format!(
+            " {}{} ",
+            if index == form.kind_index() {
+                "◉"
+            } else {
+                "○"
+            },
+            kind.label()
+        );
+        let width = display_width(&label) as u16;
+        let style = if index == form.kind_index() {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
         };
-        kind_line.push(Span::styled(
-            format!(" {} {} ", if selected { "◉" } else { "○" }, kind.label()),
-            style,
-        ));
+        kind_spans.push(Span::styled(label, style));
+        kinds.push((x, width, index));
+        x = x.saturating_add(width);
     }
-    lines.push(Line::from(kind_line));
+    lines.push(Line::from(kind_spans));
     lines.push(Line::from(Span::styled(
-        format!("           {}", form.kind().hint()),
+        clamp_width_value(form.kind().hint().to_string(), inner.width as usize),
         Style::default().fg(Color::DarkGray),
     )));
-    lines.push(Line::from(""));
-
-    // 字段：标签列 + 输入框
-    for (index, field) in fields.iter().enumerate() {
+    if form.kind() == WizardKind::Webdav {
+        lines.push(Line::from(Span::styled(
+            if form.value(2).trim().is_empty() {
+                "认证：匿名（用户名与口令留空）"
+            } else {
+                "认证：账号口令（口令原样保存）"
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let field_start = lines.len();
+    // 每个输入恰占一行。长值显示末尾视口，不让光标落在屏幕外。
+    for (index, field) in form.fields().iter().enumerate() {
         let focused = form.focused_field() == Some(index);
         let invalid = form.is_invalid(index);
-        let label_style = if invalid {
-            Style::default().fg(Color::Red)
-        } else if focused {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let raw = form.value(index);
-        let shown = if field.secret {
-            // 密文只显示长度，既不回显内容也能让人确认"确实输入了"
-            if raw.is_empty() {
-                String::new()
-            } else {
-                format!("{}{}", "●".repeat(raw.chars().count().min(16)), "")
-            }
-        } else {
-            raw.to_string()
-        };
-        let value_style = if invalid {
+        let style = if invalid {
             Style::default().fg(Color::Red)
         } else if focused {
             Style::default().fg(Color::Black).bg(Color::White)
         } else {
             Style::default()
         };
+        let anonymous = form.kind() == WizardKind::Webdav
+            && field.label == "口令"
+            && form.value(2).trim().is_empty();
+        let prefix = format!(
+            "{}{}: ",
+            field.label,
+            if field.required() && !anonymous {
+                "*"
+            } else {
+                ""
+            }
+        );
+        let room = (inner.width as usize)
+            .saturating_sub(display_width(&prefix))
+            .saturating_sub(1);
+        let raw = form.value(index);
+        let shown = if field.secret {
+            "●".repeat(raw.chars().count().min(room))
+        } else {
+            input_tail(raw, room)
+        };
+        let shown = if focused {
+            format!("{shown}▏")
+        } else if shown.is_empty() {
+            "（未填）".to_string()
+        } else {
+            shown
+        };
+        hits.push((lines.len(), 0, inner.width, Focus::Field(index)));
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<10}", field.label), label_style),
             Span::styled(
-                format!("{} ", if field.required() { "*" } else { " " }),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                if focused {
-                    format!("{shown}▏")
-                } else if shown.is_empty() {
-                    "（未填）".to_string()
+                prefix,
+                if invalid {
+                    Style::default().fg(Color::Red)
                 } else {
-                    shown
+                    Style::default().fg(Color::Cyan)
                 },
-                value_style,
             ),
-            Span::styled(
-                format!("   {}", field.help),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(shown, style),
         ]));
     }
-
-    lines.push(Line::from(""));
-    // 按钮
-    let save_style = if matches!(form.focus(), Focus::Save) {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Green)
-    };
-    let cancel_style = if matches!(form.focus(), Focus::Cancel) {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Gray)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
+    let button_line = lines.len();
+    let save = " [ 保存并测试 ] ";
+    let cancel = " [ 取消 ] ";
+    let save_width = display_width(save) as u16;
+    let cancel_width = display_width(cancel) as u16;
+    hits.push((button_line, 0, save_width, Focus::Save));
+    hits.push((
+        button_line,
+        save_width.saturating_add(2),
+        cancel_width,
+        Focus::Cancel,
+    ));
     lines.push(Line::from(vec![
-        Span::styled("          ", Style::default()),
-        Span::styled(" [ 保存并测试 ] ", save_style),
+        Span::styled(
+            save,
+            if form.focus() == Focus::Save {
+                Style::default().fg(Color::Black).bg(Color::Green)
+            } else {
+                Style::default().fg(Color::Green)
+            },
+        ),
         Span::raw("  "),
-        Span::styled(" [ 取消 ] ", cancel_style),
+        Span::styled(
+            cancel,
+            if form.focus() == Focus::Cancel {
+                Style::default().fg(Color::Black).bg(Color::Gray)
+            } else {
+                Style::default().fg(Color::Gray)
+            },
+        ),
     ]));
+    // 错误与当前字段帮助可滚动，不能挤掉字段/按钮。
     if let Some(message) = &form.message {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  {message}"),
-            Style::default().fg(Color::Red),
-        )));
+        lines.extend(wrapped_lines(
+            Text::from(Line::from(Span::styled(
+                message.clone(),
+                Style::default().fg(Color::Red),
+            ))),
+            inner.width,
+        ));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Tab/↑↓ 换行　←→ 选类型　直接输入　Ctrl+Y 填示例　Ctrl+L 清空　回车 保存　Esc 取消　（也可用鼠标点行）",
-        Style::default().fg(Color::DarkGray),
-    )));
-
+    if let Some(index) = form.focused_field() {
+        lines.extend(wrapped_lines(
+            Text::from(Line::from(Span::styled(
+                form.fields()[index].help.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner.width,
+        ));
+    }
+    lines.extend(wrapped_lines(Text::from("Tab/↑↓ 焦点　←→ 类型　Ctrl+Y 示例　Ctrl+L 清空\nEnter 激活（取消不保存）　Esc 取消　PgUp/PgDn/滚轮滚动\n先创建/加入本机加密空间，再连接存储；连接检查不等于同步完成。\n密钥粘贴原样保留（包括空格/换行），请确认未多选字符。"), inner.width));
+    let focus_line = match form.focus() {
+        Focus::Kind => 0,
+        Focus::Field(index) => field_start + index,
+        Focus::Save | Focus::Cancel => button_line,
+    };
+    form.viewport(inner.height, lines.len(), focus_line);
+    let scroll = form.scroll;
+    for (row, x, width, focus) in hits {
+        if row >= scroll as usize
+            && row < scroll as usize + inner.height as usize
+            && x < inner.width
+        {
+            app.wizard_hits.push((
+                Rect::new(
+                    inner.x + x,
+                    inner.y + (row - scroll as usize) as u16,
+                    width.min(inner.width - x),
+                    1,
+                ),
+                focus,
+            ));
+        }
+    }
+    if scroll == 0 && inner.height > 0 {
+        for (x, width, index) in kinds {
+            if x < inner.width {
+                app.wizard_kinds.push((
+                    Rect::new(inner.x + x, inner.y, width.min(inner.width - x), 1),
+                    index,
+                ));
+            }
+        }
+    }
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" 添加后端 ")
+                    .title(" 添加后端（可滚动） ")
                     .border_style(Style::default().fg(Color::Cyan)),
             )
-            .wrap(Wrap { trim: false }),
+            .scroll((scroll, 0)),
         popup,
     );
+}
+
+/// 输入框采用末尾视口；按显示列计算，不截断 UTF-8。
+fn input_tail(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    for ch in text.chars().rev() {
+        let candidate = format!("{ch}{result}");
+        if display_width(&candidate) > width {
+            break;
+        }
+        result = candidate;
+    }
+    result
 }
 /// "后端与连接"面板：后端健康、局域网对端、以及 doctor 里的其余检查。
 ///
 /// 为什么需要它：TUI 原来只看得到"后端 N 个"，看不出**哪个后端在失败、退避到什么时候、
 /// 局域网到底连上没有**——而这些恰恰是"同步不工作"时最先要问的问题。
-fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let popup = centered(area, 78, 74);
+    app.modal_rect = popup;
     frame.render_widget(Clear, popup);
 
     let mut lines: Vec<Line<'static>> = vec![
@@ -668,7 +782,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ))),
         Some(status) if status.backends.is_empty() => {
             lines.push(Line::from(Span::styled(
-                "还没有配置同步后端：内容只留在本机历史里。",
+                "还没有配置同步后端；LAN 独立于云后端，范围请看下方诊断。",
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::from(""));
@@ -682,7 +796,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " 在界面里直接填表添加（类型、字段、密钥都在表单里填，保存前自测）",
+                    " 在界面里填表；交给命令层保存并检查（cx backend add）",
                     Style::default().fg(Color::Cyan),
                 ),
             ]));
@@ -718,7 +832,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 "    server  空间 id + 注册密钥（cx-server token issue 生成）",
             ));
             lines.push(Line::from(
-                "    例：printf '%s' '<SecretAccessKey>' | cx backend add s3 …",
+                "    在表单密文输入，或从安全凭据文件重定向 stdin；不要把密钥写进命令字面量。",
             ));
             lines.push(Line::from(Span::styled(
                 "    凭据落在 secrets/ 下（权限 0600），不会写进 config.toml",
@@ -749,7 +863,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "界面内的配置向导（字段引导 + 密文输入 + 保存前自测）正在开发。",
+                "连接存储 → 创建/加入本机加密空间 → 验证两端收发；连接检查不等于同步完成。",
                 Style::default().fg(Color::Cyan),
             )));
         }
@@ -759,6 +873,8 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     ("○", Style::default().fg(Color::DarkGray))
                 } else if backend.failures > 0 || backend.last_error.is_some() {
                     ("●", Style::default().fg(Color::Red))
+                } else if backend.last_ok_ms.is_none() {
+                    ("?", Style::default().fg(Color::Yellow))
                 } else {
                     ("●", Style::default().fg(Color::Green))
                 };
@@ -845,10 +961,16 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::raw(check.detail.clone()),
             ]));
         }
-    } else {
+    }
+    if let Some(error) = &app.doctor_error {
+        lines.push(Line::from(Span::styled(
+            format!("诊断读取失败：{error}；按 r 重试"),
+            Style::default().fg(Color::Red),
+        )));
+    } else if app.doctor.is_none() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "（正在读取诊断…）",
+            "（正在读取诊断…；按 r 重试）",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -861,11 +983,15 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray),
     )));
 
-    // 引导内容是长文，小终端一屏放不下，因此面板可滚动
+    let lines = wrapped_lines(Text::from(lines), popup.width.saturating_sub(2));
+    app.panel_max_scroll = lines
+        .len()
+        .saturating_sub(popup.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    app.clamp_panel_scroll();
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::default().borders(Borders::ALL).title(" 后端与连接 "))
-            .wrap(Wrap { trim: false })
             .scroll((app.panel_scroll(), 0)),
         popup,
     );
@@ -885,8 +1011,9 @@ fn retry_in(backend: &cx_proto::control::BackendStatus) -> String {
         }
     }
 }
-fn draw_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, 66, 80);
+fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let popup = centered(area, 86, 90);
+    app.modal_rect = popup;
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
@@ -909,7 +1036,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("  p                立即发布本机剪贴板"),
         Line::from("  r                刷新状态与历史"),
         Line::from("  R                重新读取配置"),
-        Line::from("  a                添加同步后端（表单：类型 / 字段 / 密钥，保存前自测）"),
+        Line::from("  a                添加同步后端（表单交给命令层保存并检查）"),
         Line::from("  鼠标             滚轮翻列表；左键点某一行即选中它；表单里点某行即聚焦"),
         Line::from("  d                删除选中项（本机历史，会先确认）"),
         Line::from("  b                后端与连接面板（各后端健康、局域网对端）"),
@@ -925,14 +1052,24 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  界面只读控制套接字：不直接动剪贴板、不直接访问网络。",
+            "  不直接访问网络或剪贴板；通过守护进程操作。",
             Style::default().fg(Color::DarkGray),
         )),
     ];
+    let lines = wrapped_lines(Text::from(lines), popup.width.saturating_sub(2));
+    app.help_max_scroll = lines
+        .len()
+        .saturating_sub(popup.height.saturating_sub(2) as usize)
+        .min(u16::MAX as usize) as u16;
+    app.help_scroll = app.help_scroll.min(app.help_max_scroll);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title(" 帮助 "))
-            .wrap(Wrap { trim: false }),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" 帮助（↑↓/PgUp/PgDn/滚轮滚动，Esc 返回） "),
+            )
+            .scroll((app.help_scroll, 0)),
         popup,
     );
 }
@@ -979,7 +1116,7 @@ pub(crate) fn relative_time(ms: u64) -> String {
     }
 }
 
-/// 绝对时间（本地时区，`MM-DD HH:MM`）。
+/// 绝对时间（UTC，`MM-DD HH:MM UTC`）。
 fn absolute_time(ms: u64) -> String {
     let total_seconds = (ms / 1000) as i64;
     let days = total_seconds.div_euclid(86_400);
@@ -988,7 +1125,7 @@ fn absolute_time(ms: u64) -> String {
     let hour = seconds_of_day / 3600;
     let minute = (seconds_of_day % 3600) / 60;
     let _ = year;
-    format!("{month:02}-{day:02} {hour:02}:{minute:02}")
+    format!("{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -1637,6 +1774,201 @@ mod tests {
         );
         assert!(has(&screen, "y / 回车"), "{screen}");
     }
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn mouse(
+        x: u16,
+        y: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn draw_回填真实列表高度用于分页与预取() {
+        use crossterm::event::KeyCode;
+        for (width, height) in [(80, 24), (60, 20), (120, 30)] {
+            let mut app = app_with(100);
+            render(&mut app, width, height);
+            let rows = app.list_rect.height as usize;
+            assert!(rows > 1);
+            assert_eq!(app.viewport_rows(), rows);
+            assert!(app.take_preview_requests().len() >= rows.min(40));
+            app.on_key(key(KeyCode::PageDown));
+            assert_eq!(app.cursor, rows);
+        }
+    }
+
+    #[test]
+    fn 长单行_cjk_末尾可达且刷新不重置阅读() {
+        let mut app = app_with(1);
+        app.apply(loaded(0, &format!("{}TAIL-END", "中文长行".repeat(200))));
+        render(&mut app, 80, 24);
+        app.preview_scroll_by(10000);
+        let offset = app.preview_scroll();
+        assert!(offset > 10);
+        let screen = render(&mut app, 80, 24);
+        assert!(has(&screen, "TAIL-END"), "{screen}");
+        app.apply(UiEvent::History(vec![item(0, "cli")]));
+        app.apply(UiEvent::Status(Box::new(status(false))));
+        render(&mut app, 80, 24);
+        assert_eq!(app.preview_scroll(), offset);
+        app.forget_previews();
+        render(&mut app, 80, 24);
+        assert_eq!(
+            app.preview_scroll(),
+            offset,
+            "loading must not clamp the saved anchor"
+        );
+        app.apply(loaded(0, &format!("{}TAIL-END", "中文长行".repeat(200))));
+        render(&mut app, 80, 24);
+        assert_eq!(app.preview_scroll(), offset);
+        let screen = render(&mut app, 60, 20);
+        assert!(
+            has(&screen, "TAIL-END"),
+            "resize should retain trailing anchor: {screen}"
+        );
+    }
+
+    #[test]
+    fn 二维鼠标命中且所有浮层都不穿透() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = app_with(20);
+        render(&mut app, 120, 30);
+        let row = app.list_rect.y + 2;
+        let preview_x = app.preview_rect.x;
+        app.on_mouse(mouse(
+            preview_x,
+            row,
+            MouseEventKind::Down(MouseButton::Left),
+        ));
+        assert_eq!(app.cursor, 0, "预览点击不能选历史");
+        app.on_mouse(mouse(
+            app.list_rect.x,
+            row,
+            MouseEventKind::Down(MouseButton::Left),
+        ));
+        assert_eq!(app.cursor, 2);
+        for modal in 0..5 {
+            let mut app = app_with(20);
+            match modal {
+                0 => app.show_help = true,
+                1 => app.show_panel = true,
+                2 => app.wizard = Some(crate::wizard::Wizard::new()),
+                3 => app.pending_delete = Some(0),
+                _ => app.pending_backend_remove = Some("fake".to_string()),
+            }
+            render(&mut app, 120, 30);
+            let x = app.list_rect.x;
+            let y = app.list_rect.y + 2;
+            app.on_mouse(mouse(x, y, MouseEventKind::Down(MouseButton::Left)));
+            app.on_mouse(mouse(x, y, MouseEventKind::ScrollDown));
+            assert_eq!(app.cursor, 0, "modal {modal} 穿透");
+        }
+    }
+
+    #[test]
+    fn 小终端表单焦点与输入尾部可达且鼠标取消不提交() {
+        use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
+        for (width, height) in [(80, 24), (60, 20), (120, 30)] {
+            let mut app = app_with(1);
+            app.on_key(key(KeyCode::Char('a')));
+            app.wizard.as_mut().unwrap().set_kind(2);
+            let count = app.wizard.as_ref().unwrap().fields().len();
+            for index in 0..count {
+                app.wizard.as_mut().unwrap().focus_field(index);
+                let screen = render(&mut app, width, height);
+                assert!(
+                    app.wizard_hits
+                        .iter()
+                        .any(|(_, focus)| *focus == Focus::Field(index)),
+                    "{screen}"
+                );
+            }
+            let form = app.wizard.as_mut().unwrap();
+            form.focus_field(2);
+            for ch in format!("{}VISIBLE-END", "https://example.invalid/".repeat(10)).chars() {
+                form.push_char(ch);
+            }
+            let screen = render(&mut app, width, height);
+            assert!(has(&screen, "VISIBLE-END▏"), "{screen}");
+            app.wizard.as_mut().unwrap().focus_button(false);
+            render(&mut app, width, height);
+            let rect = app
+                .wizard_hits
+                .iter()
+                .find(|(_, focus)| *focus == Focus::Cancel)
+                .unwrap()
+                .0;
+            assert_eq!(
+                app.on_mouse(mouse(
+                    rect.x + 1,
+                    rect.y,
+                    MouseEventKind::Down(MouseButton::Left)
+                )),
+                crate::KeyOutcome::None
+            );
+            assert!(app.wizard.is_none());
+        }
+    }
+
+    #[test]
+    fn 小终端帮助末尾可达且不关闭() {
+        use crossterm::event::KeyCode;
+        for (width, height) in [(80, 24), (60, 20), (120, 30)] {
+            let mut app = app_with(1);
+            app.show_help = true;
+            render(&mut app, width, height);
+            app.on_key(key(KeyCode::End));
+            let screen = render(&mut app, width, height);
+            assert!(app.show_help);
+            assert!(has(&screen, "不直接访问网络"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn 安全与时间文案不误导() {
+        assert!(absolute_time(1_759_323_998_000).ends_with("UTC"));
+        let mut app = app_with(1);
+        assert!(!app.health_line().unwrap().0.contains("只留在本机"));
+        app.apply(UiEvent::Disconnected);
+        assert!(app.status_line().contains("已过期"));
+        app.show_panel = true;
+        let screen = render(&mut app, 180, 70);
+        assert!(!screen.contains("<SecretAccessKey>"));
+        assert!(!has(&screen, "保存前自测"));
+    }
+
+    #[test]
+    fn 诊断失败面板可见且_r_重试不关闭() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with(1);
+        app.show_panel = true;
+        app.apply(UiEvent::Failure {
+            command: "doctor".to_string(),
+            message: "synthetic failure".to_string(),
+        });
+        let screen = render(&mut app, 180, 100);
+        assert!(
+            has(&screen, "诊断读取失败：synthetic failure；按 r 重试"),
+            "{screen}"
+        );
+        assert!(!has(&screen, "正在读取诊断"));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('r'))),
+            crate::KeyOutcome::Doctor
+        );
+        assert!(app.show_panel);
+        assert!(app.doctor_error.is_none());
+    }
+
     #[test]
     fn 空历史时不会_panic() {
         let mut app = App::new();
@@ -1753,6 +2085,6 @@ mod tests {
         assert!(has(&screen, "1 个正在失败"), "{screen}");
         assert!(has(&screen, "按 b"), "{screen}");
         // 状态行本身还在（动态头部高度不能把它挤掉）
-        assert!(has(&screen, "同步中"), "状态行不该被裁掉：{screen}");
+        assert!(has(&screen, "守护进程已连接"), "状态行不该被裁掉：{screen}");
     }
 }

@@ -102,7 +102,7 @@ fn create_bucket_conflicts_are_not_assumed_owned() {
             scripted(vec![(409, format!("<Error><Code>{code}</Code></Error>"))]);
         let result = backend.create_bucket();
         if code == "BucketAlreadyOwnedByYou" {
-            assert_eq!(result.unwrap(), false);
+            assert!(!result.unwrap());
         } else {
             assert!(matches!(result, Err(BackendError::Conflict(_))));
         }

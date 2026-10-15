@@ -522,7 +522,10 @@ impl Engine {
                 report: Box::new(self.doctor()),
             })],
             Command::Reload { id, config } => {
-                if config.backends != self.config.backends || config.space != self.config.space || config.lan != self.config.lan {
+                if config.backends != self.config.backends
+                    || config.space != self.config.space
+                    || config.lan != self.config.lan
+                {
                     return vec![Action::Reply(ReplyPayload::Error { id, body: ErrorBody {
                         code: "restart_required".into(), msg: "后端、空间或局域网配置已变化；请重启守护进程后生效，未将新配置套用到旧连接".into(),
                     } })];
@@ -642,6 +645,7 @@ impl Engine {
                         level: log::Level::Warn,
                         message: format!("写入历史失败：{err}"),
                     });
+                    return actions;
                 }
                 self.seen.insert(&name);
                 self.state.mark_seen(&name);
@@ -1717,7 +1721,7 @@ mod tests {
     #[test]
     fn 重载配置生效() {
         let mut h = Harness::new(Config::default());
-        let mut new_config = Config::default();
+        let mut new_config = h.engine.config.clone();
         new_config.sync.max_item_bytes = 8;
         let actions = h.engine.handle(
             h.now,
