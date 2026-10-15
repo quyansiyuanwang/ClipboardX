@@ -93,12 +93,23 @@ cx backend add webdav dav https://cloud.example.com/remote.php/dav/files/<用户
 
 # S3 兼容（AWS / MinIO / R2 / 阿里云 OSS）
 cx backend add s3 oss --bucket clipboardx --endpoint http://127.0.0.1:9000 --access-key-id <AK> --secret-stdin --path-style
-# 阿里云 OSS：region 必须与端点一致，密钥走 stdin（不进命令行历史）
-printf '%s' '<SecretAccessKey>' | cx backend add s3 oss --bucket <桶> --endpoint https://oss-cn-hangzhou.aliyuncs.com --region cn-hangzhou --prefix clipboardx --access-key-id <AccessKeyId> --secret-stdin
+# 阿里云 OSS：先在控制台创建桶并授权该前缀，自动采用 virtual-host（也可显式 --virtual-host）
+# 运行 --secret-stdin 后从交互标准输入提供密钥，不把 Secret 字面量写入 shell 命令/历史。
+cx backend add s3 oss --bucket <桶> --endpoint https://oss-cn-hangzhou.aliyuncs.com --region cn-hangzhou --prefix clipboardx --access-key-id <AccessKeyId> --secret-stdin --virtual-host
 
 cx backend list          # 查看已配置后端（可配置多个，会同时生效）
-cx backend test <名字>    # 直连测一次（不需要守护进程在运行）
+cx backend test <名字>    # 只读列举/元数据检查；不建桶、不验证写入或删除权限
 ```
+
+默认要求加密：首次使用还需通过 `cx space init --passphrase-stdin` 创建空间并
+`cx space publish <后端名>` 发布元数据，其他设备执行 `cx space join <后端名> --passphrase-stdin`。
+未加入空间或密钥不可读时不会静默转为明文外发；界面仍可查看本机历史与诊断。
+空间初始化/加入后需要重启守护进程以加载密钥和后端 worker。
+
+上传任务先写入每个目标/空间绑定的本机发件箱，断网或重启后继续重试；暂停期间不上传积压。
+修改后端地址、桶、前缀或空间后不会将旧目标的积压转发给新目标；旧队列保留供人工恢复，
+不要为了排障直接清空历史或游标。此版本会对旧时间戳游标做有界重新扫描以补齐漏项。
+零云后端不代表仅本机：启用 LAN 后仍可能与局域网设备同步。
 
 > **注意**：新增或删除后端后需要**重启守护进程**（`cx stop && cx start`）才能生效——
 > `cx reload` 目前只重载引擎侧配置，后端 worker 线程是启动时创建的（这一项正在改进）。

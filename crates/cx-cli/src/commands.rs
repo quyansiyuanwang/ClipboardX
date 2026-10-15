@@ -176,8 +176,8 @@ pub enum ConfigCommand {
 
 /// `cx backend` 的子命令。
 ///
-/// 只改配置文件与凭据文件，**不碰网络**（`test` 除外，它为了能在守护进程未运行时
-/// 也能排障而直接连一次）。
+/// 普通添加/移除只改配置与凭据；`test` 是只读直连探测，server enrollment
+/// 需要显式注册请求。TUI 的保存并测试在配置提交前探测。
 #[derive(Debug, Clone, Subcommand)]
 pub enum BackendCommand {
     /// 列出已配置的后端
@@ -270,9 +270,12 @@ pub enum BackendAddCommand {
         /// 从标准输入读私有密钥（避免出现在命令行历史里）
         #[arg(long)]
         secret_stdin: bool,
-        /// 用 path-style 寻址（MinIO 通常需要；省略时按"自建端点即 path-style"推断）
-        #[arg(long)]
+        /// 强制 path-style 寻址（MinIO 通常需要；默认自动识别 OSS）
+        #[arg(long, conflicts_with = "virtual_host")]
         path_style: bool,
+        /// 强制 virtual-hosted 寻址（阿里云 OSS 要求）
+        #[arg(long, conflicts_with = "path_style")]
+        virtual_host: bool,
         /// 自定义 CA 证书文件名
         #[arg(long)]
         ca_file: Option<String>,
@@ -369,8 +372,10 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
         }
 
         Command::Restart { no_clipboard } => {
+            let no_clipboard = no_clipboard || running_no_clipboard(paths)?.unwrap_or(false);
             let was_running = cx_daemon::stop_running(paths)?;
             let pid = cx_daemon::spawn_background(paths, no_clipboard)?;
+            wait_daemon_ready(paths)?;
             println!(
                 "{}（pid {pid}）",
                 if was_running {
@@ -404,27 +409,38 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             json,
         } => {
             let mut client = ControlClient::connect(paths)?;
-            let mut args = Map::new();
-            args.insert("position".to_string(), json!(position));
+            let mut args = checked_history_args(&mut client, position)?;
             args.insert("max_chars".to_string(), json!(max_chars));
-            let data = client.request(commands::HISTORY_SHOW, args)?;
+            let data = client.request(commands::HISTORY_SHOW_CHECKED, args)?;
             output::preview(&data, json)
         }
 
         Command::Copy { position } => {
             let mut client = ControlClient::connect(paths)?;
-            let mut args = Map::new();
-            args.insert("position".to_string(), json!(position));
-            client.request(commands::COPY, args)?;
+            let args = checked_history_args(&mut client, position)?;
+            client.request(commands::COPY_CHECKED, args)?;
             println!("已把第 {position} 条（0 = 最新）写回剪贴板");
             Ok(ExitCode::SUCCESS)
         }
 
         Command::Delete { position } => {
             let mut client = ControlClient::connect(paths)?;
-            let mut args = Map::new();
-            args.insert("position".to_string(), json!(position));
-            client.request(commands::HISTORY_DELETE, args)?;
+            let args = checked_history_args(&mut client, position)?;
+            eprint!(
+                "删除第 {position} 条本机历史 {}？云端及其他设备不受影响。[y/N] ",
+                args.get("expected_name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+            );
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(DaemonError::io)?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                println!("已取消删除");
+                return Ok(ExitCode::SUCCESS);
+            }
+            client.request(commands::HISTORY_DELETE_CHECKED, args)?;
             // 删除只作用于本机历史：把边界说清楚，别让人以为别的设备上也没了
             println!(
                 "已删除第 {position} 条（0 = 最新）的本机历史。\n\
@@ -456,7 +472,10 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             }
             client.request(commands::PUSH, args)?;
             match content {
-                Some(text) => println!("已发布 {} 字节的文本", text.len()),
+                Some(text) => println!(
+                    "已提交 {} 字节文本的发布请求；是否排队/上传请查看状态和日志",
+                    text.len()
+                ),
                 None => println!("已请求发布当前剪贴板内容"),
             }
             Ok(ExitCode::SUCCESS)
@@ -541,7 +560,7 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                 let passphrase = if no_encrypt {
                     None
                 } else if passphrase_stdin {
-                    Some(read_stdin_text(4096)?.trim().to_string())
+                    Some(strip_line_terminator(read_stdin_text(4096)?))
                 } else {
                     return Err(DaemonError::Protocol(
                         "请用 `--passphrase-stdin` 提供口令（避免出现在命令历史里），\
@@ -573,7 +592,7 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                 passphrase_stdin,
             } => {
                 let passphrase = if passphrase_stdin {
-                    Some(read_stdin_text(4096)?.trim().to_string())
+                    Some(strip_line_terminator(read_stdin_text(4096)?))
                 } else {
                     None
                 };
@@ -625,36 +644,77 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             // 从快捷方式启动时守护进程通常还没起来。这里先确保它在跑，
             // 否则界面会停在"未连接"上，用户看到的就是"黑窗一闪"。
             ensure_daemon_running(paths)?;
-            match cx_tui::run(paths)
-                .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?
-            {
-                cx_tui::TuiExit::Quit => Ok(ExitCode::SUCCESS),
-                cx_tui::TuiExit::ToggleBackend(name) => {
-                    let enabled = set_backend_enabled(paths, &name)?;
-                    let state = if enabled { "已启用" } else { "已停用" };
-                    println!("后端 {name} {state}");
-                    if enabled {
-                        println!("（内容会重新同步到它；首次同步可能拉取较多历史）");
-                    } else {
-                        println!("（已上传到它的对象不会被删除；其他后端不受影响）");
+            let mut app = cx_tui::App::new();
+            loop {
+                let exit = cx_tui::run_with_app(paths, &mut app)
+                    .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?;
+                match exit {
+                    cx_tui::TuiExit::Quit => return Ok(ExitCode::SUCCESS),
+                    cx_tui::TuiExit::AddBackend(draft) => {
+                        match add_backend_from_draft(paths, &draft) {
+                            Ok(()) => {
+                                app.show_panel = true;
+                                app.note("后端已测试并保存，正在更新连接状态");
+                            }
+                            Err(err) => {
+                                let saved = Config::load(paths).ok().is_some_and(|config| {
+                                    config.backend(draft.name().trim()).is_some()
+                                });
+                                if saved {
+                                    app.warn(format!("配置已保存，但运行时更新失败：{err}"));
+                                } else {
+                                    app.wizard =
+                                        Some(cx_tui::Wizard::from_draft(&draft, err.to_string()));
+                                }
+                            }
+                        }
                     }
-                    restart_daemon(paths)?;
-                    Ok(ExitCode::SUCCESS)
-                }
-                cx_tui::TuiExit::RemoveBackend(name) => {
-                    remove_backend(paths, &name)?;
-                    println!("已移除后端 {name}（已上传的对象不在本机，未做删除）");
-                    restart_daemon(paths)?;
-                    Ok(ExitCode::SUCCESS)
-                }
-                cx_tui::TuiExit::AddBackend(draft) => {
-                    // 界面只负责收集，落盘与自测在这里做（同一进程内的库调用）
-                    add_backend_from_draft(paths, &draft)?;
-                    Ok(ExitCode::SUCCESS)
+                    cx_tui::TuiExit::ToggleBackend(name) => {
+                        match set_backend_enabled(paths, &name).and_then(|enabled| {
+                            restart_daemon(paths)?;
+                            Ok(enabled)
+                        }) {
+                            Ok(enabled) => app.note(if enabled {
+                                "后端已启用"
+                            } else {
+                                "后端已停用，云端对象和局域网设置未改变"
+                            }),
+                            Err(err) => app.warn(err.to_string()),
+                        }
+                        app.show_panel = true;
+                    }
+                    cx_tui::TuiExit::RemoveBackend(name) => {
+                        match remove_backend(paths, &name).and_then(|()| restart_daemon(paths)) {
+                            Ok(()) => app.note("后端已移除，云端对象未删除"),
+                            Err(err) => app.warn(err.to_string()),
+                        }
+                        app.show_panel = true;
+                    }
                 }
             }
         }
     }
+}
+
+fn checked_history_args(
+    client: &mut ControlClient,
+    position: usize,
+) -> Result<Map<String, serde_json::Value>, DaemonError> {
+    if position >= 10_000 {
+        return Err(DaemonError::Protocol("历史位置超出可查询上限".into()));
+    }
+    let mut query = Map::new();
+    query.insert("limit".into(), json!(position + 1));
+    let data = client.request(commands::HISTORY_LIST, query)?;
+    let items: Vec<cx_proto::control::HistorySummary> = serde_json::from_value(data)
+        .map_err(|_| DaemonError::Protocol("历史响应无法解析".into()))?;
+    let item = items
+        .get(position)
+        .ok_or_else(|| DaemonError::Protocol("历史位置不存在".into()))?;
+    let mut args = Map::new();
+    args.insert("position".into(), json!(position));
+    args.insert("expected_name".into(), json!(item.name));
+    Ok(args)
 }
 
 /// `cx daemon`：前台运行。
@@ -681,13 +741,7 @@ fn run_daemon(
         }
     };
     let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
-    let space = match LocalSpace::load(paths) {
-        Ok(space) => Some(space),
-        Err(err) => {
-            log::info!("本机还没有空间（{err}），先以本机历史模式运行");
-            None
-        }
-    };
+    let space = load_optional_space(paths)?;
 
     let options = DaemonOptions {
         no_clipboard,
@@ -697,6 +751,20 @@ fn run_daemon(
     let daemon = Daemon::new(paths.clone(), config, identity, space, options);
     let code = daemon.run()?;
     Ok(ExitCode::from(code as u8))
+}
+
+fn load_optional_space(paths: &Paths) -> Result<Option<LocalSpace>, DaemonError> {
+    // An orphan key or unreadable/corrupt metadata is not a first-run state.
+    if cx_core::fsutil::read_to_string_optional(&paths.space_file())?.is_none() {
+        if cx_core::fsutil::read_to_string_optional(&paths.space_key_file())?.is_some() {
+            return Err(DaemonError::Protocol(
+                "空间元数据缺失但密钥仍存在；请恢复空间备份，不会退回明文同步".to_string(),
+            ));
+        }
+        log::info!("尚未创建或加入空间，仅运行本机历史；加密同步需先初始化空间");
+        return Ok(None);
+    }
+    LocalSpace::load(paths).map(Some).map_err(Into::into)
 }
 
 /// 从标准输入读取文本（有上限，避免误操作把巨大文件塞进剪贴板通道）。
@@ -770,15 +838,6 @@ fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<
     );
     Ok(true)
 }
-/// `cx backend` 的实现。
-///
-/// 设计取舍：这里**只改配置与凭据文件**，不碰网络（`Test` 例外——它存在的意义
-/// 就是"守护进程没起来时也能排障"，因此直接连一次）。附带的好处是"添加后端"
-/// 不需要守护进程在运行，安装脚本可以先写好配置再启动。
-/// 确保守护进程在运行（TUI 入口用）。
-///
-/// 已经连得上就直接返回；连不上就按 `cx start` 的方式拉起一个后台守护进程，
-/// 最多等 5 秒等它开始监听。
 /// 翻转某个后端的启用状态，返回新状态。
 ///
 /// 停用只是不在这次运行里为它起 worker：已上传的对象不动、其他后端不受影响，
@@ -813,219 +872,397 @@ fn check_backend_name(name: &str) -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// 从配置里移除一个后端，并清掉它自己的凭据文件。
-///
-/// CLI 的 `cx backend remove` 与界面里的移除都走这里——一份实现，行为不会分叉。
-///
-/// 凭据按**前缀**清理（`<名>.<后缀>`），而不是列举已知后缀：写入侧用过 `.pass`/`.key`，
-/// 表单写入用 `.token`/`.password`/`.secret`，列举迟早会漏掉一种，把凭据留在盘上。
-fn remove_backend(paths: &Paths, name: &str) -> Result<(), DaemonError> {
-    let mut config = Config::load_or_create(paths)?;
-    let before = config.backends.len();
-    config.backends.retain(|backend| backend.name != name);
-    if config.backends.len() == before {
-        return Err(DaemonError::Protocol(format!("没有名为 {name} 的后端")));
-    }
-    config.save(paths)?;
+/// Only credential references are owned by a backend; CA files are never removed.
+fn credential_files(section: &cx_core::BackendSection) -> impl Iterator<Item = &str> {
+    [
+        section.token_file.as_deref(),
+        section.password_file.as_deref(),
+        section.secret_access_key_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+}
 
-    let prefix = format!("{name}.");
-    if let Ok(entries) = std::fs::read_dir(paths.secrets_dir()) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.starts_with(&prefix) {
-                let _ = std::fs::remove_file(entry.path());
-            }
+fn referenced_paths(paths: &Paths, section: &cx_core::BackendSection) -> Vec<std::path::PathBuf> {
+    credential_files(section)
+        .chain(section.ca_file.as_deref())
+        .map(|file| paths.secret_file(file))
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect()
+}
+
+/// Remove only exact, unshared credential references, never filename prefixes or CA files.
+fn remove_backend(paths: &Paths, name: &str) -> Result<(), DaemonError> {
+    let mut config = Config::load(paths)?;
+    let index = config
+        .backends
+        .iter()
+        .position(|backend| backend.name == name)
+        .ok_or_else(|| DaemonError::Protocol(format!("没有名为 {name} 的后端")))?;
+    let removed = config.backends.remove(index);
+    let protected: std::collections::HashSet<_> = config
+        .backends
+        .iter()
+        .flat_map(|section| referenced_paths(paths, section))
+        .chain(removed.ca_file.as_deref().map(|file| {
+            let path = paths.secret_file(file);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        }))
+        .collect();
+    config.save(paths)?;
+    let mut failures = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    for file in credential_files(&removed) {
+        let path = paths.secret_file(file);
+        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if protected.contains(&identity) || !visited.insert(identity) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push(format!("{}：{err}", path.display())),
         }
     }
-    Ok(())
-}
-
-/// 重启守护进程（后端 worker 是启动时创建的，改配置后必须重启才生效）。
-fn restart_daemon(paths: &Paths) -> Result<(), DaemonError> {
-    if cx_daemon::stop_running(paths)? {
-        println!("已重启守护进程以应用改动");
+    if !failures.is_empty() {
+        return Err(DaemonError::Protocol(format!(
+            "后端已移除，但凭据清理失败：{}",
+            failures.join("；")
+        )));
     }
-    let _ = cx_daemon::spawn_background(paths, false);
     Ok(())
 }
 
-/// 把 TUI 表单收集到的草稿落成配置（界面里添加后端的落地口）。
-///
-/// 与 `cx backend add` 走同一套核心逻辑：写 `secrets/` 下的凭据文件 + 追加
-/// `[[backend]]` 段。差别只是凭据来自表单而不是标准输入。
+fn running_no_clipboard(paths: &Paths) -> Result<Option<bool>, DaemonError> {
+    let mut client = match ControlClient::connect(paths) {
+        Ok(client) => client,
+        Err(err) => {
+            if cx_daemon::DaemonInfo::load(paths).is_some_and(|info| info.is_alive()) {
+                return Err(err);
+            }
+            return Ok(None);
+        }
+    };
+    let status = client.simple(commands::STATUS)?;
+    status
+        .get("no_clipboard")
+        .and_then(serde_json::Value::as_bool)
+        .map(Some)
+        .ok_or_else(|| DaemonError::Protocol("无法确认守护进程的剪贴板模式，取消重启".to_string()))
+}
+
+fn wait_daemon_ready(paths: &Paths) -> Result<(), DaemonError> {
+    for _ in 0..50 {
+        if let Ok(mut client) = ControlClient::connect(paths)
+            && client.simple(commands::STATUS).is_ok()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(DaemonError::Protocol(
+        "守护进程启动后未在 5 秒内就绪；请检查运行日志".to_string(),
+    ))
+}
+
+/// Restart only a running daemon, preserving its relay/clipboard mode.
+fn restart_daemon(paths: &Paths) -> Result<(), DaemonError> {
+    restart_with_mode(
+        running_no_clipboard(paths)?,
+        || cx_daemon::stop_running(paths).map(|_| ()),
+        |mode| cx_daemon::spawn_background(paths, mode).map(|_| ()),
+        || wait_daemon_ready(paths),
+    )
+}
+
+fn restart_with_mode(
+    mode: Option<bool>,
+    stop: impl FnOnce() -> Result<(), DaemonError>,
+    spawn: impl FnOnce(bool) -> Result<(), DaemonError>,
+    ready: impl FnOnce() -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    let Some(mode) = mode else {
+        return Ok(());
+    };
+    stop()?;
+    spawn(mode)?;
+    ready()?;
+    println!("已重启守护进程以应用改动");
+    Ok(())
+}
+
+/// Prepare and test a draft before committing configuration. Failures roll back secrets.
 fn add_backend_from_draft(
     paths: &Paths,
     draft: &cx_tui::TuiBackendDraft,
 ) -> Result<(), DaemonError> {
-    use cx_core::config::{BackendKind, BackendSection};
+    add_draft_with_probe(paths, draft, probe_section)?;
+    restart_daemon(paths)
+}
+
+fn add_draft_with_probe(
+    paths: &Paths,
+    draft: &cx_tui::TuiBackendDraft,
+    probe: impl FnOnce(&Paths, &Config, &cx_core::BackendSection) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    use cx_core::BackendKind;
     use cx_tui::WizardKind;
-
     let name = draft.name().trim().to_string();
-    // 后端名会被用作凭据文件名，必须在**写任何文件之前**校验（共用规则）
     check_backend_name(&name)?;
-    let mut config = Config::load_or_create(paths)?;
-    if config.backends.iter().any(|backend| backend.name == name) {
-        return Err(DaemonError::Protocol(format!(
-            "已经有名为 {name} 的后端了（用 `cx backend remove {name}` 先删掉）"
-        )));
-    }
-
-    let mut section = BackendSection {
-        name: name.clone(),
-        kind: match draft.kind {
-            WizardKind::Server => BackendKind::Server,
-            WizardKind::Webdav => BackendKind::Webdav,
-            WizardKind::S3 => BackendKind::S3,
-        },
-        enabled: true,
-        url: None,
-        space: None,
-        token_file: None,
-        username: None,
-        password_file: None,
-        password_env: None,
-        ca_file: None,
-        insecure: false,
-        bucket: None,
-        prefix: None,
-        region: None,
-        endpoint: None,
-        access_key_id: None,
-        secret_access_key_file: None,
-        secret_access_key_env: None,
-        path_style: None,
-        poll_interval_ms: None,
+    let mut config = Config::load(paths)?;
+    ensure_unique_name(&config, &name)?;
+    let kind = match draft.kind {
+        WizardKind::Server => BackendKind::Server,
+        WizardKind::Webdav => BackendKind::Webdav,
+        WizardKind::S3 => BackendKind::S3,
     };
-
-    // 凭据一律写进 secrets/（0600），不落进 config.toml
-    let mut written: Vec<std::path::PathBuf> = Vec::new();
-    let mut save_secret = |label: &str, value: &str| -> Result<String, DaemonError> {
-        let file_name = format!("{name}.{label}");
-        write_secret_file(paths, &file_name, value)?;
-        written.push(paths.secret_file(&file_name));
-        Ok(file_name)
-    };
-
-    let result = (|| -> Result<(), DaemonError> {
-        match draft.kind {
-            WizardKind::Server => {
-                section.url = Some(draft.get("服务端地址").trim().to_string());
-                section.space = Some(draft.get("空间 id").trim().to_string());
-                let secret = draft.get("注册密钥").trim();
-                if !secret.is_empty() {
-                    // 注册密钥 ≠ 设备令牌：它要用去向服务端自助注册、换回一台设备的令牌。
-                    // 直接把注册密钥当令牌写进去，同步时会认证失败——这正是这里要避免的。
-                    let identity = Identity::load_or_create(paths, None)?;
-                    let url = draft.get("服务端地址").trim();
-                    let space = draft.get("空间 id").trim();
-                    let token = cx_backend::enroll(
-                        url,
-                        space,
-                        secret,
-                        &identity.name,
-                        None,
-                        false,
-                        std::time::Duration::from_secs(30),
-                    )
-                    .map_err(|err| DaemonError::Protocol(format!("自助注册失败：{err}")))?;
-                    println!("自助注册成功，已获取设备令牌");
-                    section.token_file = Some(save_secret("token", &token)?);
-                }
+    let mut section = empty_section(name.clone(), kind);
+    let mut secrets = Vec::new();
+    match draft.kind {
+        WizardKind::Server => {
+            section.url = Some(draft.get("服务端地址").trim().to_string());
+            section.space = Some(draft.get("空间 id").trim().to_string());
+            section.token_file = Some(format!("{name}.token"));
+            if draft.get("注册密钥").is_empty() {
+                return Err(DaemonError::Protocol(
+                    "请填写注册密钥以获取设备令牌".to_string(),
+                ));
             }
-            WizardKind::Webdav => {
-                section.url = Some(draft.get("URL").trim().to_string());
-                let user = draft.get("用户名").trim();
-                if !user.is_empty() {
-                    section.username = Some(user.to_string());
-                }
-                let password = draft.get("口令").trim();
-                if !password.is_empty() {
-                    section.password_file = Some(save_secret("password", password)?);
-                } else if user.is_empty() {
+        }
+        WizardKind::Webdav => {
+            section.url = Some(draft.get("URL").trim().to_string());
+            section.username = nonempty(draft.get("用户名"));
+            let password = draft.get("口令");
+            if !password.is_empty() {
+                let file = format!("{name}.password");
+                section.password_file = Some(file.clone());
+                secrets.push((file, password.to_string()));
+            }
+        }
+        WizardKind::S3 => {
+            section.bucket = Some(draft.get("桶名").trim().to_string());
+            section.endpoint = nonempty(draft.get("端点"));
+            section.region = nonempty(draft.get("区域"));
+            section.access_key_id = Some(draft.get("AccessKeyId").trim().to_string());
+            section.prefix = nonempty(draft.get("前缀"));
+            section.path_style = match draft.get("寻址").trim() {
+                "" | "auto" => None,
+                "virtual-host" => Some(false),
+                "path" => Some(true),
+                _ => {
                     return Err(DaemonError::Protocol(
-                        "匿名 WebDAV 也要留空用户名，但至少填 URL".to_string(),
+                        "寻址必须为 auto、virtual-host 或 path".into(),
                     ));
                 }
-            }
-            WizardKind::S3 => {
-                section.bucket = Some(draft.get("桶名").trim().to_string());
-                let endpoint = draft.get("端点").trim();
-                if !endpoint.is_empty() {
-                    section.endpoint = Some(endpoint.to_string());
-                }
-                section.region = Some(draft.get("区域").trim().to_string());
-                section.access_key_id = Some(draft.get("AccessKeyId").trim().to_string());
-                let secret = draft.get("SecretAccessKey").trim();
-                if !secret.is_empty() {
-                    section.secret_access_key_file = Some(save_secret("secret", secret)?);
-                }
-                let prefix = draft.get("前缀").trim();
-                if !prefix.is_empty() {
-                    section.prefix = Some(prefix.to_string());
-                }
+            };
+            let secret = draft.get("SecretAccessKey");
+            if !secret.is_empty() {
+                let file = format!("{name}.secret");
+                section.secret_access_key_file = Some(file.clone());
+                secrets.push((file, secret.to_string()));
             }
         }
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        // 落盘失败就把已经写下的凭据清掉，别留半截文件
-        for path in written {
-            let _ = std::fs::remove_file(path);
-        }
-        return Err(err);
     }
+    validate_addition(&config, &section)?;
+    // Validate all core fields and duplicates before identity creation or enrollment.
+    if draft.kind == WizardKind::Server {
+        let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
+        let token = cx_backend::enroll(
+            section.url.as_deref().unwrap_or_default(),
+            section.space.as_deref().unwrap_or_default(),
+            draft.get("注册密钥"),
+            &identity.name,
+            None,
+            false,
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|err| {
+            DaemonError::Protocol(format!("自助注册失败：{err}；{}", backend_error_tip(&err)))
+        })?;
+        secrets.push((section.token_file.clone().unwrap(), token));
+    }
+    commit_backend(
+        paths,
+        &mut config,
+        section,
+        secrets,
+        probe,
+        |config, paths| config.save(paths).map_err(Into::into),
+    )?;
+    println!("已添加后端 {name}（只读连通性测试通过；写入能力尚未验证）");
+    Ok(())
+}
 
-    config.backends.push(section);
-    // 与 CLI 的 `cx backend add` 保持一致：先整体校验再落盘，
-    // 否则界面可能写进一份连 `cx config check` 都通不过的配置。
-    let problems = config.problems();
-    if !problems.is_empty() {
-        // 校验失败就把刚写下的凭据清掉，别留下"配置没有、密钥还在"的残渣
-        for path in written {
-            let _ = std::fs::remove_file(path);
-        }
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn ensure_unique_name(config: &Config, name: &str) -> Result<(), DaemonError> {
+    if config.backend(name).is_some() {
         return Err(DaemonError::Protocol(format!(
-            "配置有问题，未保存：{}",
-            problems.join("；")
+            "已经有名为 {name} 的后端了；添加不会覆盖现有凭据"
         )));
     }
-    config.save(paths)?;
-    println!("已添加后端 {name}（凭据写入 secrets/，权限 0600）");
+    Ok(())
+}
 
-    // 直连自测：让用户在界面里就能立刻知道配得对不对
-    // 真实探测一次（与 `cx backend test` 同一条路径）：配得对不对当场就知道，
-    // 而不是等守护进程下一轮轮询才在面板里看到红色。
-    match build_named_backend(paths, &name).and_then(|backend| {
-        let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
-        let mut sync = cx_sync::RemoteSync::new(backend, &identity.device_id, &identity.name);
-        sync.probe()
-            .map_err(|err| DaemonError::Protocol(err.to_string()))
-    }) {
-        Ok(summary) => println!("连通性自测：通过（{summary}）"),
-        Err(err) => {
-            println!("连通性自测：失败——{err}");
-            println!("后端已保存，改好后可以再测：cx backend test {name}");
+/// Validate without reading credentials or touching the network.
+fn validate_addition(
+    config: &Config,
+    section: &cx_core::BackendSection,
+) -> Result<(), DaemonError> {
+    check_backend_name(&section.name)?;
+    ensure_unique_name(config, &section.name)?;
+    let mut candidate = config.clone();
+    candidate.backends.push(section.clone());
+    candidate.validate()?;
+    if section.kind == cx_core::BackendKind::Server
+        && section
+            .space
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        return Err(DaemonError::Protocol("服务端空间 id 不能为空".to_string()));
+    }
+    for (label, value) in [
+        ("URL", section.url.as_deref()),
+        ("端点", section.endpoint.as_deref()),
+    ] {
+        if let Some(value) = value {
+            let parsed = url::Url::parse(value)
+                .map_err(|_| DaemonError::Protocol(format!("{label} 必须是合法的 HTTP(S) URL")))?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || (label == "端点" && parsed.path() != "/" && !parsed.path().is_empty())
+            {
+                return Err(DaemonError::Protocol(format!(
+                    "{label} 格式不合法：不能包含凭据、query 或 fragment；S3 端点不能包含路径"
+                )));
+            }
         }
     }
-
-    // 后端 worker 是启动时创建的，因此新增后端要重启守护进程才生效
-    restart_daemon(paths)?;
     Ok(())
+}
+
+/// Own only files successfully created by this operation. Never overwrite old files.
+#[derive(Default)]
+struct CredentialTransaction {
+    created: Vec<std::path::PathBuf>,
+}
+
+impl CredentialTransaction {
+    fn write(&mut self, paths: &Paths, file: &str, value: &str) -> Result<(), DaemonError> {
+        write_secret_file(paths, file, value)?;
+        self.created.push(paths.secret_file(file));
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), DaemonError> {
+        let mut failures = Vec::new();
+        self.created
+            .retain(|path| match std::fs::remove_file(path) {
+                Ok(()) => false,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    failures.push(format!("{}：{err}", path.display()));
+                    true
+                }
+            });
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(DaemonError::Protocol(format!(
+                "凭据回滚失败：{}",
+                failures.join("；")
+            )))
+        }
+    }
+}
+
+impl Drop for CredentialTransaction {
+    fn drop(&mut self) {
+        for path in &self.created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The injected probe/save seams keep failure tests completely offline.
+fn commit_backend(
+    paths: &Paths,
+    config: &mut Config,
+    section: cx_core::BackendSection,
+    secrets: Vec<(String, String)>,
+    probe: impl FnOnce(&Paths, &Config, &cx_core::BackendSection) -> Result<(), DaemonError>,
+    save: impl FnOnce(&Config, &Paths) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    validate_addition(config, &section)?;
+    let original = cx_core::fsutil::read_to_string_optional(&paths.config_file())?;
+    let mut transaction = CredentialTransaction::default();
+    let result = (|| {
+        for (file, value) in &secrets {
+            transaction.write(paths, file, value)?;
+        }
+        probe(paths, config, &section)?;
+        let mut candidate = config.clone();
+        candidate.backends.push(section);
+        if let Err(err) = save(&candidate, paths) {
+            // Config::save can fail after rename (e.g. tightening permissions).
+            let now = cx_core::fsutil::read_to_string_optional(&paths.config_file())?;
+            if now != original {
+                match &original {
+                    Some(text) => {
+                        cx_core::fsutil::write_atomic(&paths.config_file(), text.as_bytes())?
+                    }
+                    None => std::fs::remove_file(paths.config_file()).map_err(DaemonError::io)?,
+                }
+            }
+            return Err(err);
+        }
+        *config = candidate;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        return match transaction.rollback() {
+            Ok(()) => Err(err),
+            Err(rollback) => Err(DaemonError::Protocol(format!("{err}；{rollback}"))),
+        };
+    }
+    transaction.created.clear();
+    Ok(())
+}
+
+fn probe_section(
+    paths: &Paths,
+    config: &Config,
+    section: &cx_core::BackendSection,
+) -> Result<(), DaemonError> {
+    let backend = cx_backend::build_backend(section, paths, std::time::Duration::from_secs(30))
+        .map_err(|err| {
+            DaemonError::Protocol(format!("无法构造后端：{err}；{}", backend_error_tip(&err)))
+        })?;
+    let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
+    let mut sync = cx_sync::RemoteSync::new(backend, &identity.device_id, &identity.name);
+    sync.probe().map(|_| ()).map_err(|err| {
+        DaemonError::Protocol(format!(
+            "连通性测试失败：{err}；{}",
+            backend_error_tip(&err)
+        ))
+    })
 }
 fn ensure_daemon_running(paths: &Paths) -> Result<(), DaemonError> {
     if ControlClient::connect(paths).is_ok() {
         return Ok(());
     }
     cx_daemon::spawn_background(paths, false)?;
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if ControlClient::connect(paths).is_ok() {
-            return Ok(());
-        }
-    }
-    // 起不来也不拦着进界面：界面会显示"未连接"并持续重试
-    Ok(())
+    wait_daemon_ready(paths)
 }
 fn run_backend(paths: &Paths, command: BackendCommand) -> Result<ExitCode, DaemonError> {
     match command {
@@ -1081,7 +1318,7 @@ fn run_backend(paths: &Paths, command: BackendCommand) -> Result<ExitCode, Daemo
             }
             println!("已移除后端 {name}");
             // 说清生效条件：后端 worker 是守护进程启动时创建的，reload 不重建它
-            println!("提示：需要重启守护进程才能生效（cx stop && cx start）。");
+            println!("提示：需要重启守护进程才能生效（cx restart；保留当前剪贴板模式）。");
             Ok(ExitCode::SUCCESS)
         }
 
@@ -1120,91 +1357,68 @@ fn backend_target(backend: &cx_core::BackendSection) -> String {
     }
 }
 
-/// 添加后端。
+/// Add CLI configuration without silently overwriting credentials or doing a test.
 fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonError> {
-    // 名字会成为凭据文件名，而下面每个分支都会**先写凭据**、末尾才整体校验配置，
-    // 因此必须先在这里把名字校验掉（与表单入口共用同一条规则）。
-    let pending_name = match &kind {
+    let name = match &kind {
         BackendAddCommand::Webdav { name, .. }
         | BackendAddCommand::Server { name, .. }
         | BackendAddCommand::S3 { name, .. } => name.trim().to_string(),
     };
-    check_backend_name(&pending_name)?;
-
-    let mut config = Config::load_or_create(paths)?;
-    let section = match kind {
+    check_backend_name(&name)?;
+    let mut config = Config::load(paths)?;
+    if let Err(err) = ensure_unique_name(&config, &name) {
+        eprintln!("{err}");
+        return Ok(false);
+    }
+    let mut section;
+    match &kind {
         BackendAddCommand::Webdav {
-            name,
             url,
             username,
             password_stdin,
             ca_file,
             insecure,
+            ..
         } => {
-            let mut section = empty_section(name, cx_core::BackendKind::Webdav);
-            section.url = Some(url);
-            section.username = username;
-            section.ca_file = ca_file;
-            section.insecure = insecure;
-            if password_stdin {
-                if section.username.is_some() {
-                    let file = format!("{}.pass", section.name);
-                    write_secret_file(paths, &file, &read_secret_stdin("口令")?)?;
-                    section.password_file = Some(file);
-                } else {
-                    eprintln!(
-                        "注意：没有 --username 时忽略 --password-stdin（匿名 WebDAV 不需要口令）"
-                    );
-                }
+            section = empty_section(name.clone(), cx_core::BackendKind::Webdav);
+            section.url = Some(url.trim().to_string());
+            section.username = username.as_deref().and_then(nonempty);
+            section.ca_file = ca_file.clone();
+            section.insecure = *insecure;
+            if *password_stdin && section.username.is_some() {
+                section.password_file = Some(format!("{name}.pass"));
             }
-            section
         }
         BackendAddCommand::Server {
-            name,
             url,
             space,
             token_stdin,
             enroll_secret,
             ca_file,
             insecure,
+            ..
         } => {
-            let mut section = empty_section(name, cx_core::BackendKind::Server);
-            section.url = Some(url.clone());
-            section.space = Some(space.clone());
-            section.insecure = insecure;
-            let ca_path = ca_file.clone().map(|file| paths.secret_file(&file));
-            section.ca_file = ca_file;
-
-            let token = if let Some(secret) = enroll_secret {
-                let identity = Identity::load_or_create(paths, None)?;
-                let token = cx_backend::enroll(
-                    &url,
-                    &space,
-                    &secret,
-                    &identity.name,
-                    ca_path,
-                    insecure,
-                    std::time::Duration::from_secs(30),
-                )
-                .map_err(|err| DaemonError::Protocol(format!("自助注册失败：{err}")))?;
-                println!("自助注册成功，已获取设备令牌");
-                token
-            } else if token_stdin {
-                read_secret_stdin("设备令牌")?
-            } else {
+            section = empty_section(name.clone(), cx_core::BackendKind::Server);
+            section.url = Some(url.trim().to_string());
+            section.space = Some(space.trim().to_string());
+            section.ca_file = ca_file.clone();
+            section.insecure = *insecure;
+            if *token_stdin && enroll_secret.is_some() {
                 return Err(DaemonError::Protocol(
-                    "请用 --token-stdin 提供设备令牌（管理员签发），或用 --enroll-secret 自助注册"
-                        .to_string(),
+                    "--token-stdin 与 --enroll-secret 只能选一个".to_string(),
                 ));
-            };
-
-            let file = format!("{}.token", section.name);
-            write_secret_file(paths, &file, &token)?;
-            section.token_file = Some(file);
-            section
+            }
+            if !*token_stdin && enroll_secret.is_none() {
+                return Err(DaemonError::Protocol(
+                    "请用 --token-stdin 提供设备令牌，或用 --enroll-secret 自助注册".to_string(),
+                ));
+            }
+            if enroll_secret.as_deref() == Some("") {
+                return Err(DaemonError::Protocol("注册密钥不能为空".to_string()));
+            }
+            section.token_file = Some(format!("{name}.token"));
         }
         BackendAddCommand::S3 {
-            name,
             bucket,
             endpoint,
             region,
@@ -1212,61 +1426,98 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
             access_key_id,
             secret_stdin,
             path_style,
+            virtual_host,
             ca_file,
             insecure,
+            ..
         } => {
-            let mut section = empty_section(name, cx_core::BackendKind::S3);
-            section.bucket = Some(bucket);
-            section.endpoint = endpoint;
-            section.region = region;
-            section.prefix = prefix;
-            section.access_key_id = Some(access_key_id);
-            section.ca_file = ca_file;
-            section.insecure = insecure;
-            // 省略时由后端按"有无自定义端点"推断（自建端点默认 path-style）
-            section.path_style = if path_style { Some(true) } else { None };
-            if secret_stdin {
-                let file = format!("{}.key", section.name);
-                write_secret_file(paths, &file, &read_secret_stdin("私有密钥")?)?;
-                section.secret_access_key_file = Some(file);
-            } else {
-                eprintln!(
-                    "提示：没给 --secret-stdin；之后可重跑本命令或手写 secret_access_key_file"
-                );
+            section = empty_section(name.clone(), cx_core::BackendKind::S3);
+            section.bucket = Some(bucket.trim().to_string());
+            section.endpoint = endpoint.clone();
+            section.region = region.clone();
+            section.prefix = prefix.clone();
+            section.access_key_id = Some(access_key_id.trim().to_string());
+            section.ca_file = ca_file.clone();
+            section.insecure = *insecure;
+            if *path_style && *virtual_host {
+                return Err(DaemonError::Protocol(
+                    "--path-style 与 --virtual-host 只能选一个".to_string(),
+                ));
             }
-            section
+            section.path_style = if *path_style {
+                Some(true)
+            } else if *virtual_host {
+                Some(false)
+            } else {
+                None
+            };
+            if *secret_stdin {
+                section.secret_access_key_file = Some(format!("{name}.key"));
+            }
         }
-    };
-
-    if config
-        .backends
-        .iter()
-        .any(|backend| backend.name == section.name)
-    {
-        eprintln!(
-            "已经有名为 {} 的后端了（先 `cx backend remove {}`）",
-            section.name, section.name
-        );
+    }
+    if let Err(err) = validate_addition(&config, &section) {
+        eprintln!("配置有问题，未保存：{err}");
         return Ok(false);
     }
-
-    let name = section.name.clone();
-    config.backends.push(section);
-    // 先校验再落盘：宁可不保存，也不要留下一份自己都通不过的配置
-    let problems = config.problems();
-    if !problems.is_empty() {
-        eprintln!("配置有问题，未保存：");
-        for problem in &problems {
-            eprintln!("  - {problem}");
+    let mut secrets = Vec::new();
+    match kind {
+        BackendAddCommand::Webdav {
+            password_stdin: true,
+            ..
+        } => {
+            if let Some(file) = &section.password_file {
+                secrets.push((file.clone(), read_secret_stdin("口令")?));
+            } else {
+                eprintln!("注意：匿名 WebDAV 不读取或保存口令");
+            }
         }
-        return Ok(false);
+        BackendAddCommand::Server { enroll_secret, .. } => {
+            let token = if let Some(secret) = enroll_secret {
+                let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
+                cx_backend::enroll(
+                    section.url.as_deref().unwrap_or_default(),
+                    section.space.as_deref().unwrap_or_default(),
+                    &secret,
+                    &identity.name,
+                    section
+                        .ca_file
+                        .as_deref()
+                        .map(|file| paths.secret_file(file)),
+                    section.insecure,
+                    std::time::Duration::from_secs(30),
+                )
+                .map_err(|err| {
+                    DaemonError::Protocol(format!(
+                        "自助注册失败：{err}；{}",
+                        backend_error_tip(&err)
+                    ))
+                })?
+            } else {
+                read_secret_stdin("设备令牌")?
+            };
+            secrets.push((section.token_file.clone().unwrap(), token));
+        }
+        BackendAddCommand::S3 {
+            secret_stdin: true, ..
+        } => {
+            secrets.push((
+                section.secret_access_key_file.clone().unwrap(),
+                read_secret_stdin("私有密钥")?,
+            ));
+        }
+        _ => {}
     }
-    config.save(paths)?;
-
+    commit_backend(
+        paths,
+        &mut config,
+        section,
+        secrets,
+        |_, _, _| Ok(()),
+        |config, paths| config.save(paths).map_err(Into::into),
+    )?;
     println!("已添加后端 {name}");
-    // 别写成"cx reload 即可"：reload 只重载引擎侧配置，后端 worker 是守护进程启动时
-    // 创建的，新增后端必须重启才会真正开始同步（这条引导之前是错的）。
-    println!("下一步：cx backend test {name}   然后重启守护进程生效：cx restart");
+    println!("下一步：cx backend test {name}   测试通过后再重启守护进程：cx restart");
     Ok(true)
 }
 
@@ -1296,31 +1547,95 @@ fn empty_section(name: String, kind: cx_core::BackendKind) -> cx_core::BackendSe
     }
 }
 
-/// 从标准输入读一条凭据（去掉首尾空白）。
+/// Remove exactly one stdin line terminator, never password whitespace.
+fn strip_line_terminator(mut value: String) -> String {
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    value
+}
+
 fn read_secret_stdin(label: &str) -> Result<String, DaemonError> {
     eprint!("请输入{label}（回车结束）：");
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
-        .map_err(|err| DaemonError::Protocol(format!("读取{label}失败：{err}")))?;
-    let value = line.trim().to_string();
+        .map_err(DaemonError::io)?;
+    let value = strip_line_terminator(line);
     if value.is_empty() {
         return Err(DaemonError::Protocol(format!("{label}不能为空")));
     }
     Ok(value)
 }
 
-/// 写入凭据文件（尽量收紧权限）。
+/// Exclusive creation: even orphaned credentials must never be overwritten.
 fn write_secret_file(paths: &Paths, file_name: &str, value: &str) -> Result<(), DaemonError> {
+    use std::io::Write;
     let path = paths.secret_file(file_name);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| DaemonError::Protocol(format!("创建凭据目录失败：{err}")))?;
+        std::fs::create_dir_all(parent).map_err(DaemonError::io)?;
+        cx_core::fsutil::tighten_permissions(parent, true)?;
     }
-    cx_core::fsutil::write_atomic(&path, value.as_bytes())
-        .map_err(|err| DaemonError::Protocol(format!("写入凭据文件失败：{err}")))?;
-    let _ = cx_core::fsutil::tighten_permissions(&path, false);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|err| {
+        DaemonError::Protocol(format!(
+            "创建凭据文件失败（不会覆盖已有文件）{}：{err}",
+            path.display()
+        ))
+    })?;
+    let result = (|| -> Result<(), DaemonError> {
+        file.write_all(value.as_bytes()).map_err(DaemonError::io)?;
+        file.sync_all().map_err(DaemonError::io)?;
+        cx_core::fsutil::tighten_permissions(&path, false)?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(err) = result {
+        if let Err(cleanup) = std::fs::remove_file(&path) {
+            return Err(DaemonError::Protocol(format!(
+                "{err}；清理凭据失败：{cleanup}"
+            )));
+        }
+        return Err(err);
+    }
     Ok(())
+}
+
+fn backend_error_tip(err: &cx_backend::BackendError) -> &'static str {
+    let detail = err.to_string();
+    if detail.contains("SecondLevelDomainForbidden") {
+        "OSS 要求 virtual-hosted 寻址；使用 --virtual-host（或 path_style=false），不要扩大 RAM 权限"
+    } else if detail.contains("SignatureDoesNotMatch") {
+        "核对签名区域、端点/寻址及密钥原始字节；不要把所有签名错误都当成权限不足"
+    } else if detail.contains("InvalidAccessKeyId") {
+        "AccessKeyId 不存在或已停用；核对账号与凭据来源"
+    } else if detail.contains("ExpiredToken") || detail.contains("InvalidToken") {
+        "临时凭据已过期或不完整；更新 STS 凭据（含 session token），不要只替换 Secret"
+    } else if detail.contains("RequestTimeTooSkewed") || detail.contains("RequestExpired") {
+        "检查系统时间与时间同步后重试"
+    } else if detail.contains("AuthorizationHeaderMalformed")
+        || detail.contains("PermanentRedirect")
+        || detail.contains("IncorrectEndpoint")
+    {
+        "核对桶所属区域和服务端建议的 endpoint；不要将桶域名重复作为服务端点，也不要关闭 TLS"
+    } else if detail.contains("AccessDenied") {
+        "核对该桶及对象前缀的 List/Get 权限与显式 Deny；403 不证明桶属于别人，也不要求 ListBuckets 或建桶权限"
+    } else if err.is_auth() {
+        "区分认证与授权：核对账号/凭据及目标桶或目录权限；不建议反复删除重加或授予管理权限"
+    } else if err.kind() == "config" || err.kind() == "credentials" {
+        "检查配置字段和凭据文件/环境变量；不要删除可用凭据或关闭 TLS 来绕过错误"
+    } else {
+        "检查 DNS、网络、TLS 信任与端点/区域；只读测试不验证写入权限，请勿关闭 TLS 校验"
+    }
 }
 
 /// 直连测试一个后端（不需要守护进程在运行）。
@@ -1343,13 +1658,7 @@ fn test_backend(paths: &Paths, name: &str) -> Result<bool, DaemonError> {
         }
         Err(err) => {
             eprintln!("后端 {name} 不可用：{err}");
-            if err.is_auth() {
-                eprintln!("提示：检查用户名/口令（S3 则是 access key 与 secret）是否正确。");
-            } else if err.kind() == "config" {
-                eprintln!("提示：`cx backend remove {name}` 后用 `cx backend add` 重新添加。");
-            } else {
-                eprintln!("提示：确认网络可达、地址正确；自建服务端需先建好桶或目录。");
-            }
+            eprintln!("提示：{}", backend_error_tip(&err));
             Ok(false)
         }
     }
@@ -1384,7 +1693,7 @@ mod backend_tests {
             enabled: true,
             url: Some("http://127.0.0.1:8688".to_string()),
             space: Some("space-1".to_string()),
-            token_file: None,
+            token_file: Some("home.token".to_string()),
             username: None,
             password_file: None,
             password_env: None,
@@ -1415,11 +1724,7 @@ mod backend_tests {
             "移除后配置里不该还有它"
         );
         assert!(!token.exists(), "凭据文件应当被清掉：{}", token.display());
-        assert!(
-            !pass.exists(),
-            "按前缀清理就该覆盖所有历史命名：{}",
-            pass.display()
-        );
+        assert!(pass.exists(), "未被引用的旧文件不能仅凭名字前缀删除");
 
         // 再移除一次应当明确报错，而不是静默成功
         let err = super::remove_backend(&paths, "home").unwrap_err();
@@ -1437,7 +1742,7 @@ mod backend_tests {
             enabled: true,
             url: Some("http://127.0.0.1:8688".to_string()),
             space: Some("space-1".to_string()),
-            token_file: None,
+            token_file: Some("home.token".to_string()),
             username: None,
             password_file: None,
             password_env: None,
@@ -1487,6 +1792,7 @@ mod backend_tests {
                 access_key_id: "AK".to_string(),
                 secret_stdin: true,
                 path_style: false,
+                virtual_host: false,
                 ca_file: None,
                 insecure: false,
             },
@@ -1541,29 +1847,535 @@ mod backend_tests {
     }
 
     #[test]
-    fn 表单添加服务端会真的去自助注册而不是把密钥当令牌() {
+    fn 表单添加服务端先校验字段再自助注册() {
         use cx_tui::{BackendDraft, WizardKind};
         let paths = temp_paths("draft-server");
         let draft = BackendDraft {
             kind: WizardKind::Server,
             values: vec![
                 "home".to_string(),
-                // 不可达地址：注册必然失败，正好用来证明"确实去注册了"
-                "http://127.0.0.1:1".to_string(),
+                // Invalid URL must fail before enrollment, identity creation, or any IO.
+                "invalid-url".to_string(),
                 "space-1".to_string(),
                 "SECRET-abc".to_string(),
             ],
         };
         let err = super::add_backend_from_draft(&paths, &draft).unwrap_err();
-        assert!(
-            err.to_string().contains("自助注册失败"),
-            "应当去自助注册并把它失败的原因报出来，而不是把注册密钥当令牌存下：{err}"
-        );
+        assert!(err.to_string().contains("URL"), "应先校验 URL：{err}");
+        assert!(!paths.identity_file().exists());
         assert!(
             Config::load(&paths).unwrap().backends.is_empty(),
             "注册失败不该留下半截后端配置"
         );
         let _ = std::fs::remove_dir_all(paths.data_dir.parent().unwrap_or(&paths.data_dir));
+    }
+
+    #[test]
+    fn duplicate_name_rejects_before_stdin_and_preserves_credentials() {
+        let paths = temp_paths("duplicate-secret");
+        let mut config = Config::default();
+        let mut section = empty_section("dav".into(), cx_core::BackendKind::Webdav);
+        section.url = Some("https://example.invalid/dav".into());
+        section.username = Some("fake".into());
+        section.password_file = Some("dav.pass".into());
+        config.backends.push(section);
+        config.save(&paths).unwrap();
+        write_secret_file(&paths, "dav.pass", " original password ").unwrap();
+        let before = std::fs::read(paths.config_file()).unwrap();
+        assert!(
+            !add_backend(
+                &paths,
+                BackendAddCommand::Webdav {
+                    name: " dav ".into(),
+                    url: "https://example.invalid/other".into(),
+                    username: Some("other".into()),
+                    password_stdin: true,
+                    ca_file: None,
+                    insecure: false,
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(paths.secret_file("dav.pass")).unwrap(),
+            b" original password "
+        );
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        // Server duplicate must also be rejected before enrollment or identity creation.
+        assert!(
+            !add_backend(
+                &paths,
+                BackendAddCommand::Server {
+                    name: "dav".into(),
+                    url: "https://example.invalid".into(),
+                    space: "fake".into(),
+                    token_stdin: false,
+                    enroll_secret: Some("fake".into()),
+                    ca_file: None,
+                    insecure: false,
+                }
+            )
+            .unwrap()
+        );
+        assert!(!paths.identity_file().exists());
+        let draft = cx_tui::BackendDraft {
+            kind: cx_tui::WizardKind::Webdav,
+            values: vec![
+                "dav".into(),
+                "https://example.invalid/new".into(),
+                "other".into(),
+                "replacement".into(),
+            ],
+        };
+        assert!(
+            add_draft_with_probe(&paths, &draft, |_, _, _| panic!(
+                "duplicate draft must not probe"
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(paths.secret_file("dav.pass")).unwrap(),
+            b" original password "
+        );
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!paths.secret_file("dav.password").exists());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_exact_custom_shared_and_dotted_references() {
+        let paths = temp_paths("remove-exact");
+        let mut config = Config::default();
+        for (name, credential) in [
+            ("a", "custom-token"),
+            ("a.b", "a.b.token"),
+            ("sharing", "shared.pass"),
+        ] {
+            let mut section = empty_section(name.into(), cx_core::BackendKind::Server);
+            section.url = Some("https://example.invalid".into());
+            section.space = Some("fake-space".into());
+            section.token_file = Some(credential.into());
+            config.backends.push(section);
+        }
+        config.backends[0].password_file = None;
+        config.backends[0].secret_access_key_file = Some("shared.pass".into());
+        config.backends[0].ca_file = Some("a.ca".into());
+        // A credential file can also be a CA reference of a remaining backend.
+        config.backends[0].password_file = Some("protected-ca".into());
+        config.backends[2].ca_file = Some("./protected-ca".into());
+        // Server forbids token + password, so use WebDAV for this synthetic multi-reference fixture.
+        config.backends[0].kind = cx_core::BackendKind::Webdav;
+        config.backends[0].username = Some("fake".into());
+        config.save(&paths).unwrap();
+        for file in [
+            "custom-token",
+            "a.b.token",
+            "shared.pass",
+            "a.ca",
+            "protected-ca",
+            "a.unreferenced",
+        ] {
+            write_secret_file(&paths, file, file).unwrap();
+        }
+        remove_backend(&paths, "a").unwrap();
+        assert!(!paths.secret_file("custom-token").exists());
+        for file in [
+            "a.b.token",
+            "shared.pass",
+            "a.ca",
+            "protected-ca",
+            "a.unreferenced",
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(paths.secret_file(file)).unwrap(),
+                file
+            );
+        }
+        assert_eq!(Config::load(&paths).unwrap().backends.len(), 2);
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_reports_credential_cleanup_failure() {
+        let paths = temp_paths("remove-cleanup-fail");
+        let mut config = Config::default();
+        config.backends.push(fake_secret_section("fake"));
+        config.save(&paths).unwrap();
+        std::fs::create_dir(paths.secret_file("fake.pass")).unwrap();
+        let err = remove_backend(&paths, "fake").unwrap_err();
+        assert!(err.to_string().contains("清理失败"));
+        assert!(Config::load(&paths).unwrap().backends.is_empty());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    fn fake_secret_section(name: &str) -> cx_core::BackendSection {
+        let mut section = empty_section(name.into(), cx_core::BackendKind::Webdav);
+        section.url = Some("https://example.invalid/dav".into());
+        section.username = Some("fake".into());
+        section.password_file = Some(format!("{name}.pass"));
+        section
+    }
+
+    #[test]
+    fn invalid_config_rejects_before_any_transaction_write() {
+        let paths = temp_paths("invalid-config-rollback");
+        let mut config = Config::default();
+        let mut invalid = fake_secret_section("new");
+        invalid.url = Some(" ".into());
+        assert!(
+            commit_backend(
+                &paths,
+                &mut config,
+                invalid,
+                vec![("new.pass".into(), "fake".into())],
+                |_, _, _| panic!("invalid config must not probe"),
+                |_, _| panic!("invalid config must not save")
+            )
+            .is_err()
+        );
+        assert!(!paths.secret_file("new.pass").exists());
+        assert!(!paths.config_file().exists());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_probe_rolls_back_secret_and_never_saves_config() {
+        let paths = temp_paths("probe-rollback");
+        let mut config = Config::default();
+        let err = commit_backend(
+            &paths,
+            &mut config,
+            fake_secret_section("new"),
+            vec![("new.pass".into(), " secret ".into())],
+            |paths, _, _| {
+                assert!(
+                    !paths.config_file().exists(),
+                    "probe must happen before config commit"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(paths.secret_file("new.pass")).unwrap(),
+                    " secret "
+                );
+                Err(DaemonError::Protocol("mock probe failure".into()))
+            },
+            |_, _| panic!("failed probe must not save"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mock probe failure"));
+        assert!(config.backends.is_empty());
+        assert!(!paths.config_file().exists());
+        assert!(!paths.secret_file("new.pass").exists());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_save_rolls_back_new_credentials_and_restores_config_bytes() {
+        let paths = temp_paths("save-rollback");
+        let mut config = Config::default();
+        config.save(&paths).unwrap();
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let err = commit_backend(
+            &paths,
+            &mut config,
+            fake_secret_section("new"),
+            vec![("new.pass".into(), "fake secret".into())],
+            |_, _, _| Ok(()),
+            |candidate, paths| {
+                candidate.save(paths)?;
+                Err(DaemonError::Protocol(
+                    "mock post-rename save failure".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mock post-rename"));
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(config.backends.is_empty());
+        assert!(!paths.secret_file("new.pass").exists());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_first_save_removes_new_config_and_secret() {
+        let paths = temp_paths("first-save-rollback");
+        let mut config = Config::default();
+        let err = commit_backend(
+            &paths,
+            &mut config,
+            fake_secret_section("new"),
+            vec![("new.pass".into(), "fake".into())],
+            |_, _, _| Ok(()),
+            |candidate, paths| {
+                candidate.save(paths)?;
+                Err(DaemonError::Protocol("mock first save failure".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("first save"));
+        assert!(!paths.config_file().exists());
+        assert!(!paths.secret_file("new.pass").exists());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn config_save_io_failure_rolls_back_secret_without_touching_old_config() {
+        let paths = temp_paths("save-io-failure");
+        let mut config = Config::default();
+        config.save(&paths).unwrap();
+        let before = std::fs::read(paths.config_file()).unwrap();
+        // Force an actual rename/write failure at a directory target, without relying on temp names.
+        assert!(
+            commit_backend(
+                &paths,
+                &mut config,
+                fake_secret_section("new"),
+                vec![("new.pass".into(), "fake".into())],
+                |_, _, _| Ok(()),
+                |_, paths| cx_core::fsutil::write_atomic(
+                    &paths.config_dir,
+                    b"cannot-replace-directory"
+                )
+                .map_err(Into::into)
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!paths.secret_file("new.pass").exists());
+        assert!(config.backends.is_empty());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_draft_test_returns_error_with_no_config_or_credentials() {
+        let paths = temp_paths("draft-probe-fail");
+        let draft = cx_tui::BackendDraft {
+            kind: cx_tui::WizardKind::Webdav,
+            values: vec![
+                "fake".into(),
+                "https://example.invalid/dav".into(),
+                "user".into(),
+                " secret ".into(),
+            ],
+        };
+        let err = add_draft_with_probe(&paths, &draft, |paths, _, _| {
+            assert!(!paths.config_file().exists());
+            Err(DaemonError::Protocol("mock denied".into()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("mock denied"));
+        assert!(!paths.config_file().exists());
+        assert_eq!(std::fs::read_dir(paths.secrets_dir()).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn create_new_collision_keeps_orphan_secret_and_rolls_back_earlier_writes() {
+        let paths = temp_paths("secret-collision");
+        write_secret_file(&paths, "existing", "must survive").unwrap();
+        let mut config = Config::default();
+        assert!(
+            commit_backend(
+                &paths,
+                &mut config,
+                fake_secret_section("new"),
+                vec![
+                    ("new.pass".into(), "fake".into()),
+                    ("existing".into(), "replacement".into())
+                ],
+                |_, _, _| panic!("collision must precede probe"),
+                |_, _| panic!("must not save")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.secret_file("existing")).unwrap(),
+            "must survive"
+        );
+        assert!(!paths.secret_file("new.pass").exists());
+        assert!(!paths.config_file().exists());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn oss_draft_keeps_auto_addressing_and_tests_before_commit() {
+        let paths = temp_paths("oss-auto-draft");
+        let draft = cx_tui::BackendDraft {
+            kind: cx_tui::WizardKind::S3,
+            values: vec![
+                "fake-oss".into(),
+                "fake-bucket".into(),
+                "https://oss-cn-beijing.aliyuncs.com".into(),
+                "cn-beijing".into(),
+                "fake-ak".into(),
+                " fake-secret ".into(),
+                "fake-prefix".into(),
+            ],
+        };
+        add_draft_with_probe(&paths, &draft, |paths, _, section| {
+            assert_eq!(
+                section.path_style, None,
+                "auto is resolved centrally by build_backend"
+            );
+            assert!(!paths.config_file().exists());
+            assert_eq!(
+                std::fs::read_to_string(paths.secret_file("fake-oss.secret")).unwrap(),
+                " fake-secret "
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(Config::load(&paths).unwrap().backends.len(), 1);
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn anonymous_draft_and_whitespace_password_are_preserved() {
+        let paths = temp_paths("draft-secrets");
+        let anonymous = cx_tui::BackendDraft {
+            kind: cx_tui::WizardKind::Webdav,
+            values: vec![
+                "anon".into(),
+                "https://example.invalid/dav".into(),
+                "".into(),
+                "".into(),
+            ],
+        };
+        add_draft_with_probe(&paths, &anonymous, |_, _, section| {
+            assert!(section.username.is_none());
+            assert!(section.password_file.is_none());
+            Ok(())
+        })
+        .unwrap();
+        let draft = cx_tui::BackendDraft {
+            kind: cx_tui::WizardKind::Webdav,
+            values: vec![
+                "auth".into(),
+                "https://example.invalid/dav".into(),
+                "user".into(),
+                " \tpass  ".into(),
+            ],
+        };
+        add_draft_with_probe(&paths, &draft, |paths, _, section| {
+            assert_eq!(
+                std::fs::read_to_string(
+                    paths.secret_file(section.password_file.as_deref().unwrap())
+                )
+                .unwrap(),
+                " \tpass  "
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(strip_line_terminator(" secret \r\n".into()), " secret ");
+        assert_eq!(strip_line_terminator(" \t \n".into()), " \t ");
+        assert_eq!(strip_line_terminator("value\r".into()), "value\r");
+        assert_eq!(strip_line_terminator("value\n\n".into()), "value\n");
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn invalid_core_fields_fail_before_secret_input_or_enrollment() {
+        let paths = temp_paths("invalid-before-enroll");
+        assert!(
+            !add_backend(
+                &paths,
+                BackendAddCommand::Server {
+                    name: "new".into(),
+                    url: "not-a-url".into(),
+                    space: "space".into(),
+                    token_stdin: false,
+                    enroll_secret: Some("fake".into()),
+                    ca_file: None,
+                    insecure: false,
+                }
+            )
+            .unwrap()
+        );
+        assert!(!paths.identity_file().exists());
+        assert!(!paths.config_file().exists());
+        let mut section = fake_secret_section("new");
+        section.url = Some("https://user:secret@example.invalid".into());
+        assert!(validate_addition(&Config::default(), &section).is_err());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn absent_space_is_distinct_from_corrupt_or_orphan_space() {
+        let paths = temp_paths("space-state");
+        assert!(load_optional_space(&paths).unwrap().is_none());
+        std::fs::write(paths.space_key_file(), "fake").unwrap();
+        assert!(load_optional_space(&paths).is_err());
+        std::fs::write(paths.space_file(), "not-json").unwrap();
+        assert!(load_optional_space(&paths).is_err());
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn restart_preserves_mode_waits_for_ready_and_propagates_failures() {
+        use std::cell::RefCell;
+        for mode in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            restart_with_mode(
+                Some(mode),
+                || {
+                    calls.borrow_mut().push("stop");
+                    Ok(())
+                },
+                |actual| {
+                    assert_eq!(actual, mode);
+                    calls.borrow_mut().push("spawn");
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push("ready");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(*calls.borrow(), ["stop", "spawn", "ready"]);
+        }
+        assert!(
+            restart_with_mode(
+                Some(true),
+                || Ok(()),
+                |_| Err(DaemonError::Protocol("mock spawn failed".into())),
+                || panic!("spawn failure must not report ready")
+            )
+            .is_err()
+        );
+        assert!(
+            restart_with_mode(
+                Some(false),
+                || Ok(()),
+                |_| Ok(()),
+                || Err(DaemonError::Protocol("mock readiness failed".into()))
+            )
+            .is_err()
+        );
+        restart_with_mode(
+            None,
+            || panic!("not running"),
+            |_| panic!("must not auto-start"),
+            || panic!("not started"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn code_aware_auth_tips_distinguish_permissions_addressing_and_signature() {
+        for (code, expected) in [
+            ("AccessDenied", "前缀"),
+            ("SecondLevelDomainForbidden", "virtual-host"),
+            ("SignatureDoesNotMatch", "区域"),
+            ("ExpiredToken", "STS"),
+            ("InvalidAccessKeyId", "停用"),
+        ] {
+            let err = cx_backend::BackendError::Unauthorized {
+                status: 403,
+                detail: code.into(),
+            };
+            assert!(backend_error_tip(&err).contains(expected));
+        }
     }
 
     #[test]
@@ -1640,6 +2452,7 @@ mod backend_tests {
                 access_key_id: "minioadmin".to_string(),
                 secret_stdin: false,
                 path_style: true,
+                virtual_host: false,
                 ca_file: None,
                 insecure: false,
             },
@@ -1689,27 +2502,27 @@ mod backend_tests {
         webdav.url = Some(dav.url());
         config.backends.push(webdav);
 
-        // S3：对着会校验签名的测试服务端（桶还不存在，probe 会顺手建出来）
+        // S3：预置测试桶，验证 probe 不会尝试创建它。
         let s3 = TestS3Server::start("minioadmin", "minioadmin", "clipboardx");
+        s3.seed("fixture", b"fake");
         let mut s3_section = empty_section("oss".to_string(), cx_core::BackendKind::S3);
         s3_section.bucket = Some("clipboardx".to_string());
         s3_section.endpoint = Some(s3.endpoint());
         s3_section.access_key_id = Some("minioadmin".to_string());
-        s3_section.secret_access_key_env = Some("CX_TEST_S3_SECRET".to_string());
+        s3_section.secret_access_key_file = Some("fake-s3.key".to_string());
+        write_secret_file(&paths, "fake-s3.key", "minioadmin").unwrap();
         s3_section.path_style = Some(true);
         config.backends.push(s3_section);
         config.save(&paths).unwrap();
 
-        unsafe { std::env::set_var("CX_TEST_S3_SECRET", "minioadmin") };
         assert!(test_backend(&paths, "dav").unwrap(), "WebDAV 后端应当可用");
         assert!(test_backend(&paths, "oss").unwrap(), "S3 后端应当可用");
-        assert_eq!(s3.buckets_created(), 1, "probe 应当建出桶");
+        assert_eq!(s3.buckets_created(), 0, "probe 不应建桶");
         assert!(
             s3.signature_failures().is_empty(),
             "{:?}",
             s3.signature_failures()
         );
-        unsafe { std::env::remove_var("CX_TEST_S3_SECRET") };
 
         // 不存在的后端名：给出明确失败而不是 panic
         assert!(!test_backend(&paths, "nope").unwrap());

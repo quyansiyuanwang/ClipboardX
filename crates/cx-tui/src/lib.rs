@@ -53,6 +53,11 @@ pub enum TuiExit {
 
 /// 进入全屏 TUI。
 pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
+    run_with_app(paths, &mut App::new())
+}
+
+/// 使用保留的界面状态再次进入，管理操作失败时无需重填草稿。
+pub fn run_with_app(paths: &Paths, app: &mut App) -> Result<TuiExit, TuiError> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     };
@@ -74,7 +79,7 @@ pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
         EnableBracketedPaste
     );
 
-    let result = run_loop(&mut terminal, paths);
+    let result = run_loop(&mut terminal, paths, app);
 
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -90,10 +95,10 @@ pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
 fn run_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     paths: &Paths,
+    app: &mut App,
 ) -> Result<TuiExit, TuiError> {
     use crossterm::event::{self, Event as TermEvent, KeyEventKind};
 
-    let mut app = App::new();
     let client = DaemonClient::start(paths.clone());
     app.note("正在连接守护进程…");
 
@@ -106,16 +111,15 @@ fn run_loop(
             app.apply(event);
         }
 
-        // 2) 为**当前可见窗口**补拉内容摘要（见 app.rs 的说明：位置会漂移，
-        //    所以请求带上对象名，结果按名字贴回对应的行）
+        // 2) 先画一帧：布局/滚动偏移是预取窗口的唯一权威来源。
+        terminal
+            .draw(|frame| ui::draw(frame, app))
+            .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
+
+        // 3) 按渲染后的实际可见窗口补拉摘要。
         for (position, name) in app.take_preview_requests() {
             client.request_preview(position, name);
         }
-
-        // 3) 画一帧（渲染同时回填可视行数，供预取与翻页使用）
-        terminal
-            .draw(|frame| ui::draw(frame, &mut app))
-            .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
 
         // 4) 等键盘（最多等一个刷新间隔）
         if event::poll(tick).map_err(|err| TuiError::Io(format!("读取键盘事件失败：{err}")))?
@@ -129,29 +133,20 @@ fn run_loop(
                 app.on_paste(text);
                 continue;
             }
-            if let TermEvent::Mouse(mouse) = event {
-                use crossterm::event::MouseEventKind;
-                match mouse.kind {
-                    MouseEventKind::ScrollDown => app.on_scroll(3),
-                    MouseEventKind::ScrollUp => app.on_scroll(-3),
-                    // 左键点列表某一行就选中它（坐标换算由 App 负责：它手里有渲染时
-                    // 回填的列表位置与滚动偏移）
-                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        app.click(mouse.row);
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            if let TermEvent::Key(key) = event {
-                // Windows 上按键会同时报 Press 与 Release，只处理按下
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match app.on_key(key) {
+            let outcome = match event {
+                TermEvent::Mouse(mouse) => app.on_mouse(mouse),
+                TermEvent::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                _ => continue,
+            };
+            {
+                match outcome {
                     KeyOutcome::None => {}
                     KeyOutcome::Quit => break,
-                    KeyOutcome::Copy(position) => client.request_copy(position),
+                    KeyOutcome::Copy(position) => {
+                        if let Some(item) = app.selected_item() {
+                            client.request_copy_checked(position, item.name.clone());
+                        }
+                    }
                     KeyOutcome::Pause => client.request("pause"),
                     KeyOutcome::Resume => client.request("resume"),
                     KeyOutcome::Refresh => {
@@ -176,7 +171,11 @@ fn run_loop(
                         break;
                     }
                     KeyOutcome::Delete(position) => {
-                        client.request_delete(position);
+                        if let Some(name) = app.delete_expected_name.take() {
+                            client.request_delete_checked(position, name);
+                        } else {
+                            app.warn("删除缺少对象标识，请重新选择条目");
+                        }
                         // 删完立刻刷新：列表里那一条应当马上消失
                         client.request_history(HISTORY_LIMIT);
                         app.forget_previews();
@@ -220,6 +219,13 @@ pub fn snapshot(paths: &Paths, width: u16, height: u16) -> Result<String, TuiErr
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    let backend = ratatui::backend::TestBackend::new(width.max(20), height.max(6));
+    let mut terminal = ratatui::Terminal::new(backend)
+        .map_err(|err| TuiError::Io(format!("无法创建测试终端：{err}")))?;
+    terminal
+        .draw(|frame| ui::draw(frame, &mut app))
+        .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;
+
     // 再等选中项的内容摘要：快照是"读到了什么"的证据，因此这里要等到位（或超时）
     for (position, name) in app.take_preview_requests() {
         client.request_preview(position, name);
@@ -238,9 +244,6 @@ pub fn snapshot(paths: &Paths, width: u16, height: u16) -> Result<String, TuiErr
     }
     client.shutdown();
 
-    let backend = ratatui::backend::TestBackend::new(width.max(20), height.max(6));
-    let mut terminal = ratatui::Terminal::new(backend)
-        .map_err(|err| TuiError::Io(format!("无法创建测试终端：{err}")))?;
     terminal
         .draw(|frame| ui::draw(frame, &mut app))
         .map_err(|err| TuiError::Io(format!("绘制失败：{err}")))?;

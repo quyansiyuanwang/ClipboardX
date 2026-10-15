@@ -14,21 +14,33 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
     }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("data")
+        "{}.{}.{}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("data"),
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-
-    {
-        let mut file = fs::File::create(&tmp).map_err(|e| CoreError::io(&tmp, e))?;
+    let mut created = false;
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp).map_err(|e| CoreError::io(&tmp, e))?;
+        created = true;
         file.write_all(bytes).map_err(|e| CoreError::io(&tmp, e))?;
-        file.flush().map_err(|e| CoreError::io(&tmp, e))?;
-        // 数据落盘后再 rename，避免 rename 成功但内容仍在页缓存里
         file.sync_all().map_err(|e| CoreError::io(&tmp, e))?;
+        drop(file);
+        fs::rename(&tmp, path).map_err(|e| CoreError::io(path, e))
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(&tmp);
     }
-
-    fs::rename(&tmp, path).map_err(|e| CoreError::io(path, e))?;
-    Ok(())
+    result
 }
 
 /// 读取文本文件；不存在时返回 `None`（"没有"与"读失败"必须区分开）。

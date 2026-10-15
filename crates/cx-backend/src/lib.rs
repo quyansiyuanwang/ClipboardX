@@ -308,12 +308,20 @@ fn read_secret(
         let text = std::fs::read_to_string(&path).map_err(|err| {
             BackendError::Credentials(format!("无法读取{what}文件 {}：{err}", path.display()))
         })?;
-        return Ok(Some(text.trim().to_string()));
+        return Ok(Some(if what == "口令" {
+            text
+        } else {
+            text.trim().to_string()
+        }));
     }
     if let Some(name) = env {
         let value = std::env::var(name)
             .map_err(|_| BackendError::Credentials(format!("环境变量 {name} 未设置（{what}）")))?;
-        return Ok(Some(value.trim().to_string()));
+        return Ok(Some(if what == "口令" {
+            value
+        } else {
+            value.trim().to_string()
+        }));
     }
     Ok(None)
 }
@@ -375,6 +383,25 @@ mod tests {
         let existed = PutOutcome::AlreadyExists;
         assert!(!existed.wrote());
         assert!(existed.etag().is_none());
+    }
+
+    #[test]
+    fn 口令文件保留首尾空格与换行() {
+        let root = std::env::temp_dir().join(format!(
+            "cx-password-exact-{}-{}",
+            std::process::id(),
+            cx_core::now_ms()
+        ));
+        let paths = cx_core::Paths::from_root(&root);
+        paths.ensure().unwrap();
+        std::fs::write(paths.secret_file("fake.pass"), "  fake password \n").unwrap();
+        assert_eq!(
+            read_secret(&paths, Some("fake.pass"), None, "口令")
+                .unwrap()
+                .unwrap(),
+            "  fake password \n"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

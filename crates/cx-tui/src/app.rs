@@ -15,6 +15,7 @@
 use crate::client::UiEvent;
 use crate::wizard::{BackendDraft, Focus, Wizard};
 use cx_proto::control::{DoctorReport, HistoryPreview, HistorySummary, StatusReport};
+use ratatui::layout::Rect;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 一次可见窗口最多请求多少条预览（防止窄屏/大屏差异导致请求风暴）。
@@ -139,6 +140,18 @@ pub struct App {
     list_geometry: Option<(u16, u16)>,
     /// 列表当前滚动到第几行（渲染层每帧告知：ratatui 自己算的，只有渲染后才知道）。
     list_offset: usize,
+    /// 二维命中区域只由实际渲染回填。
+    pub(crate) list_rect: Rect,
+    pub(crate) preview_rect: Rect,
+    pub(crate) modal_rect: Rect,
+    pub(crate) wizard_hits: Vec<(Rect, Focus)>,
+    pub(crate) wizard_kinds: Vec<(Rect, usize)>,
+    preview_rows: usize,
+    preview_lines: usize,
+    preview_width: u16,
+    pub(crate) help_scroll: u16,
+    pub(crate) help_max_scroll: u16,
+    pub(crate) panel_max_scroll: u16,
     /// 预览滚动偏移（行）。
     preview_scroll: u16,
     /// 最近一条提示。
@@ -157,8 +170,14 @@ pub struct App {
     pub pending_backend_remove: Option<String>,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
     pub doctor: Option<DoctorReport>,
+    /// 面板内独立错误，避免失败后永远显示读取中。
+    pub doctor_error: Option<String>,
     /// 等待确认的删除位置（删除是破坏性操作，必须先确认一次）。
     pub pending_delete: Option<usize>,
+    /// 确认弹层绑定的稳定对象名，不随位置漂移。
+    pub pending_delete_name: Option<String>,
+    /// 最近确认的删除对象；事件循环取走后发 expected_name 请求。
+    pub delete_expected_name: Option<String>,
     /// 后台线程是否还在跑。
     pub running: bool,
     /// 是否已连上守护进程（断线时界面继续留在屏幕上重试，而不是退出）。
@@ -198,11 +217,27 @@ impl App {
                 self.connected = true;
             }
             UiEvent::History(items) => {
+                let selected = self.selected_item().map(|item| item.name.clone());
+                let scroll = self.preview_scroll;
                 self.items = items;
                 self.refilter();
+                if let Some(name) = selected {
+                    if let Some(cursor) = self
+                        .visible
+                        .iter()
+                        .position(|index| self.items[*index].name == name)
+                    {
+                        self.cursor = cursor;
+                        self.preview_scroll = scroll;
+                    } else {
+                        self.preview_scroll = 0;
+                    }
+                }
+                self.last_plan.clear();
             }
             UiEvent::Preview { name, result } => {
                 self.pending.remove(&name);
+                self.last_plan.clear();
                 let state = match result {
                     Ok(preview) => PreviewState::Ready(preview),
                     Err(message) => PreviewState::Failed(message),
@@ -213,9 +248,13 @@ impl App {
                 self.previews.insert(name, state);
             }
             UiEvent::Failure { command, message } => {
+                if command == "doctor" {
+                    self.doctor_error = Some(message.clone());
+                }
                 self.warn(format!("{command} 失败：{message}"));
             }
             UiEvent::Doctor(report) => {
+                self.doctor_error = None;
                 self.doctor = Some(*report);
             }
             UiEvent::Disconnected => {
@@ -252,6 +291,7 @@ impl App {
 
     /// 按过滤词重算可见集合，并把光标夹回范围内。
     fn refilter(&mut self) {
+        let selected = self.selected_item().map(|item| item.name.clone());
         let query = self.filter.to_lowercase();
         self.visible = if query.is_empty() {
             (0..self.items.len()).collect()
@@ -261,7 +301,17 @@ impl App {
                 .collect()
         };
         self.clamp();
-        self.preview_scroll = 0;
+        if let Some(name) = selected {
+            if let Some(cursor) = self
+                .visible
+                .iter()
+                .position(|index| self.items[*index].name == name)
+            {
+                self.cursor = cursor;
+            } else {
+                self.preview_scroll = 0;
+            }
+        }
     }
 
     /// 某一行是否匹配过滤词。
@@ -375,6 +425,10 @@ impl App {
         }
     }
 
+    pub(crate) fn clamp_panel_scroll(&mut self) {
+        self.panel_scroll = self.panel_scroll.min(self.panel_max_scroll);
+    }
+
     /// 面板滚动偏移。
     pub fn panel_scroll(&self) -> u16 {
         self.panel_scroll
@@ -396,6 +450,14 @@ impl App {
     /// 坐标换算必须用**渲染时**记录的位置与偏移：列表是不是滚动、滚动到哪一行，
     /// 都是 ratatui 在渲染时为了"让选中项可见"自己算出来的，App 这边凭空推不出来。
     pub fn click(&mut self, row: u16) -> Option<usize> {
+        if self.show_help
+            || self.show_panel
+            || self.wizard.is_some()
+            || self.pending_delete.is_some()
+            || self.pending_backend_remove.is_some()
+        {
+            return None;
+        }
         let (top, rows) = self.list_geometry?;
         if rows == 0 || row < top || row >= top.saturating_add(rows) {
             return None;
@@ -414,7 +476,14 @@ impl App {
     /// 只覆盖可见窗口与选中项。窗口没变时返回空，避免每帧都发请求。
     pub fn take_preview_requests(&mut self) -> Vec<(usize, String)> {
         let rows = self.viewport_rows();
-        let start = self.cursor.saturating_sub(rows / 2);
+        let start = if self.list_geometry.is_some()
+            && self.cursor >= self.list_offset
+            && self.cursor < self.list_offset.saturating_add(rows)
+        {
+            self.list_offset
+        } else {
+            self.cursor.saturating_sub(rows / 2)
+        };
         let end = (start + rows + 1).min(self.visible.len());
         let start = end.saturating_sub(rows + 1);
 
@@ -425,12 +494,11 @@ impl App {
             };
             plan.push((item.position, item.name.clone()));
         }
-        // 选中项一定在内（窄屏时可能超出上面的窗口）
+        // 选中项排第一，避免大终端的 MAX_PREFETCH 截断把当前预览丢掉。
         if let Some(item) = self.selected_item() {
             let entry = (item.position, item.name.clone());
-            if !plan.iter().any(|(_, name)| *name == entry.1) {
-                plan.push(entry);
-            }
+            plan.retain(|(_, name)| *name != entry.1);
+            plan.insert(0, entry);
         }
 
         let names: Vec<String> = plan.iter().map(|(_, name)| name.clone()).collect();
@@ -439,22 +507,55 @@ impl App {
         }
         self.last_plan = names;
 
-        plan.truncate(MAX_PREFETCH);
         plan.retain(|(_, name)| !self.previews.contains_key(name) && !self.pending.contains(name));
+        plan.truncate(MAX_PREFETCH);
         for (_, name) in &plan {
             self.pending.insert(name.clone());
         }
         plan
     }
 
+    /// 渲染后的包装行数包含元数据；预览高度独立于历史列表。
+    pub(crate) fn set_preview_geometry(&mut self, rect: Rect, lines: usize) {
+        self.preview_rect = rect;
+        if self.selected_item().is_some() && self.selected_preview_state().is_none() {
+            // 手动刷新会临时清掉缓存；读取中的占位行不能把阅读位置夹回 0。
+            return;
+        }
+        if self.preview_width > 0 && rect.width > 0 && self.preview_width != rect.width {
+            let at_end = self.preview_scroll > 0
+                && self.preview_scroll as usize
+                    >= self.preview_lines.saturating_sub(self.preview_rows);
+            self.preview_scroll = if at_end {
+                lines
+                    .saturating_sub(rect.height as usize)
+                    .min(u16::MAX as usize) as u16
+            } else {
+                ((self.preview_scroll as usize * self.preview_width as usize) / rect.width as usize)
+                    .min(u16::MAX as usize) as u16
+            };
+        }
+        self.preview_width = rect.width;
+        self.preview_rect = rect;
+        self.preview_rows = rect.height as usize;
+        self.preview_lines = lines;
+        self.preview_scroll_by(0);
+    }
+
     /// 预览滚动。
     pub fn preview_scroll_by(&mut self, delta: i32) {
-        let lines = self
-            .selected_preview_state()
-            .map(|state| state.line_count())
-            .unwrap_or(0);
-        let max = lines.saturating_sub(self.viewport_rows()) as i32;
-        let next = (self.preview_scroll as i32 + delta).clamp(0, max.max(0));
+        let (lines, rows) = if self.preview_width > 0 {
+            (self.preview_lines, self.preview_rows)
+        } else {
+            (
+                self.selected_preview_state()
+                    .map(|state| state.line_count())
+                    .unwrap_or(0),
+                self.viewport_rows(),
+            )
+        };
+        let max = lines.saturating_sub(rows).min(u16::MAX as usize) as i32;
+        let next = (self.preview_scroll as i32 + delta).clamp(0, max);
         self.preview_scroll = next as u16;
     }
 
@@ -524,23 +625,19 @@ impl App {
 
     // ---------------------------------------------------------------- 按键
 
-    /// 处理一次粘贴（括号粘贴：终端把整段文本一次送过来）。
-    ///
-    /// 为什么值得单独处理：
-    /// - 逐字符按键路径下，长粘贴会变成几十上百次「按键 → 重绘」，慢且在部分终端会丢字符；
-    /// - 粘贴密钥时经常会**带上末尾换行**，直接塞进字段会污染密钥、连不上还很难查——
-    ///   所以这里统一去掉换行与首尾空白。
-    ///
-    /// 路由规则：表单字段优先（正在填表），其次是过滤输入框；其它情况忽略
-    /// （在列表上粘贴不该改变任何东西）。
+    /// 处理括号粘贴。秘密按原值保存；普通单行字段去掉换行。
     pub fn on_paste(&mut self, text: &str) {
-        let cleaned = text.replace(['\r', '\n'], "");
-        if cleaned.is_empty() {
-            return;
-        }
         if let Some(form) = self.wizard.as_mut() {
-            if form.focused_field().is_some() {
-                for ch in cleaned.trim().chars() {
+            if let Some(index) = form.focused_field() {
+                let secret = form.fields()[index].secret;
+                let cleaned;
+                let value = if secret {
+                    text
+                } else {
+                    cleaned = text.replace(['\r', '\n'], "");
+                    cleaned.trim()
+                };
+                for ch in value.chars() {
                     form.push_char(ch);
                 }
             }
@@ -548,8 +645,27 @@ impl App {
         }
         if self.filter_input {
             let mut query = self.filter.clone();
-            query.push_str(cleaned.trim());
+            query.push_str(text.replace(['\r', '\n'], "").trim());
             self.set_filter(query);
+        }
+    }
+
+    fn activate_wizard(&mut self) -> KeyOutcome {
+        if self
+            .wizard
+            .as_ref()
+            .is_some_and(|form| form.focus() == Focus::Cancel)
+        {
+            self.wizard = None;
+            self.note("已取消，未做任何改动");
+            return KeyOutcome::None;
+        }
+        match self.wizard.as_mut().map(|form| form.submit()) {
+            Some(Ok(draft)) => {
+                self.wizard = None;
+                KeyOutcome::AddBackend(Box::new(draft))
+            }
+            _ => KeyOutcome::None,
         }
     }
     /// 处理一个按键。
@@ -619,17 +735,21 @@ impl App {
                 }
                 KeyCode::Left => {
                     if let Some(form) = self.wizard.as_mut() {
-                        if form.focused_field().is_some() {
-                            form.backspace();
-                        } else {
-                            form.kind_left();
+                        match form.focus() {
+                            Focus::Kind => form.kind_left(),
+                            Focus::Cancel => form.focus_button(true),
+                            _ => {}
                         }
                     }
                     KeyOutcome::None
                 }
                 KeyCode::Right => {
                     if let Some(form) = self.wizard.as_mut() {
-                        form.kind_right();
+                        match form.focus() {
+                            Focus::Kind => form.kind_right(),
+                            Focus::Save => form.focus_button(false),
+                            _ => {}
+                        }
                     }
                     KeyOutcome::None
                 }
@@ -651,43 +771,30 @@ impl App {
                     }
                     KeyOutcome::None
                 }
-                KeyCode::Char(ch) if !ctrl => {
+                KeyCode::Enter => self.activate_wizard(),
+                KeyCode::Char(' ')
+                    if !ctrl
+                        && self.wizard.as_ref().is_some_and(|form| {
+                            matches!(form.focus(), Focus::Save | Focus::Cancel)
+                        }) =>
+                {
+                    self.activate_wizard()
+                }
+                KeyCode::PageDown => {
                     if let Some(form) = self.wizard.as_mut() {
-                        form.push_char(ch);
+                        form.scroll_by(5);
                     }
                     KeyOutcome::None
                 }
-                // 回车：在 [保存] 上或任意字段上提交
-                KeyCode::Enter => {
-                    let submit = self
-                        .wizard
-                        .as_mut()
-                        .map(|form| form.submit())
-                        .unwrap_or(Err(Vec::new()));
-                    match submit {
-                        Ok(draft) => {
-                            self.wizard = None;
-                            KeyOutcome::AddBackend(Box::new(draft))
-                        }
-                        Err(_) => KeyOutcome::None,
-                    }
-                }
-                KeyCode::Char(' ') => {
+                KeyCode::PageUp => {
                     if let Some(form) = self.wizard.as_mut() {
-                        match form.focus() {
-                            Focus::Save => {
-                                let submit = form.submit();
-                                if let Ok(draft) = submit {
-                                    self.wizard = None;
-                                    return KeyOutcome::AddBackend(Box::new(draft));
-                                }
-                            }
-                            Focus::Cancel => {
-                                self.wizard = None;
-                                self.note("已取消，未做任何改动");
-                            }
-                            _ => form.push_char(' '),
-                        }
+                        form.scroll_by(-5);
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Char(ch) if !ctrl => {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.push_char(ch);
                     }
                     KeyOutcome::None
                 }
@@ -699,8 +806,20 @@ impl App {
         // 删除确认：只有 y/回车 才真的删，其他任何键都取消
         if let Some(position) = self.pending_delete {
             self.pending_delete = None;
+            let name = self.pending_delete_name.take();
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let position = match name.as_ref() {
+                        Some(name) => match self.items.iter().find(|item| &item.name == name) {
+                            Some(item) => item.position,
+                            None => {
+                                self.warn("待删除条目已不在历史中，请刷新后重试");
+                                return KeyOutcome::None;
+                            }
+                        },
+                        None => position,
+                    };
+                    self.delete_expected_name = name;
                     KeyOutcome::Delete(position)
                 }
                 _ => {
@@ -712,6 +831,15 @@ impl App {
 
         // 面板与帮助页都是"看一眼就关"的浮层：任意键关闭（q 退出）
         if self.show_panel {
+            if key.code == KeyCode::Char('r') {
+                self.doctor_error = None;
+                self.doctor = None;
+                return KeyOutcome::Doctor;
+            }
+            if key.code == KeyCode::Char('a') {
+                self.wizard = Some(Wizard::new());
+                return KeyOutcome::None;
+            }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             return match key.code {
                 KeyCode::Char('q') => KeyOutcome::Quit,
@@ -790,9 +918,35 @@ impl App {
         }
 
         if self.show_help {
-            // 帮助页里任意键返回（q 直接退出，避免"被困在帮助页"）
             return match key.code {
                 KeyCode::Char('q') => KeyOutcome::Quit,
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_max_scroll);
+                    KeyOutcome::None
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                    KeyOutcome::None
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = self
+                        .help_scroll
+                        .saturating_add(10)
+                        .min(self.help_max_scroll);
+                    KeyOutcome::None
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(10);
+                    KeyOutcome::None
+                }
+                KeyCode::End => {
+                    self.help_scroll = self.help_max_scroll;
+                    KeyOutcome::None
+                }
+                KeyCode::Home => {
+                    self.help_scroll = 0;
+                    KeyOutcome::None
+                }
                 _ => {
                     self.show_help = false;
                     KeyOutcome::None
@@ -823,6 +977,7 @@ impl App {
             }
             KeyCode::Char('b') => {
                 self.show_panel = true;
+                self.doctor_error = None;
                 self.panel_scroll = 0;
                 // 打开时拉一次诊断：后端面板要显示局域网对端等只有 doctor 才知道的信息
                 KeyOutcome::Doctor
@@ -905,6 +1060,7 @@ impl App {
             KeyCode::Char('d') => match self.selected_position() {
                 Some(position) => {
                     self.pending_delete = Some(position);
+                    self.pending_delete_name = self.selected_item().map(|item| item.name.clone());
                     KeyOutcome::None
                 }
                 None => {
@@ -948,8 +1104,7 @@ impl App {
         let (healthy, failing, disabled) = self.backend_health();
         if status.backends.is_empty() {
             return Some((
-                "还没有配置同步后端：内容只留在本机。按 b 看配置引导（三种方式、凭据怎么传）"
-                    .to_string(),
+                "还没有配置同步后端；LAN 状态需按 b 查看。按 b 看配置引导与凭据说明".to_string(),
                 true,
             ));
         }
@@ -966,6 +1121,7 @@ impl App {
         let latest = status
             .backends
             .iter()
+            .filter(|backend| backend.enabled)
             .filter_map(|backend| backend.last_ok_ms)
             .max();
         let tail = match latest {
@@ -978,14 +1134,98 @@ impl App {
             String::new()
         };
         Some((
-            format!("后端 {healthy} 个正常{extra}｜{tail}（按 b 看详情）"),
+            format!("后端 {healthy} 个无已知错误{extra}｜{tail}（按 b 看详情）"),
             false,
         ))
     }
 
+    /// 二维鼠标路由；浮层打开时永远不穿透到历史。
+    pub fn on_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> KeyOutcome {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollDown => 3,
+            MouseEventKind::ScrollUp => -3,
+            _ => 0,
+        };
+        if self.pending_backend_remove.is_some() || self.pending_delete.is_some() {
+            return KeyOutcome::None;
+        }
+        if self.wizard.is_some() {
+            if !self.modal_rect.contains(point) {
+                return KeyOutcome::None;
+            }
+            if delta != 0 {
+                if let Some(form) = self.wizard.as_mut() {
+                    form.scroll_by(delta);
+                }
+            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some((_, index)) = self
+                    .wizard_kinds
+                    .iter()
+                    .find(|(rect, _)| rect.contains(point))
+                {
+                    if let Some(form) = self.wizard.as_mut() {
+                        form.set_kind(*index);
+                        form.focus_kind();
+                    }
+                } else if let Some((_, focus)) = self
+                    .wizard_hits
+                    .iter()
+                    .find(|(rect, _)| rect.contains(point))
+                {
+                    let focus = *focus;
+                    if let Some(form) = self.wizard.as_mut() {
+                        match focus {
+                            Focus::Field(index) => form.focus_field(index),
+                            Focus::Save => form.focus_button(true),
+                            Focus::Cancel => form.focus_button(false),
+                            Focus::Kind => {}
+                        }
+                    }
+                    if matches!(focus, Focus::Save | Focus::Cancel) {
+                        return self.activate_wizard();
+                    }
+                }
+            }
+            return KeyOutcome::None;
+        }
+        if self.show_help || self.show_panel {
+            if self.modal_rect.contains(point) && delta != 0 {
+                if self.show_panel {
+                    self.panel_scroll = (self.panel_scroll as i32 + delta)
+                        .clamp(0, self.panel_max_scroll as i32)
+                        as u16;
+                } else {
+                    self.help_scroll = (self.help_scroll as i32 + delta)
+                        .clamp(0, self.help_max_scroll as i32)
+                        as u16;
+                }
+            }
+            return KeyOutcome::None;
+        }
+        if self.preview_rect.contains(point) {
+            if delta != 0 {
+                self.preview_scroll_by(delta);
+            }
+        } else if self.list_rect.contains(point) {
+            if delta != 0 {
+                self.on_scroll(delta);
+            } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.click(mouse.row);
+            }
+        }
+        KeyOutcome::None
+    }
+
     /// 鼠标滚轮：按行移动光标（滚轮是最自然的翻列表方式）。
     pub fn on_scroll(&mut self, delta: i32) {
-        if self.show_help || self.show_panel {
+        if self.show_help
+            || self.show_panel
+            || self.wizard.is_some()
+            || self.pending_delete.is_some()
+            || self.pending_backend_remove.is_some()
+        {
             return;
         }
         match delta.cmp(&0) {
@@ -1008,15 +1248,19 @@ impl App {
         match &self.status {
             None => "未连接守护进程".to_string(),
             Some(status) => {
-                let state = if status.paused {
+                let state = if !self.connected {
+                    "连接中断（状态已过期）"
+                } else if status.paused {
                     "已暂停"
                 } else {
-                    "同步中"
+                    "守护进程已连接"
                 };
                 let space = if status.encrypted {
-                    status.space_id.as_deref().unwrap_or("-").to_string()
+                    format!("{}（加密）", status.space_id.as_deref().unwrap_or("-"))
+                } else if status.space_id.is_none() {
+                    "未初始化；远端是否可用请看诊断".to_string()
                 } else {
-                    "未加密".to_string()
+                    "明文（未加密）".to_string()
                 };
                 format!(
                     "{state}｜设备 {}（{}）｜空间 {}｜历史 {} 条｜后端 {} 个",
@@ -1504,7 +1748,7 @@ mod tests {
         assert_eq!(app.backend_health(), (1, 0, 1));
         let (text, warn) = app.health_line().unwrap();
         assert!(!warn, "正常状态不该是警告色：{text}");
-        assert!(text.contains("1 个正常"), "{text}");
+        assert!(text.contains("1 个无已知错误"), "{text}");
         assert!(text.contains("1 个已禁用"), "{text}");
         assert!(text.contains("最近成功"), "{text}");
     }
@@ -1905,12 +2149,95 @@ mod tests {
         assert!(empty.notice.as_ref().unwrap().text.contains("没有可切换"));
     }
     #[test]
+    fn 取消按钮回车空格完整与不完整表单都绝不保存() {
+        for complete in [false, true] {
+            for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+                for save in [false, true] {
+                    let mut app = App::new();
+                    app.wizard = Some(Wizard::new());
+                    let form = app.wizard.as_mut().unwrap();
+                    if complete {
+                        for index in 1..form.fields().len() {
+                            form.focus_field(index);
+                            for ch in "fake-value".chars() {
+                                form.push_char(ch);
+                            }
+                        }
+                    }
+                    form.focus_button(save);
+                    let outcome = app.on_key(key(code));
+                    assert_eq!(
+                        matches!(outcome, KeyOutcome::AddBackend(_)),
+                        save && complete
+                    );
+                    if !save {
+                        assert!(app.wizard.is_none());
+                    } else if !complete {
+                        assert!(app.wizard.is_some());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 面板单次_a_打开表单且取消返回面板() {
+        for count in [0, 2] {
+            let mut app = app_with(count);
+            app.on_key(key(KeyCode::Char('b')));
+            app.on_key(key(KeyCode::Char('a')));
+            assert!(app.wizard.is_some());
+            app.on_key(key(KeyCode::Esc));
+            assert!(app.show_panel);
+        }
+    }
+
+    #[test]
+    fn 新历史插入保持选择且确认删除仍绑定原对象() {
+        let mut app = app_with(3);
+        app.down();
+        app.apply(preview(1, &"line\n".repeat(100)));
+        app.preview_scroll_by(4);
+        let name = app.selected_item().unwrap().name.clone();
+        app.on_key(key(KeyCode::Char('d')));
+        let mut items = vec![summary(99)];
+        items.extend((0..3).map(summary));
+        for (position, item) in items.iter_mut().enumerate() {
+            item.position = position;
+        }
+        app.apply(UiEvent::History(items));
+        assert_eq!(app.selected_item().unwrap().name, name);
+        assert_eq!(app.preview_scroll(), 4);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), KeyOutcome::Delete(2));
+        assert_eq!(app.delete_expected_name.as_deref(), Some(name.as_str()));
+    }
+
+    #[test]
+    fn 秘密粘贴与提交原样保留空白字节() {
+        let mut app = App::new();
+        let mut form = Wizard::new();
+        form.set_kind(1);
+        form.focus_field(1);
+        for ch in "https://example.invalid/dav".chars() {
+            form.push_char(ch);
+        }
+        form.focus_field(2);
+        form.push_char('u');
+        form.focus_field(3);
+        app.wizard = Some(form);
+        let secret = "  fictional secret\r\n ";
+        app.on_paste(secret);
+        let draft = app.wizard.as_mut().unwrap().submit().unwrap();
+        assert_eq!(draft.get("口令"), secret);
+    }
+
+    #[test]
     fn 状态行包含关键信息() {
         let mut app = App::new();
         assert!(app.status_line().contains("未连接"));
         app.apply(UiEvent::Status(Box::new(status(false))));
         let line = app.status_line();
-        assert!(line.contains("同步中"), "{line}");
+        assert!(line.contains("守护进程已连接"), "{line}");
         assert!(line.contains("笔记本"), "{line}");
         assert!(line.contains("ab12cd34"), "{line}");
         assert!(line.contains("历史 3 条"), "{line}");

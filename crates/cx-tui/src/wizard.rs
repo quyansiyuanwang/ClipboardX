@@ -30,8 +30,8 @@ const SERVER_FIELDS: [Field; 4] = [
     ),
     Field::text(
         "空间 id",
-        "（cx space init 输出的那个）",
-        "要同步到服务端上的哪个空间",
+        "服务端创建的空间 id",
+        "服务端空间 id；本机加密空间需另行创建或加入",
     ),
     Field::secret(
         "注册密钥",
@@ -47,20 +47,16 @@ const WEBDAV_FIELDS: [Field; 4] = [
         "WebDAV 目录地址",
     ),
     Field::text("用户名", "me", "留空表示匿名访问"),
-    Field::secret("口令", "建议用应用专用密码；密文输入，不回显"),
+    Field::secret("口令", "匿名时留空；账号模式建议用应用密码；粘贴原样保留"),
 ];
 
-const S3_FIELDS: [Field; 7] = [
+const S3_FIELDS: [Field; 8] = [
     Field::text("后端名", "oss", "唯一名字"),
-    Field::text(
-        "桶名",
-        "clipboardx",
-        "桶不存在时会尝试自动创建（需要建桶权限）",
-    ),
+    Field::text("桶名", "clipboardx", "请先创建桶；连接检查不自动创建"),
     Field::text(
         "端点",
         "https://oss-cn-hangzhou.aliyuncs.com",
-        "AWS 官方留空；自建端点默认按 path-style 访问（MinIO / 阿里云 OSS 都支持）",
+        "AWS 官方留空；OSS 用 virtual-host，MinIO 可用 path-style",
     ),
     Field::text(
         "区域",
@@ -70,6 +66,11 @@ const S3_FIELDS: [Field; 7] = [
     Field::text("AccessKeyId", "（RAM 控制台创建）", "只给该桶读写权限即可"),
     Field::secret("SecretAccessKey", "与 AccessKeyId 配对；密文输入，不回显"),
     Field::text("前缀", "clipboardx", "对象名会落在该前缀下"),
+    Field::text(
+        "寻址",
+        "auto",
+        "auto / virtual-host / path；OSS 自动使用 virtual-host",
+    ),
 ];
 
 impl WizardKind {
@@ -138,7 +139,7 @@ impl Field {
 
     /// 是否必填（端点 / 用户名 / 前缀可空）。
     pub fn required(&self) -> bool {
-        !matches!(self.label, "端点" | "用户名" | "前缀")
+        !matches!(self.label, "端点" | "用户名" | "前缀" | "寻址")
     }
 }
 
@@ -193,6 +194,9 @@ pub struct Wizard {
     invalid: Vec<usize>,
     /// 提交失败的整体提示。
     pub message: Option<String>,
+    pub(crate) scroll: u16,
+    pub(crate) max_scroll: u16,
+    pub(crate) follow_focus: bool,
 }
 
 impl Default for Wizard {
@@ -202,6 +206,18 @@ impl Default for Wizard {
 }
 
 impl Wizard {
+    /// 从未提交成功的草稿恢复输入；秘密仅保留在原进程内存中。
+    pub fn from_draft(draft: &BackendDraft, error: String) -> Self {
+        let mut form = Self::new();
+        form.kind_index = WizardKind::ALL
+            .iter()
+            .position(|kind| *kind == draft.kind)
+            .unwrap_or(0);
+        form.values[form.kind_index] = draft.values.clone();
+        form.focus = Focus::Save;
+        form.message = Some(error);
+        form
+    }
     /// 新建：默认第一种类型，后端名预填示例值（少一个必填项要敲）。
     pub fn new() -> Self {
         let mut values: [Vec<String>; 3] = Default::default();
@@ -218,6 +234,9 @@ impl Wizard {
             focus: Focus::Kind,
             invalid: Vec::new(),
             message: None,
+            scroll: 0,
+            max_scroll: 0,
+            follow_focus: true,
         }
     }
 
@@ -266,12 +285,20 @@ impl Wizard {
     pub fn set_kind(&mut self, index: usize) {
         if index < WizardKind::ALL.len() {
             self.kind_index = index;
+            self.follow_focus = true;
+            self.scroll = 0;
             // 换类型后字段数会变，焦点可能越界：回到类型行最安全
             if matches!(self.focus, Focus::Field(_)) {
                 self.focus = Focus::Kind;
             }
             self.invalid.clear();
+            self.message = None;
         }
+    }
+
+    pub(crate) fn focus_kind(&mut self) {
+        self.focus = Focus::Kind;
+        self.follow_focus = true;
     }
 
     /// 类型左移。
@@ -284,8 +311,29 @@ impl Wizard {
         self.set_kind((self.kind_index + 1).min(WizardKind::ALL.len() - 1));
     }
 
+    /// 滚轮/翻页暂时脱离焦点跟随，下次换焦点再跟随。
+    pub fn scroll_by(&mut self, delta: i32) {
+        self.scroll = (self.scroll as i32 + delta).clamp(0, self.max_scroll as i32) as u16;
+        self.follow_focus = false;
+    }
+
+    pub(crate) fn viewport(&mut self, rows: u16, lines: usize, focus_line: usize) {
+        self.max_scroll = lines.saturating_sub(rows as usize).min(u16::MAX as usize) as u16;
+        if self.follow_focus {
+            let focus_line = focus_line.min(u16::MAX as usize) as u16;
+            if focus_line < self.scroll {
+                self.scroll = focus_line;
+            } else if focus_line >= self.scroll.saturating_add(rows) {
+                self.scroll = focus_line.saturating_add(1).saturating_sub(rows);
+            }
+        }
+        self.scroll = self.scroll.min(self.max_scroll);
+        self.follow_focus = false;
+    }
+
     /// 焦点移到下一行（Tab / ↓）：类型 → 字段… → 两个按钮 → 回到类型。
     pub fn focus_next(&mut self) {
+        self.follow_focus = true;
         let fields = self.fields().len();
         self.focus = match self.focus {
             Focus::Kind => Focus::Field(0),
@@ -298,6 +346,7 @@ impl Wizard {
 
     /// 焦点移到上一行（Shift+Tab / ↑）。
     pub fn focus_prev(&mut self) {
+        self.follow_focus = true;
         let fields = self.fields().len();
         self.focus = match self.focus {
             Focus::Kind => Focus::Cancel,
@@ -310,6 +359,7 @@ impl Wizard {
 
     /// 把焦点放到某字段（鼠标点击用）。
     pub fn focus_field(&mut self, index: usize) {
+        self.follow_focus = true;
         if index < self.fields().len() {
             self.focus = Focus::Field(index);
         }
@@ -317,6 +367,7 @@ impl Wizard {
 
     /// 聚焦按钮（鼠标点击用）。
     pub fn focus_button(&mut self, save: bool) {
+        self.follow_focus = true;
         self.focus = if save { Focus::Save } else { Focus::Cancel };
     }
 
@@ -369,13 +420,25 @@ impl Wizard {
             .fields()
             .iter()
             .enumerate()
-            .filter(|(index, field)| field.required() && self.value(*index).trim().is_empty())
+            .filter(|(index, field)| {
+                let anonymous_password = self.kind() == WizardKind::Webdav
+                    && field.label == "口令"
+                    && self.value(2).trim().is_empty();
+                field.required()
+                    && !anonymous_password
+                    && if field.secret {
+                        self.value(*index).is_empty()
+                    } else {
+                        self.value(*index).trim().is_empty()
+                    }
+            })
             .map(|(index, _)| index)
             .collect();
         if !missing.is_empty() {
             self.invalid = missing.clone();
             self.message = Some(format!("还有 {} 个必填项没填", missing.len()));
             self.focus = Focus::Field(missing[0]);
+            self.follow_focus = true;
             return Err(missing);
         }
         self.invalid.clear();
@@ -440,8 +503,8 @@ mod tests {
         let fields = WizardKind::S3.fields();
         let bucket = fields.iter().find(|f| f.label == "桶名").unwrap();
         assert!(
-            bucket.help.contains("自动创建"),
-            "桶不存在时会自动创建，这一点要说明：{}",
+            bucket.help.contains("不自动创建"),
+            "默认检查不能自动建桶：{}",
             bucket.help
         );
         let endpoint = fields.iter().find(|f| f.label == "端点").unwrap();
@@ -567,6 +630,22 @@ mod tests {
         assert_eq!(form.fields().len(), 4);
         assert_eq!(form.focus(), Focus::Kind);
         assert_eq!(form.value(0), "dav", "每种类型的后端名各自预填");
+    }
+
+    #[test]
+    fn 匿名_webdav_不要求口令而账号模式要求() {
+        let mut form = Wizard::new();
+        form.set_kind(1);
+        type_into(&mut form, 1, "https://example.invalid/dav");
+        assert!(form.submit().is_ok(), "匿名用户名与口令都可空");
+        type_into(&mut form, 2, "user");
+        assert!(form.submit().unwrap_err().contains(&3));
+        type_into(&mut form, 3, "  ");
+        assert_eq!(
+            form.submit().unwrap().get("口令"),
+            "  ",
+            "合法秘密不能 trim"
+        );
     }
 
     #[test]

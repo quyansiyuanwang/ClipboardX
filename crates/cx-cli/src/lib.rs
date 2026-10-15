@@ -4,9 +4,11 @@
 //! 控制套接字完成，这样 CLI、TUI、以及将来任何前端共享同一套能力，也避免了
 //! "两个进程同时动剪贴板"这类问题。
 //!
-//! 两个例外是有意为之：
+//! 以下例外是有意为之：
 //! - `cx daemon` 就是守护进程本身；
-//! - `cx doctor` 在守护进程**起不来**时也要能用，所以它有本地回退检查。
+//! - `cx doctor` 在守护进程**起不来**时也要能用，所以它有本地回退检查；
+//! - 后端只读测试、服务端注册、空间发布/加入是用户显式请求的直连操作；
+//!   TUI 后端草稿先测试成功，再事务提交配置与凭据。
 
 mod commands;
 mod doctor;
@@ -89,6 +91,36 @@ mod tests {
     fn 子命令定义合法() {
         // clap 自带的自检：参数冲突、缺描述等问题会在这里失败
         TestCli::command().debug_assert();
+    }
+
+    #[test]
+    fn s3_addressing_flags_are_explicit_and_mutually_exclusive() {
+        let args = [
+            "cx",
+            "backend",
+            "add",
+            "s3",
+            "fake",
+            "--bucket",
+            "fake-bucket",
+            "--access-key-id",
+            "fake-key",
+            "--virtual-host",
+        ];
+        let cli = TestCli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Backend {
+                command: BackendCommand::Add {
+                    kind: BackendAddCommand::S3 {
+                        virtual_host: true,
+                        path_style: false,
+                        ..
+                    }
+                }
+            }
+        ));
+        assert!(TestCli::try_parse_from(args.into_iter().chain(["--path-style"])).is_err());
     }
 
     #[test]
