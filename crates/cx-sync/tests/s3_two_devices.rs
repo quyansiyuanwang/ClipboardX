@@ -35,7 +35,9 @@ impl Device {
         paths.ensure().unwrap();
 
         let identity = Identity::load_or_create(&paths, Some(name)).unwrap();
-        let engine = Engine::new(&paths, Config::default(), identity, None).unwrap();
+        let mut config = Config::default();
+        config.space.encrypt = false; // 明文传输夹具显式选择，不依赖缺钥自动降级。
+        let engine = Engine::new(&paths, config, identity, None).unwrap();
         let device_id = engine.identity().device_id.clone();
 
         let backend = S3Backend::new(S3Options {

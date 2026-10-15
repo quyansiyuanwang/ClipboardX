@@ -281,7 +281,10 @@ impl Daemon {
         // ---- 后端 worker 线程 ----
         // 必须在引擎线程之前建好：发布队列的所有者随后要被移进引擎线程闭包。
         let worker_shutdown = Arc::new(AtomicBool::new(false));
-        let mut publishers: Vec<Sender<PublishJob>> = Vec::new();
+        let network_blocked = Arc::new(AtomicBool::new(
+            engine.is_paused() || !engine.remote_ready(),
+        ));
+        let mut publishers: Vec<Publisher> = Vec::new();
         let mut worker_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
         {
             let cursors = engine.cursors_snapshot();
@@ -293,10 +296,11 @@ impl Daemon {
                     .history_max_days
                     .saturating_mul(24 * 60 * 60 * 1000),
             };
-            // 有活动时按 poll_active_ms 轮询，空闲时靠 worker 自己退到 poll_idle_ms 的下限
-            let poll_interval = Duration::from_millis(self.config.sync.poll_active_ms.max(500));
-
-            for backend in self.config.enabled_backends() {
+            for backend in self
+                .config
+                .enabled_backends()
+                .filter(|_| engine.remote_ready())
+            {
                 let built = build_backend(backend, &paths, Duration::from_secs(60));
                 match built {
                     Ok(remote) => {
@@ -305,11 +309,29 @@ impl Daemon {
                         if let Some(existing) = cursors.get(&backend.name) {
                             sync.set_cursors(existing.clone());
                         }
-                        let (tx, rx) = bounded::<PublishJob>(64);
-                        publishers.push(tx);
+                        let (tx, rx) = bounded::<()>(1);
+                        let outbox =
+                            crate::outbox::bound_directory(&paths, backend, self.space.as_ref())?;
+                        publishers.push(Publisher {
+                            wake: tx,
+                            outbox: outbox.clone(),
+                        });
+                        let active_interval = Duration::from_millis(
+                            backend
+                                .poll_interval_ms
+                                .unwrap_or(self.config.sync.poll_active_ms)
+                                .max(500),
+                        );
+                        let idle_interval = Duration::from_millis(
+                            backend
+                                .poll_interval_ms
+                                .unwrap_or(self.config.sync.poll_idle_ms)
+                                .max(500),
+                        );
                         let backend_name = backend.name.clone();
                         let engine_tx = engine_tx.clone();
                         let shutdown = worker_shutdown.clone();
+                        let blocked = network_blocked.clone();
                         let handle = std::thread::Builder::new()
                             .name(format!("cx-backend-{}", backend.name))
                             .spawn(move || {
@@ -317,10 +339,15 @@ impl Daemon {
                                     sync,
                                     rx,
                                     engine_tx,
-                                    poll_interval,
-                                    retention,
-                                    backend_name,
-                                    shutdown,
+                                    WorkerSettings {
+                                        active_interval,
+                                        idle_interval,
+                                        retention,
+                                        name: backend_name,
+                                        outbox,
+                                        blocked,
+                                        shutdown,
+                                    },
                                 )
                             })
                             .map_err(DaemonError::io)?;
@@ -381,6 +408,10 @@ impl Daemon {
                         match message {
                             EngineMsg::Event(event) => {
                                 let actions = engine.handle(cx_core::now_ms(), event);
+                                network_blocked.store(
+                                    engine.is_paused() || !engine.remote_ready(),
+                                    Ordering::Release,
+                                );
                                 let mut runner = ActionRunner {
                                     engine: &mut engine,
                                     clip: &mut clip_write,
@@ -393,6 +424,10 @@ impl Daemon {
                             EngineMsg::Request { command, reply } => {
                                 let actions =
                                     engine.handle(cx_core::now_ms(), EngineEvent::Command(command));
+                                network_blocked.store(
+                                    engine.is_paused() || !engine.remote_ready(),
+                                    Ordering::Release,
+                                );
                                 let mut runner = ActionRunner {
                                     engine: &mut engine,
                                     clip: &mut clip_write,
@@ -525,13 +560,10 @@ impl Daemon {
     }
 }
 
-/// 发布任务（引擎线程 → 后端 worker）。
-///
-/// 载荷用 `Arc<[u8]>`：多个后端共享同一份字节，避免大图片在每个后端各复制一次。
-struct PublishJob {
-    name: String,
-    entry: ManifestEntry,
-    bytes: Arc<[u8]>,
+/// 发布载荷先写入 outbox；channel 只负责唤醒，不承载唯一副本。
+struct Publisher {
+    wake: Sender<()>,
+    outbox: std::path::PathBuf,
 }
 
 /// 记录/移除对端（供 `cx doctor` 展示）。
@@ -587,6 +619,10 @@ fn start_lan(
     }
 
     let space = cx_core::LocalSpace::load(paths).ok();
+    if config.space.encrypt && space.as_ref().and_then(|s| s.cipher.space_key()).is_none() {
+        log::warn!("要求加密但空间密钥未就绪：禁用局域网同步，请先创建或加入空间");
+        return Ok(None);
+    }
     let (psk_hex, space_id) = match (&space, config.lan.pairing_code.as_deref()) {
         (Some(space), _) if space.cipher.space_key().is_some() => (
             cx_lan::derive_psk(
@@ -714,61 +750,113 @@ fn start_lan(
 /// 一个后端一个线程，只做两件事：把引擎产出的对象写上去、按 manifest 增量把别人的
 /// 对象取回来。取回的对象**不在这里解密/应用**，一律交给引擎，由它统一做去重、
 /// 解密与策略判断——否则"两处都以为对方查过"的漏洞迟早会出现。
-fn backend_worker_loop(
-    mut sync: RemoteSync,
-    jobs: Receiver<PublishJob>,
-    engine_tx: Sender<EngineMsg>,
-    poll_interval: Duration,
+struct WorkerSettings {
+    active_interval: Duration,
+    idle_interval: Duration,
     retention: RetentionLimits,
     name: String,
+    outbox: std::path::PathBuf,
+    blocked: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-) {
-    log::info!("后端 {name} 就绪：{}", sync.describe());
-    let mut last_error: Option<String> = None;
+}
 
+fn backend_worker_loop(
+    mut sync: RemoteSync,
+    jobs: Receiver<()>,
+    engine_tx: Sender<EngineMsg>,
+    settings: WorkerSettings,
+) {
+    let WorkerSettings {
+        active_interval,
+        idle_interval,
+        retention,
+        name,
+        outbox,
+        blocked,
+        shutdown,
+    } = settings;
+    log::info!("后端 {name} 就绪：{}", sync.describe());
+    let mut failures = 0u32;
+    let mut delay = Duration::ZERO;
     loop {
+        let deadline = std::time::Instant::now() + delay;
+        while std::time::Instant::now() < deadline {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(100));
+            match jobs.recv_timeout(remaining) {
+                Ok(()) if failures == 0 => break,
+                Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-
-        // 等发布任务；等到轮询间隔就先做一轮拉取
-        let mut pending: Vec<PublishJob> = Vec::new();
-        match jobs.recv_timeout(poll_interval) {
-            Ok(job) => pending.push(job),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+        if blocked.load(Ordering::Acquire) {
+            delay = Duration::from_millis(100);
+            continue;
         }
-        while pending.len() < 64 {
-            match jobs.try_recv() {
-                Ok(job) => pending.push(job),
-                Err(_) => break,
-            }
-        }
-
         let mut error = None;
-
-        for job in pending {
-            match sync.publish(&job.name, &job.bytes, job.entry.clone(), retention) {
-                Ok(()) => log::debug!("后端 {name} 已发布 {}", job.name),
-                Err(err) => {
-                    log::warn!("后端 {name} 发布 {} 失败：{err}", job.name);
-                    error = Some(err.to_string());
+        let mut active = false;
+        match crate::outbox::pending(&outbox, 64) {
+            Ok(pending) => {
+                for (entry, bytes) in pending {
+                    if blocked.load(Ordering::Acquire) || shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    active = true;
+                    match sync.publish(&entry.name, &bytes, entry.clone(), retention) {
+                        Ok(()) => {
+                            if let Err(err) = crate::outbox::acknowledge(&outbox, &entry.name) {
+                                error = Some(err.to_string());
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            error = Some(err.to_string());
+                            break;
+                        }
+                    }
                 }
             }
+            Err(err) => error = Some(err.to_string()),
         }
+        let previous = sync.cursors().clone();
 
         match sync.poll(cx_sync::remote::DEFAULT_MAX_FETCH) {
             Ok(outcome) => {
+                active |= outcome.manifest_changed;
                 for (object_name, item) in outcome.incoming {
-                    log::debug!("后端 {name} 取回 {object_name}");
-                    let _ = engine_tx.send(EngineMsg::Event(EngineEvent::Command(
-                        EngineCommand::ApplyRemote {
-                            backend: name.clone(),
-                            name: object_name,
-                            item: Box::new(item),
-                        },
-                    )));
-                    sync.note_applied(1);
+                    let (tx, rx) = bounded(1);
+                    if engine_tx
+                        .send(EngineMsg::Request {
+                            command: EngineCommand::ApplyRemote {
+                                backend: name.clone(),
+                                name: object_name,
+                                item: Box::new(item),
+                            },
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    match rx.recv_timeout(ENGINE_REPLY_TIMEOUT) {
+                        Ok(ReplyPayload::Done { .. }) => sync.note_applied(1),
+                        _ => {
+                            error = Some("远端对象尚未成功入库，保留游标以便重试".into());
+                            break;
+                        }
+                    }
+                }
+                if error.is_some() {
+                    sync.set_cursors(previous);
+                } else if let Some(message) = outcome.errors.first() {
+                    error = Some(message.clone());
                 }
             }
             Err(err) => {
@@ -787,13 +875,18 @@ fn backend_worker_loop(
                 error: error.clone(),
             },
         )));
-        if error != last_error {
-            match &error {
-                Some(message) => log::warn!("后端 {name}：{message}"),
-                None => log::info!("后端 {name} 恢复正常"),
-            }
-            last_error = error;
-        }
+        failures = if error.is_some() {
+            failures.saturating_add(1)
+        } else {
+            0
+        };
+        delay = if failures > 0 {
+            Duration::from_millis(cx_core::state::backoff_ms(failures, 0))
+        } else if active {
+            active_interval
+        } else {
+            idle_interval
+        };
     }
     log::debug!("后端 {name} worker 已停止");
 }
@@ -809,7 +902,7 @@ struct ActionRunner<'a> {
     clip: &'a mut Option<SystemClipboard>,
     broadcaster: &'a Broadcaster,
     /// 各后端 worker 的发布队列（顺序与配置里的启用后端一致）。
-    publishers: &'a [Sender<PublishJob>],
+    publishers: &'a [Publisher],
     /// 局域网直连服务（启用时才有）。
     lan: Option<&'a Arc<LanService>>,
 }
@@ -831,6 +924,26 @@ impl ActionRunner<'_> {
 
     fn run(&mut self, action: Action, depth: u32) -> Option<ReplyPayload> {
         match action {
+            Action::CopyToClipboard { id, content } => {
+                let result = self
+                    .clip
+                    .as_mut()
+                    .ok_or_else(|| "纯中继模式没有本机剪贴板".to_string())
+                    .and_then(|clip| {
+                        clip.write(&content)
+                            .map_err(|err| format!("写入剪贴板失败：{err}"))
+                    });
+                Some(match result {
+                    Ok(()) => ReplyPayload::Done { id },
+                    Err(msg) => ReplyPayload::Error {
+                        id,
+                        body: cx_proto::control::ErrorBody {
+                            code: "clipboard_write_failed".into(),
+                            msg,
+                        },
+                    },
+                })
+            }
             Action::ApplyToClipboard(content) => {
                 match self.clip.as_mut() {
                     Some(clip) => match clip.write(&content) {
@@ -842,6 +955,10 @@ impl ActionRunner<'_> {
                 None
             }
             Action::Publish { name, entry, bytes } => {
+                if !self.engine.remote_ready() {
+                    log::warn!("空间密钥未就绪，拒绝外发对象");
+                    return None;
+                }
                 // 局域网直连：优先走它（同一网段里最快，且不经过服务器）。
                 // 注意这里必须在"没有后端就返回"之前——局域网与后端是两条独立通路，
                 // 只用局域网（不配后端）是完全正常的用法。
@@ -869,17 +986,17 @@ impl ActionRunner<'_> {
                     return None;
                 }
 
-                // 一次分配，多后端共享（Arc<[u8]>）
-                let shared: Arc<[u8]> = Arc::from(bytes);
-                let hash = entry.hash.chars().take(8).collect::<String>();
-                for sender in self.publishers {
-                    let job = PublishJob {
-                        name: name.clone(),
-                        entry: entry.clone(),
-                        bytes: shared.clone(),
-                    };
-                    if let Err(err) = sender.try_send(job) {
-                        log::warn!("后端发布队列不可用，丢弃 {name}（{hash}）：{err}");
+                for publisher in self.publishers {
+                    if let Err(err) =
+                        crate::outbox::enqueue(&publisher.outbox, &name, &entry, &bytes)
+                    {
+                        log::error!("发布未排队，发件箱写入失败：{err}");
+                        self.broadcaster.send(ControlEvent::new(
+                            events::CLIP_SKIPPED,
+                            json!({"reason":"outbox_write_failed","name":name}),
+                        ));
+                    } else {
+                        let _ = publisher.wake.try_send(());
                     }
                 }
                 None
@@ -890,9 +1007,9 @@ impl ActionRunner<'_> {
                 None
             }
             Action::PollNow => {
-                // 后端 worker 按自己的节奏轮询；这里只需要把它们的等待缩短不了，
-                // 因此记录一下即可（`cx pull` 的实际效果是"下一轮马上就会跑"）
-                log::debug!("收到立即拉取请求，后端 worker 将在下一轮执行");
+                for publisher in self.publishers {
+                    let _ = publisher.wake.try_send(());
+                }
                 None
             }
             Action::RecheckClipboard => {
@@ -943,6 +1060,21 @@ fn to_command(
     paths: &Paths,
 ) -> Result<EngineCommand, String> {
     let id = request.id;
+    if let Some(expected_name) = request.arg_str("expected_name") {
+        let operation = match request.cmd.as_str() {
+            commands::HISTORY_SHOW_CHECKED => "show",
+            commands::HISTORY_DELETE_CHECKED => "delete",
+            commands::COPY_CHECKED => "copy",
+            _ => return Err("expected_name 仅用于历史操作".into()),
+        };
+        return Ok(EngineCommand::HistoryChecked {
+            id,
+            position: request.arg_u64("position").unwrap_or(0) as usize,
+            expected_name: expected_name.to_string(),
+            operation: operation.into(),
+            max_chars: request.arg_u64("max_chars").unwrap_or(2_000).min(1_000_000) as usize,
+        });
+    }
     match request.cmd.as_str() {
         commands::STATUS => Ok(EngineCommand::Status { id }),
         commands::PAUSE => Ok(EngineCommand::Pause { id }),
@@ -1278,3 +1410,96 @@ pub fn running_pid(paths: &Paths) -> Option<u32> {
 /// 未使用但保留：把接收端暴露给 TUI 的将来版本（订阅由控制层代理）。
 #[allow(dead_code)]
 fn _unused(_rx: Receiver<ControlEvent>) {}
+
+#[cfg(test)]
+mod worker_regressions {
+    use super::*;
+    use cx_backend::{MemoryBackend, RemoteBackend};
+    #[test]
+    fn 暂停重启保留积压直到恢复且超过队列容量不丢() {
+        let root = std::env::temp_dir().join(format!(
+            "cx-worker-test-{}-{}",
+            std::process::id(),
+            cx_core::now_ms()
+        ));
+        let paths = Paths::from_root(&root);
+        let outbox = crate::outbox::directory(&paths, "fake-bound-target");
+        let store = MemoryBackend::new("fake");
+        let ts = 1_759_299_998_712;
+        let device = "a".repeat(32);
+        for index in 0..70u64 {
+            let name = cx_proto::ItemName::build(
+                ts + index,
+                &device,
+                &format!("{index:08x}{}", "b".repeat(56)),
+            );
+            let entry = ManifestEntry {
+                name: name.clone(),
+                day: cx_proto::civil::day_from_ms(ts + index),
+                size: 4,
+                hash: "b".repeat(64),
+                kind: cx_proto::Kind::Text,
+                created_ms: ts + index,
+                mime: None,
+            };
+            crate::outbox::enqueue(&outbox, &name, &entry, b"fake").unwrap();
+        }
+        let blocked = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (wake, rx) = bounded(1);
+        let (tx, reports) = unbounded();
+        let thread = {
+            let blocked = blocked.clone();
+            let shutdown = shutdown.clone();
+            let outbox = outbox.clone();
+            let sync = RemoteSync::new(Box::new(store.shared("fake")), &device, "fake-device");
+            std::thread::spawn(move || {
+                backend_worker_loop(
+                    sync,
+                    rx,
+                    tx,
+                    WorkerSettings {
+                        active_interval: Duration::from_millis(1),
+                        idle_interval: Duration::from_millis(2),
+                        retention: RetentionLimits {
+                            max_items: 100,
+                            max_age_ms: 0,
+                        },
+                        name: "fake".into(),
+                        outbox,
+                        blocked,
+                        shutdown,
+                    },
+                )
+            })
+        };
+        assert!(reports.recv_timeout(Duration::from_millis(180)).is_err());
+        assert_eq!(crate::outbox::pending(&outbox, 100).unwrap().len(), 70);
+        blocked.store(false, Ordering::Release);
+        wake.try_send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = reports.recv_timeout(Duration::from_millis(100));
+            if crate::outbox::pending(&outbox, 100).unwrap().is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "积压应全部完成");
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = wake.try_send(());
+        thread.join().unwrap();
+        let mut reader = store.shared("reader");
+        let bytes = reader
+            .get(&cx_backend::layout::manifest_path(&device))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cx_proto::Manifest::from_json(std::str::from_utf8(&bytes).unwrap())
+                .unwrap()
+                .items
+                .len(),
+            70
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

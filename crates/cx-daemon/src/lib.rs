@@ -12,6 +12,7 @@ pub mod control;
 mod error;
 mod lock;
 pub mod logging;
+mod outbox;
 pub mod runtime;
 pub mod service;
 

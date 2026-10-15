@@ -33,6 +33,12 @@ pub struct Cursor {
     /// 已见到的最大 `created_ms`。
     #[serde(default)]
     pub items_ms: u64,
+    /// 游标算法版本；旧时间戳游标升级时重新扫描，靠对象名去重补齐漏项。
+    #[serde(default)]
+    pub progress_v: u32,
+    /// 当前 manifest 已成功下载并交付的对象名（不能用最大时间越过未处理条目）。
+    #[serde(default)]
+    pub completed_names: Vec<String>,
 }
 
 /// 单个后端的运行状态。
@@ -273,6 +279,7 @@ mod tests {
                 etag: Some("\"abc\"".to_string()),
                 updated_ms: 900,
                 items_ms: 800,
+                ..Default::default()
             },
         );
         state.save(&paths).unwrap();

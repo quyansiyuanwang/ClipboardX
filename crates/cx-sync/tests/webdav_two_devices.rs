@@ -39,7 +39,11 @@ impl Device {
         paths.ensure().unwrap();
 
         let identity = Identity::load_or_create(&paths, Some(name)).unwrap();
-        let engine = Engine::new(&paths, Config::default(), identity, space).unwrap();
+        let mut config = Config::default();
+        config.space.encrypt = space
+            .as_ref()
+            .is_some_and(|space| space.cipher.space_key().is_some());
+        let engine = Engine::new(&paths, config, identity, space).unwrap();
         let device_id = engine.identity().device_id.clone();
 
         let backend = WebDavBackend::new(WebDavOptions {

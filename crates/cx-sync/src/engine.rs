@@ -49,6 +49,19 @@ pub enum Event {
 /// 控制命令（都带请求 id，便于把结果原样回给发起者）。
 #[derive(Debug)]
 pub enum Command {
+    /// 按稳定对象名核对历史请求；位置漂移时拒绝，不操作另一条内容。
+    HistoryChecked {
+        /// 请求 id。
+        id: u64,
+        /// 原位置。
+        position: usize,
+        /// 用户选择的稳定对象名。
+        expected_name: String,
+        /// show / copy / delete。
+        operation: String,
+        /// 预览字符上限。
+        max_chars: usize,
+    },
     /// 暂停同步。
     Pause {
         /// 请求 id。
@@ -149,6 +162,13 @@ pub enum Command {
 pub enum Action {
     /// 把内容写入本机剪贴板。
     ApplyToClipboard(ClipContent),
+    /// 手动复制：真正写入剪贴板后才响应客户端。
+    CopyToClipboard {
+        /// 请求 id。
+        id: u64,
+        /// 已解密并核对身份的内容。
+        content: ClipContent,
+    },
     /// 发布对象到各后端（由守护进程的 worker 线程消费）。
     Publish {
         /// 对象名。
@@ -283,6 +303,11 @@ impl Engine {
         &self.config
     }
 
+    /// 是否允许外发内容。要求加密时，密钥未就绪必须失败关闭，不能静默明文降级。
+    pub fn remote_ready(&self) -> bool {
+        !self.config.space.encrypt || self.cipher.space_key().is_some()
+    }
+
     /// 设备身份。
     pub fn identity(&self) -> &Identity {
         &self.identity
@@ -367,6 +392,46 @@ impl Engine {
 
     fn on_command(&mut self, now_ms: u64, command: Command) -> Vec<Action> {
         match command {
+            Command::HistoryChecked {
+                id,
+                position,
+                expected_name,
+                operation,
+                max_chars,
+            } => {
+                let matches = self
+                    .history_summaries(position.saturating_add(1))
+                    .get(position)
+                    .is_some_and(|item| item.name == expected_name);
+                if !matches {
+                    return vec![Action::Reply(ReplyPayload::Error {
+                        id,
+                        body: ErrorBody {
+                            code: "history_changed".into(),
+                            msg: "历史已变化，操作已取消；请刷新后重新选择".into(),
+                        },
+                    })];
+                }
+                let command = match operation.as_str() {
+                    "show" => Command::HistoryShow {
+                        id,
+                        position,
+                        max_chars,
+                    },
+                    "copy" => Command::Copy { id, position },
+                    "delete" => Command::HistoryDelete { id, position },
+                    _ => {
+                        return vec![Action::Reply(ReplyPayload::Error {
+                            id,
+                            body: ErrorBody {
+                                code: "bad_args".into(),
+                                msg: "未知历史操作".into(),
+                            },
+                        })];
+                    }
+                };
+                self.on_command(now_ms, command)
+            }
             Command::Pause { id } => {
                 self.state.paused = true;
                 vec![
@@ -425,11 +490,15 @@ impl Engine {
                 })],
             },
             Command::Copy { id, position } => match self.copy_from_history(now_ms, position) {
-                Ok(actions) => {
-                    let mut out = vec![Action::Reply(ReplyPayload::Done { id })];
-                    out.extend(actions);
-                    out
-                }
+                Ok(actions) => actions
+                    .into_iter()
+                    .map(|action| match action {
+                        Action::ApplyToClipboard(content) => {
+                            Action::CopyToClipboard { id, content }
+                        }
+                        other => other,
+                    })
+                    .collect(),
                 Err(err) => vec![Action::Reply(ReplyPayload::Error {
                     id,
                     body: error_body(&err),
@@ -453,6 +522,11 @@ impl Engine {
                 report: Box::new(self.doctor()),
             })],
             Command::Reload { id, config } => {
+                if config.backends != self.config.backends || config.space != self.config.space || config.lan != self.config.lan {
+                    return vec![Action::Reply(ReplyPayload::Error { id, body: ErrorBody {
+                        code: "restart_required".into(), msg: "后端、空间或局域网配置已变化；请重启守护进程后生效，未将新配置套用到旧连接".into(),
+                    } })];
+                }
                 self.config = *config;
                 vec![
                     Action::Reply(ReplyPayload::Done { id }),
@@ -466,7 +540,22 @@ impl Engine {
                 backend,
                 name,
                 item,
-            } => self.apply_remote(now_ms, &backend, &name, &item),
+            } => {
+                let mut actions = self.apply_remote(now_ms, &backend, &name, &item);
+                let accepted = self.state.is_seen(&name) && self.flush_state().is_ok();
+                actions.push(Action::Reply(if accepted {
+                    ReplyPayload::Done { id: 0 }
+                } else {
+                    ReplyPayload::Error {
+                        id: 0,
+                        body: ErrorBody {
+                            code: "apply_pending".into(),
+                            msg: "对象未成功入库，稍后重试".into(),
+                        },
+                    }
+                }));
+                actions
+            }
             Command::BackendReport {
                 name,
                 cursors,
@@ -480,6 +569,13 @@ impl Engine {
     /// 发布本机内容：忽略规则 → 体积 → 加密 → 入库 → 通知。
     fn publish(&mut self, now_ms: u64, content: ClipContent, force: bool) -> Vec<Action> {
         let mut actions = Vec::new();
+        if self.state.paused {
+            actions.push(Action::Notify(ControlEvent::new(
+                event::CLIP_SKIPPED,
+                json!({"reason":"paused"}),
+            )));
+            return actions;
+        }
 
         // 忽略规则：空白文本与 glob 规则
         if let Some(text) = content.text() {
@@ -567,21 +663,23 @@ impl Engine {
                     created_ms: item.meta.created_ms,
                     mime: item.meta.mime.clone(),
                 };
-                actions.push(Action::Publish {
-                    name: name.clone(),
-                    entry,
-                    bytes,
-                });
-                actions.push(Action::Notify(ControlEvent::new(
-                    event::CLIP_PUBLISHED,
-                    json!({
-                        "name": name,
-                        "kind": content.kind().as_str(),
-                        "hash": hash,
-                        "bytes": item.plain_len(),
-                        "summary": content.describe(),
-                    }),
-                )));
+                if self.remote_ready() {
+                    actions.push(Action::Publish {
+                        name: name.clone(),
+                        entry,
+                        bytes,
+                    });
+                    actions.push(Action::Notify(ControlEvent::new(
+                        event::CLIP_PUBLISHED,
+                        json!({"name": name, "kind": content.kind().as_str(), "hash": hash,
+                            "bytes": item.plain_len(), "summary": content.describe(), "stage": "queued"}),
+                    )));
+                } else {
+                    actions.push(Action::Notify(ControlEvent::new(
+                        event::CLIP_SKIPPED,
+                        json!({"reason": "encryption_not_ready", "name": name, "local_history": true}),
+                    )));
+                }
                 actions.push(Action::SaveState);
             }
             Err(err) => actions.push(Action::Log {
@@ -681,6 +779,7 @@ impl Engine {
                 level: log::Level::Warn,
                 message: format!("远端对象 {name} 写入历史失败：{err}"),
             });
+            return actions;
         }
         self.seen.insert(name);
         self.state.mark_seen(name);
@@ -773,7 +872,7 @@ impl Engine {
                 let state = self.state.backend(&backend.name);
                 let view = match state {
                     Some(state) => cx_proto::BackendStateView {
-                        enabled: state.enabled,
+                        enabled: backend.enabled,
                         last_ok_ms: state.last_ok_ms,
                         last_error: state.last_error.clone(),
                         failures: state.consecutive_failures,
@@ -1002,13 +1101,9 @@ impl Engine {
 
         match error {
             Some(message) => {
-                // 退避抖动：用系统随机数避免多后端同时重试
-                let mut draw = [0u8; 1];
-                let _ = getrandom::fill(&mut draw);
-                let jitter = (draw[0] % 21) as u64;
                 let failures = state.consecutive_failures;
                 let message_for_log = message.clone();
-                state.record_failure(now_ms, message, jitter);
+                state.record_failure(now_ms, message, 0);
                 log::debug!(
                     "后端 {name} 失败（第 {} 次）：{message_for_log}",
                     failures + 1
@@ -1045,7 +1140,16 @@ impl Engine {
         self.history
             .newest_first(limit)
             .into_iter()
-            .map(|entry| ManifestEntry {
+            .enumerate()
+            .filter(|(position, entry)| {
+                self.remote_ready()
+                    && self
+                        .history
+                        .read_newest(*position)
+                        .ok()
+                        .is_some_and(|item| self.cipher.open(&entry.name, &item).is_ok())
+            })
+            .map(|(_, entry)| ManifestEntry {
                 name: entry.name.clone(),
                 day: cx_proto::civil::day_from_ms(entry.created_ms),
                 size: entry.frame_len as u64,
@@ -1106,7 +1210,9 @@ mod tests {
     }
 
     impl Harness {
-        fn new(config: Config) -> Self {
+        fn new(mut config: Config) -> Self {
+            // 本测试夹具没有空间密钥，旧发布语义测试必须明确选择明文模式。
+            config.space.encrypt = false;
             // 注意：并行测试不能用时间戳命名目录（同毫秒会撞名，互相删掉对方的数据）
             static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1153,9 +1259,48 @@ mod tests {
 
     fn applied(actions: &[Action]) -> Option<&ClipContent> {
         actions.iter().find_map(|a| match a {
-            Action::ApplyToClipboard(content) => Some(content),
+            Action::ApplyToClipboard(content) | Action::CopyToClipboard { content, .. } => {
+                Some(content)
+            }
             _ => None,
         })
+    }
+
+    #[test]
+    fn 要求加密但没有密钥时仅记录本机历史() {
+        let mut h = Harness::new(Config::default());
+        h.engine.config.space.encrypt = true;
+        let actions = h.feed(Harness::text("fake-secret-only-local"));
+        assert!(published(&actions).is_none());
+        assert_eq!(h.engine.history_len(), 1);
+        assert!(!h.engine.remote_ready());
+        assert!(actions.iter().any(|action| matches!(action, Action::Notify(event)
+            if event.event == event::CLIP_SKIPPED && event.data["reason"] == "encryption_not_ready")));
+    }
+
+    #[test]
+    fn 稳定对象校验拒绝插入新条目后的旧位置() {
+        let mut h = Harness::new(Config::default());
+        h.feed(Harness::text("selected-a"));
+        let expected_name = h.engine.history_summaries(1)[0].name.clone();
+        h.tick(10);
+        h.feed(Harness::text("new-b"));
+        for operation in ["show", "copy", "delete"] {
+            let actions = h.engine.handle(
+                h.now,
+                Event::Command(Command::HistoryChecked {
+                    id: 77,
+                    position: 0,
+                    expected_name: expected_name.clone(),
+                    operation: operation.into(),
+                    max_chars: 64,
+                }),
+            );
+            assert!(
+                matches!(&actions[0], Action::Reply(ReplyPayload::Error { body, .. }) if body.code == "history_changed")
+            );
+            assert_eq!(h.engine.history_len(), 2);
+        }
     }
 
     #[test]
@@ -1369,7 +1514,12 @@ mod tests {
                 item: Box::new(item),
             }),
         );
-        assert!(second.is_empty(), "已处理过的对象不应再产生动作");
+        assert!(
+            second
+                .iter()
+                .all(|action| matches!(action, Action::Reply(ReplyPayload::Done { .. }))),
+            "已处理对象仅确认，不重复应用"
+        );
         assert_eq!(h.engine.history_len(), 1);
     }
 
@@ -1497,7 +1647,11 @@ mod tests {
             .handle(h.now, Event::Command(Command::Copy { id: 7, position: 1 }));
         let content = applied(&actions).expect("应写回剪贴板");
         assert_eq!(content.text(), Some("第一条"), "position=1 是倒数第二条");
-        assert!(actions.iter().any(|a| matches!(a, Action::Reply(_))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CopyToClipboard { id: 7, .. }))
+        );
 
         // 写回产生的 watcher 事件不应导致重复上传
         h.tick(10);

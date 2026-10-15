@@ -33,7 +33,9 @@ impl Device {
         paths.ensure().unwrap();
 
         let identity = Identity::load_or_create(&paths, Some(name)).unwrap();
-        let engine = Engine::new(&paths, Config::default(), identity, None).unwrap();
+        let mut config = Config::default();
+        config.space.encrypt = false;
+        let engine = Engine::new(&paths, config, identity, None).unwrap();
         let device_id = engine.identity().device_id.clone();
 
         let backend = ServerBackend::new(ServerOptions {

@@ -372,6 +372,19 @@ impl ControlClient {
         Ok(client)
     }
 
+    /// 设置只读/请求超时（TUI使用短超时保持退出和重连有界）。
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), DaemonError> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(timeout)
+            .map_err(DaemonError::io)
+    }
+
+    /// 克隆仅用于 shutdown 的控制句柄；不读取也不泄露令牌。
+    pub fn cancellation_socket(&self) -> Result<TcpStream, DaemonError> {
+        self.writer.try_clone().map_err(DaemonError::io)
+    }
+
     /// 守护进程 pid（仅信息展示）。
     pub fn daemon_pid(&self) -> u32 {
         self.connected_pid
