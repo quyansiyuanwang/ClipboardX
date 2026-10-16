@@ -560,6 +560,13 @@ impl Daemon {
     }
 }
 
+/// 告警前缀：`WARN: ` 开头的是"要展示但不算故障"的信息（例如保留策略清理失败）。
+fn fault(error: &Option<String>) -> bool {
+    error
+        .as_deref()
+        .is_some_and(|text| !text.starts_with("WARN: "))
+}
+
 /// 发布载荷先写入 outbox；channel 只负责唤醒，不承载唯一副本。
 struct Publisher {
     wake: Sender<()>,
@@ -806,6 +813,7 @@ fn backend_worker_loop(
         }
         let mut error = None;
         let mut active = false;
+        let mut trim_warning: Option<String> = None;
         match crate::outbox::pending(&outbox, 64) {
             Ok(pending) => {
                 for (entry, bytes) in pending {
@@ -816,7 +824,12 @@ fn backend_worker_loop(
                     match sync.publish(&entry.name, &bytes, entry.clone(), retention) {
                         // 返回的是"保留策略清理失败"的条数：publish 内部已 warn 过，
                         // 这里照常出队——清理问题不该阻塞同步，也不该触发后端退避。
-                        Ok(_) => {
+                        Ok(trim) => {
+                            if trim > 0 {
+                                trim_warning = Some(format!(
+                                    "WARN: 保留策略清理失败 {trim} 个对象：检查该凭据是否具备删除权限（S3/OSS 需要 DeleteObject）"
+                                ));
+                            }
                             if let Err(err) = crate::outbox::acknowledge(&outbox, &entry.name) {
                                 error = Some(err.to_string());
                                 break;
@@ -859,7 +872,7 @@ fn backend_worker_loop(
                         }
                     }
                 }
-                if error.is_some() {
+                if fault(&error) {
                     sync.set_cursors(previous);
                 } else if let Some(message) = outcome.errors.first() {
                     error = Some(message.clone());
@@ -871,6 +884,15 @@ fn backend_worker_loop(
             }
         }
 
+        // 清理失败这类"WARN 前缀"告警照常上报给 status（doctor 与面板都能看到），
+        // 但不算故障：否则"能同步但删不掉"会被当成连不上，并把轮询拖进退避。
+        if error.is_none()
+            && let Some(warning) = trim_warning
+        {
+            error = Some(warning);
+        }
+        let has_fault = fault(&error);
+
         // 每轮都汇报：游标必须及时落盘，否则重启会把历史重下一遍
         let _ = engine_tx.send(EngineMsg::Event(EngineEvent::Command(
             EngineCommand::BackendReport {
@@ -881,7 +903,7 @@ fn backend_worker_loop(
                 error: error.clone(),
             },
         )));
-        failures = if error.is_some() {
+        failures = if has_fault {
             failures.saturating_add(1)
         } else {
             0
