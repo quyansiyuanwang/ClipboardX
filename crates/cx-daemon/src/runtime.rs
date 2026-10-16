@@ -814,7 +814,9 @@ fn backend_worker_loop(
                     }
                     active = true;
                     match sync.publish(&entry.name, &bytes, entry.clone(), retention) {
-                        Ok(()) => {
+                        // 返回的是"保留策略清理失败"的条数：publish 内部已 warn 过，
+                        // 这里照常出队——清理问题不该阻塞同步，也不该触发后端退避。
+                        Ok(_) => {
                             if let Err(err) = crate::outbox::acknowledge(&outbox, &entry.name) {
                                 error = Some(err.to_string());
                                 break;

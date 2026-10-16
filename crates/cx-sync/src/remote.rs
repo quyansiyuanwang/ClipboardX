@@ -124,13 +124,17 @@ impl RemoteSync {
     ///
     /// `entry` 由引擎给出（含哈希、大小、类型、来源设备）。对象名字含内容哈希，
     /// 因此用 `only_if_absent` 写：已存在说明完全相同的内容已经在远端了。
+    /// 发布一个对象，并把它记进自己的 manifest。
+    ///
+    /// 返回本轮"保留策略清理失败"的条数：这些失败必须让用户看见，但又不能当成
+    /// 后端故障（那会把"能同步但删不掉"误判成"连不上"并触发退避）。
     pub fn publish(
         &mut self,
         name: &str,
         bytes: &[u8],
         entry: ManifestEntry,
         limits: RetentionLimits,
-    ) -> Result<(), BackendError> {
+    ) -> Result<u64, BackendError> {
         let path = layout::item_path(name)
             .ok_or_else(|| BackendError::Malformed(format!("非法的对象名：{name}")))?;
         self.backend.put(&path, bytes, true)?;
@@ -141,10 +145,12 @@ impl RemoteSync {
         let removed = manifest.trim(limits.max_items, limits.max_age_ms, manifest.updated_ms);
 
         // 只删自己 manifest 裁掉的对象：别人的对象由他们自己裁
+        let mut trim_failures = 0u64;
         for name in &removed {
             if let Some(path) = layout::item_path(name)
                 && let Err(err) = self.backend.delete(&path)
             {
+                trim_failures = trim_failures.saturating_add(1);
                 // 保留策略删不掉通常是权限问题（缺 oss:DeleteObject），不是网络抖动：
                 // 用 warn 而不是 debug，否则旧对象会在桶里静默堆积、用户完全看不到。
                 log::warn!(
@@ -164,7 +170,7 @@ impl RemoteSync {
         )?;
         self.own_manifest = Some(manifest);
         self.published = self.published.saturating_add(1);
-        Ok(())
+        Ok(trim_failures)
     }
 
     /// 拉取一轮：按 manifest 增量取回别人的对象。
