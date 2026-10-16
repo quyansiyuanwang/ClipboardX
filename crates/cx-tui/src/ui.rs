@@ -27,7 +27,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // 头部高度按内容算：标题 + 状态（+ 健康提示 + 最近一条提示），**再加一行下边框**。
     // 少算边框那一行会把状态行直接裁掉——这个错误在"未连接"的渲染测试里被抓到了。
     let mut header = 3u16;
-    if app.health_line().is_some() {
+    // 只有"需要用户动手"的健康问题才占一行；一切正常时不占版面
+    if app.health_line().is_some_and(|(_, warn)| warn) {
         header += 1;
     }
     if app.notice.is_some() {
@@ -154,13 +155,10 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) -> usize {
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = Line::from(vec![
-        Span::styled(
-            " ClipboardX ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("（终端界面）", Style::default().fg(Color::DarkGray)),
-    ]);
+    let title = Line::from(Span::styled(
+        " ClipboardX ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     let state = app.status_line();
     let state_style = match &app.status {
         _ if !app.connected => Style::default().fg(Color::Red),
@@ -169,15 +167,12 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Some(_) => Style::default().fg(Color::Green),
     };
     let mut lines = vec![title, Line::from(Span::styled(state, state_style))];
-    // 健康行：空后端 / 有后端在失败时出现（都是"我明明开着为什么不同步"的答案）
-    if let Some((text, warn)) = app.health_line() {
+    // 健康行只在出问题时才显示（"我明明开着为什么不同步"的答案），
+    // 一切正常就不占一行——界面保持安静。
+    if let Some((text, true)) = app.health_line() {
         lines.push(Line::from(Span::styled(
-            format!(" {text}"),
-            if warn {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
+            format!(" ! {text}"),
+            Style::default().fg(Color::Yellow),
         )));
     }
     if let Some(notice) = &app.notice {
@@ -246,11 +241,11 @@ fn history_title(app: &App) -> String {
     };
     if app.filter_active() {
         format!(
-            " 历史 {position}（过滤 “{}”，命中 {shown}/{total}，0 = 最新）",
+            " 历史 {position}（过滤 “{}” {shown}/{total}）",
             app.filter()
         )
     } else {
-        format!(" 历史 {position}（共 {total} 条，0 = 最新）")
+        format!(" 历史 {position}（{total} 条）")
     }
 }
 
@@ -368,7 +363,7 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             if app.filter_active() {
                 "当前过滤没有匹配到内容（Esc 清除过滤）"
             } else {
-                "历史里还没有内容。复制点什么，或者按 p 发布当前剪贴板。"
+                "历史里还没有内容。复制点什么，或按 p 发布。"
             },
             Style::default().fg(Color::DarkGray),
         ))]),
@@ -523,12 +518,19 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    // 页脚只放"下一步最可能用到的键"；宽终端才补全，细节都在 ? 帮助页里
     let hint = if app.show_help {
         " 任意键返回　q 退出 "
     } else if app.filter_active() {
-        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　/ 改过滤　Esc 清过滤　? 帮助　q 退出 "
+        if area.width >= 84 {
+            " 回车 写回剪贴板　/ 改过滤　Esc 清过滤　J/K 滚动　? 帮助　q 退出 "
+        } else {
+            " 回车 写回剪贴板　Esc 清过滤　? 帮助 "
+        }
+    } else if area.width >= 100 {
+        " 回车 写回剪贴板　空格 暂停　d 删除　b 后端　a 添加　/ 过滤　? 帮助　q 退出 "
     } else {
-        " j/k 选择　PgUp/PgDn 翻页　J/K 滚动预览　回车 写回剪贴板　空格 暂停/恢复　d 删除　b 后端状态　a 添加后端　/ 过滤　? 帮助　q 退出 "
+        " 回车 写回剪贴板　d 删除　b 后端　/ 过滤　? 帮助 "
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -699,7 +701,14 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             inner.width,
         ));
     }
-    lines.extend(wrapped_lines(Text::from("Tab/↑↓ 焦点　←→ 类型　Ctrl+Y 示例　Ctrl+L 清空\nEnter 激活（取消不保存）　Esc 取消　PgUp/PgDn/滚轮滚动\n先创建/加入本机加密空间，再连接存储；连接检查不等于同步完成。\n密钥粘贴原样保留（包括空格/换行），请确认未多选字符。"), inner.width));
+    // 表单底部只留两行：怎么操作 + 最容易踩的一个坑（其余说明在字段自己的提示里）
+    lines.extend(wrapped_lines(
+        Text::from(
+            "Tab/↑↓ 焦点　←→ 类型　Ctrl+Y 示例　Enter 激活　Esc 取消\n\
+             先建/加本机加密空间再连存储；连接检查不等于同步完成",
+        ),
+        inner.width,
+    ));
     let focus_line = match form.focus() {
         Focus::Kind => 0,
         Focus::Field(index) => field_start + index,
@@ -1012,47 +1021,29 @@ fn retry_in(backend: &cx_proto::control::BackendStatus) -> String {
     }
 }
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let popup = centered(area, 86, 90);
+    let popup = centered(area, 72, 76);
     app.modal_rect = popup;
     frame.render_widget(Clear, popup);
+    // 分组压行：同一类键写在一行，帮助页从 29 行收到 11 行（宽终端仍然好读）
     let lines = vec![
         Line::from(Span::styled(
             "快捷键",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  ↑ / k            上移一行"),
-        Line::from("  ↓ / j            下移一行"),
-        Line::from("  PgUp / PgDn      上下翻页"),
-        Line::from("  Home / g         回到最新"),
-        Line::from("  End / G          跳到最旧"),
-        Line::from("  回车             把选中项写回剪贴板"),
-        Line::from("  /                过滤（回车确定，Esc 取消）"),
-        Line::from("  Esc              有过滤时先清过滤，再按退出"),
-        Line::from("  J / K            预览下滚 / 上滚一行"),
-        Line::from("  Ctrl+D / Ctrl+U  预览上下翻页"),
-        Line::from("  0                预览回到开头"),
-        Line::from("  空格             暂停 / 恢复同步"),
-        Line::from("  p                立即发布本机剪贴板"),
-        Line::from("  r                刷新状态与历史"),
-        Line::from("  R                重新读取配置"),
-        Line::from("  a                添加同步后端（表单交给命令层保存并检查）"),
-        Line::from("  鼠标             滚轮翻列表；左键点某一行即选中它；表单里点某行即聚焦"),
-        Line::from("  d                删除选中项（本机历史，会先确认）"),
-        Line::from("  b                后端与连接面板（各后端健康、局域网对端）"),
-        Line::from("  ?                帮助（本页）"),
-        Line::from("  q                退出"),
+        Line::from(" ↑/k ↓/j 选择　PgUp/PgDn 翻页　Home/g 最新　End/G 最旧"),
+        Line::from(" 回车 写回剪贴板　d 删除（先确认）　/ 过滤　Esc 清过滤"),
+        Line::from(" J/K 预览滚动　Ctrl+D/U 预览翻页　0 回到开头"),
+        Line::from(" 空格 暂停/恢复　p 立即发布　r 刷新　R 重读配置"),
+        Line::from(" a 添加后端　b 后端与连接　? 帮助　q 退出"),
+        Line::from(" 鼠标 滚轮翻列表，左键点行即选中；表单里点行即聚焦"),
         Line::from(""),
         Line::from(Span::styled(
-            "  ↑ 本机发出，↓ 来自别的设备，· 状态未知；行内摘要是按需加载的，",
+            " ↑ 本机发出，↓ 来自别的设备，· 状态未知",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  因此过滤只能匹配已加载的内容摘要（类型/来源/哈希总能匹配）。",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  不直接访问网络或剪贴板；通过守护进程操作。",
+            " 行内摘要按需加载，因此过滤只能匹配已加载的摘要",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -1338,7 +1329,7 @@ mod tests {
         app.down();
         let screen = render(&mut app, 140, 30);
         assert!(has(&screen, "3/12"), "应当显示第几条/共几条：{screen}");
-        assert!(has(&screen, "共 12 条"), "{screen}");
+        assert!(has(&screen, "12 条"), "{screen}");
     }
 
     #[test]
@@ -1356,7 +1347,7 @@ mod tests {
         }
         let screen = render(&mut app, 140, 30);
         assert!(has(&screen, "过滤"), "{screen}");
-        assert!(has(&screen, "命中 0/4"), "{screen}");
+        assert!(has(&screen, "0/4"), "{screen}");
         assert!(
             has(&screen, "Esc 取消"),
             "输入态页脚应当说明怎么退出：{screen}"
@@ -1480,7 +1471,7 @@ mod tests {
         let lines: Vec<&str> = screen.lines().collect();
         let list_y = lines
             .iter()
-            .position(|l| compact(l).contains("0=最新"))
+            .position(|l| compact(l).contains("历史") && l.contains('┌'))
             .unwrap_or(99);
         let preview_y = lines
             .iter()
@@ -1556,8 +1547,8 @@ mod tests {
         let mut help = app_with(1);
         help.show_help = true;
         let screen = render(&mut help, 130, 40);
-        assert!(has(&screen, "删除选中项"), "{screen}");
-        assert!(has(&screen, "会先确认"), "帮助里要说明需要确认：{screen}");
+        assert!(has(&screen, "删除"), "{screen}");
+        assert!(has(&screen, "先确认"), "帮助里要说明需要确认：{screen}");
     }
     #[test]
     fn 渲染后用真实坐标点击能选中对应的行() {
@@ -1929,7 +1920,7 @@ mod tests {
             app.on_key(key(KeyCode::End));
             let screen = render(&mut app, width, height);
             assert!(app.show_help);
-            assert!(has(&screen, "不直接访问网络"), "{screen}");
+            assert!(has(&screen, "行内摘要按需加载"), "{screen}");
         }
     }
 
