@@ -25,6 +25,23 @@ TUI 界面，支持自建服务端，也支持直接用 WebDAV 或 S3 作为同�
 
 自建服务端 `cx-server` 随包一起安装（它不依赖剪贴板与图形会话）。
 
+### 卸载
+
+| 平台 | 做法 |
+|---|---|
+| Windows | 「应用和功能」里卸载（或 `msiexec /x ClipboardX-<版本>-x64.msi`） |
+| macOS | 挂载 DMG 后双击 `卸载.command`；DMG 丢了就手动删：`sudo rm -f /usr/local/bin/cx /usr/local/bin/cx-server /Library/LaunchAgents/com.clipboardx.agent.plist`，再 `sudo pkgutil --forget com.clipboardx.cli` |
+| Linux | `sudo dpkg -r clipboardx` |
+
+macOS 的 pkg **没有自带卸载器**，`卸载.command` 就是用来做这件事的（它还会问你是否
+一并删除用户数据）。三个平台的卸载都只移除程序与自启项，**不动配置、空间密钥与剪贴板历史**：
+
+- Windows：`%APPDATA%\ClipboardX`
+- macOS：`~/Library/Application Support/ClipboardX`
+- Linux：`~/.config/clipboardx` 与 `~/.local/share/clipboardx`
+
+要彻底清干净，卸载后再手动删除上面这个目录。只想关掉开机自启、保留程序：`cx service uninstall`。
+
 ## Nightly 测试包
 
 main 上的提交会产出滚动更新的 nightly：同一个 `nightly` 标签，**每次覆盖上一份**，
