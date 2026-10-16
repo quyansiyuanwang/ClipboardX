@@ -464,6 +464,52 @@ pub fn default_path_style(endpoint: Option<&str>) -> bool {
         || host.starts_with("s3.") && host.ends_with(".amazonaws.com"))
 }
 
+/// 控制台里的"桶域名"（`<bucket>.oss-<region>.aliyuncs.com`）不是服务端点：
+/// 填进来会变成重复桶前缀，或让 path-style 把桶名当成对象键（实测 NoSuchKey）。
+fn oss_bucket_domain(host: &str) -> bool {
+    let Some(rest) = host.strip_suffix(".aliyuncs.com") else {
+        return false;
+    };
+    let Some((first, tail)) = rest.split_once('.') else {
+        return false;
+    };
+    // s3.oss-<region> 是 S3 兼容的**服务**端点，不是桶域名
+    if first == "s3" {
+        return false;
+    }
+    !first.is_empty() && (tail.starts_with("oss-") || tail.starts_with("s3.oss-"))
+}
+
+/// 从 OSS 服务端点推断区域，供 region 留空时兜底（`oss-cn-beijing-internal` → `cn-beijing`）。
+pub fn region_from_endpoint(endpoint: &str) -> Option<String> {
+    let host = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default();
+    let rest = host.strip_suffix(".aliyuncs.com")?;
+    let rest = rest.strip_prefix("s3.").unwrap_or(rest);
+    let rest = rest.strip_prefix("oss-")?;
+    let region = rest.strip_suffix("-internal").unwrap_or(rest);
+    // 区域一定形如 cn-beijing / us-west-1；accelerate 之类没有连字符，不能当区域
+    (!region.is_empty() && !region.contains('.') && region.contains('-'))
+        .then(|| region.to_string())
+}
+
+/// 端点使用提示：不阻断配置，只把"大多数情况下会失败的组合"提前说清楚。
+pub fn endpoint_notes(endpoint: &str) -> Vec<&'static str> {
+    let host = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    if host.contains("-internal.aliyuncs.com") {
+        return vec!["内网端点只能从同区域 ECS 访问；从公网连接会失败，本机请改用公网端点"];
+    }
+    Vec::new()
+}
+
 /// Endpoint must be a service origin, never credentials, a bucket path or query.
 fn normalize_endpoint(endpoint: &str) -> Result<String, BackendError> {
     let trimmed = endpoint.trim();
@@ -504,6 +550,17 @@ fn normalize_endpoint(endpoint: &str) -> Result<String, BackendError> {
         || parsed.fragment().is_some()
     {
         return Err(BackendError::Config("S3 endpoint 必须是 http(s)://host[:port] 服务地址，不能含凭据、路径、query 或 fragment".into()));
+    }
+    if let Some(host) = parsed.host_str()
+        && oss_bucket_domain(host)
+    {
+        let region = region_from_endpoint(parsed.as_str())
+            .map(|region| format!("https://oss-{region}.aliyuncs.com"))
+            .unwrap_or_else(|| "https://oss-<region>.aliyuncs.com".to_string());
+        return Err(BackendError::Config(format!(
+            "{host} 是桶的访问域名，不是服务端点：桶名请填在 bucket 字段，端点填 {region}\
+             （控制台「外网访问」里不带桶名的那一条）"
+        )));
     }
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }

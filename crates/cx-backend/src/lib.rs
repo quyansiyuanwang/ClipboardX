@@ -29,7 +29,10 @@ mod xml;
 pub use error::BackendError;
 pub use http::{DEFAULT_TIMEOUT, HttpSettings};
 pub use memory::MemoryBackend;
-pub use s3::{MAX_LIST_OBJECTS, S3Backend, S3Options, default_path_style};
+pub use s3::{
+    MAX_LIST_OBJECTS, S3Backend, S3Options, default_path_style, endpoint_notes,
+    region_from_endpoint,
+};
 pub use server::{ServerBackend, ServerOptions, enroll};
 pub use webdav::{PROPFIND_BODY, WebDavBackend, WebDavOptions};
 
@@ -260,6 +263,12 @@ pub fn build_backend(
                 region: section
                     .region
                     .clone()
+                    .or_else(|| {
+                        section
+                            .endpoint
+                            .as_deref()
+                            .and_then(crate::s3::region_from_endpoint)
+                    })
                     .unwrap_or_else(|| "us-east-1".to_string()),
                 bucket,
                 prefix: section.prefix.clone().unwrap_or_default(),
@@ -546,6 +555,73 @@ mod tests {
 
         let backend = build_backend(&section, &paths, Duration::from_secs(1)).unwrap();
         assert_eq!(backend.kind(), "s3");
+        assert!(
+            backend.describe().contains("virtual-host"),
+            "{}",
+            backend.describe()
+        );
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
+    fn 桶访问域名会被拒绝并指出正确写法() {
+        let paths = temp_paths("s3bucketdomain");
+        let mut section = config_section(cx_core::BackendKind::S3);
+        section.endpoint = Some("https://clipboard-sync.oss-cn-beijing.aliyuncs.com".to_string());
+        section.bucket = Some("clipboard-sync".to_string());
+        section.access_key_id = Some("fake-ak".to_string());
+        section.secret_access_key_file = Some("s3.key".to_string());
+        std::fs::write(paths.secret_file("s3.key"), b"fake-secret").unwrap();
+
+        let err = take_error(build_backend(&section, &paths, Duration::from_secs(1)));
+        let text = err.to_string();
+        assert!(text.contains("桶的访问域名"), "{text}");
+        assert!(text.contains("oss-cn-beijing.aliyuncs.com"), "{text}");
+        assert!(text.contains("bucket"), "{text}");
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
+    fn 区域可从端点推断且内网端点有提示() {
+        use crate::s3::{endpoint_notes, region_from_endpoint};
+        assert_eq!(
+            region_from_endpoint("https://oss-cn-beijing.aliyuncs.com").as_deref(),
+            Some("cn-beijing")
+        );
+        assert_eq!(
+            region_from_endpoint("https://s3.oss-cn-hangzhou.aliyuncs.com").as_deref(),
+            Some("cn-hangzhou")
+        );
+        assert_eq!(
+            region_from_endpoint("https://oss-cn-beijing-internal.aliyuncs.com").as_deref(),
+            Some("cn-beijing")
+        );
+        // 加速域名与自建端点不推断（区域含义不同），仍由用户显式配置
+        assert_eq!(
+            region_from_endpoint("https://oss-accelerate.aliyuncs.com"),
+            None
+        );
+        assert_eq!(region_from_endpoint("http://127.0.0.1:9000"), None);
+
+        assert!(endpoint_notes("https://oss-cn-beijing.aliyuncs.com").is_empty());
+        assert!(
+            !endpoint_notes("https://oss-cn-beijing-internal.aliyuncs.com").is_empty(),
+            "内网端点必须给出提示"
+        );
+    }
+
+    #[test]
+    fn 缺区域时按端点推断() {
+        let paths = temp_paths("s3region");
+        let mut section = config_section(cx_core::BackendKind::S3);
+        section.endpoint = Some("https://oss-cn-beijing.aliyuncs.com".to_string());
+        section.region = None;
+        section.bucket = Some("clipboardx".to_string());
+        section.access_key_id = Some("fake-ak".to_string());
+        section.secret_access_key_file = Some("s3.key".to_string());
+        std::fs::write(paths.secret_file("s3.key"), b"fake-secret").unwrap();
+
+        let backend = build_backend(&section, &paths, Duration::from_secs(1)).unwrap();
         assert!(
             backend.describe().contains("virtual-host"),
             "{}",

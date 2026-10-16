@@ -1693,6 +1693,13 @@ fn test_backend(paths: &Paths, name: &str) -> Result<bool, DaemonError> {
     let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
     let mut sync = cx_sync::RemoteSync::new(backend, &identity.device_id, &identity.name);
 
+    // 端点形态提示：内网端点之类"配置合法但多数情况连不上"的组合提前说清楚
+    if let Some(endpoint) = section.endpoint.as_deref() {
+        for note in cx_backend::endpoint_notes(endpoint) {
+            println!("注意：{note}");
+        }
+    }
+
     match sync.probe() {
         Ok(summary) => {
             println!("后端 {name} 可用：{summary}");
@@ -1701,6 +1708,11 @@ fn test_backend(paths: &Paths, name: &str) -> Result<bool, DaemonError> {
         Err(err) => {
             eprintln!("后端 {name} 不可用：{err}");
             eprintln!("提示：{}", backend_error_tip(&err));
+            if let Some(endpoint) = section.endpoint.as_deref() {
+                for note in cx_backend::endpoint_notes(endpoint) {
+                    eprintln!("注意：{note}");
+                }
+            }
             Ok(false)
         }
     }
