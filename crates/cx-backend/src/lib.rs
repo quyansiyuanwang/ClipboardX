@@ -246,6 +246,13 @@ pub fn build_backend(
                 .path_style
                 .unwrap_or_else(|| default_path_style(section.endpoint.as_deref()));
             let ca_file = section.ca_file.as_ref().map(|name| paths.secret_file(name));
+            // STS 临时凭据：配了就一定要读得到，读不到宁可报凭据错误也不要静默降级
+            let session_token = read_secret(
+                paths,
+                section.session_token_file.as_deref(),
+                section.session_token_env.as_deref(),
+                "会话令牌",
+            )?;
 
             let backend = S3Backend::new(S3Options {
                 name: section.name.clone(),
@@ -258,7 +265,7 @@ pub fn build_backend(
                 prefix: section.prefix.clone().unwrap_or_default(),
                 access_key_id,
                 secret_access_key,
-                session_token: None,
+                session_token,
                 path_style,
                 ca_file,
                 insecure: section.insecure,
@@ -350,6 +357,8 @@ mod tests {
             access_key_id: None,
             secret_access_key_file: None,
             secret_access_key_env: None,
+            session_token_file: None,
+            session_token_env: None,
             path_style: None,
             poll_interval_ms: None,
         }
@@ -501,6 +510,47 @@ mod tests {
         assert!(text.contains("127.0.0.1:9000"), "{text}");
         assert!(text.contains("clipboardx"), "{text}");
         assert!(text.contains("path-style"), "{text}");
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
+    fn s3_会话令牌文件缺失时报凭据错误而不静默降级() {
+        let paths = temp_paths("s3stsmissing");
+        let mut section = config_section(cx_core::BackendKind::S3);
+        section.bucket = Some("clipboardx".to_string());
+        section.access_key_id = Some("fake-ak".to_string());
+        section.secret_access_key_file = Some("s3.key".to_string());
+        std::fs::write(paths.secret_file("s3.key"), b"fake-secret").unwrap();
+        section.session_token_file = Some("missing.sessiontoken".to_string());
+
+        let err = take_error(build_backend(&section, &paths, Duration::from_secs(1)));
+        assert!(
+            matches!(err, BackendError::Credentials(_)) && err.to_string().contains("会话令牌"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+    }
+
+    #[test]
+    fn s3_会话令牌文件存在时可构造后端() {
+        let paths = temp_paths("s3sts");
+        let mut section = config_section(cx_core::BackendKind::S3);
+        section.endpoint = Some("https://oss-cn-beijing.aliyuncs.com".to_string());
+        section.region = Some("cn-beijing".to_string());
+        section.bucket = Some("clipboardx".to_string());
+        section.access_key_id = Some("fake-ak".to_string());
+        section.secret_access_key_file = Some("s3.key".to_string());
+        section.session_token_file = Some("s3.sessiontoken".to_string());
+        std::fs::write(paths.secret_file("s3.key"), b"fake-secret").unwrap();
+        std::fs::write(paths.secret_file("s3.sessiontoken"), b"fake-session-token").unwrap();
+
+        let backend = build_backend(&section, &paths, Duration::from_secs(1)).unwrap();
+        assert_eq!(backend.kind(), "s3");
+        assert!(
+            backend.describe().contains("virtual-host"),
+            "{}",
+            backend.describe()
+        );
         let _ = std::fs::remove_dir_all(&paths.config_dir);
     }
 

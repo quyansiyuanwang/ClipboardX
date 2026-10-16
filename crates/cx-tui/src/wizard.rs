@@ -50,7 +50,7 @@ const WEBDAV_FIELDS: [Field; 4] = [
     Field::secret("口令", "匿名时留空；账号模式建议用应用密码；粘贴原样保留"),
 ];
 
-const S3_FIELDS: [Field; 8] = [
+const S3_FIELDS: [Field; 9] = [
     Field::text("后端名", "oss", "唯一名字"),
     Field::text("桶名", "clipboardx", "请先创建桶；连接检查不自动创建"),
     Field::text(
@@ -70,6 +70,10 @@ const S3_FIELDS: [Field; 8] = [
         "寻址",
         "auto",
         "auto / virtual-host / path；OSS 自动使用 virtual-host",
+    ),
+    Field::secret(
+        "会话令牌",
+        "仅 STS 临时凭据需要；长期 RAM Key 留空（密文输入）",
     ),
 ];
 
@@ -139,7 +143,7 @@ impl Field {
 
     /// 是否必填（端点 / 用户名 / 前缀可空）。
     pub fn required(&self) -> bool {
-        !matches!(self.label, "端点" | "用户名" | "前缀" | "寻址")
+        !matches!(self.label, "端点" | "用户名" | "前缀" | "寻址" | "会话令牌")
     }
 }
 

@@ -97,6 +97,9 @@ cx backend add s3 oss --bucket clipboardx --endpoint http://127.0.0.1:9000 --acc
 # 运行 --secret-stdin 后从交互标准输入提供密钥，不把 Secret 字面量写入 shell 命令/历史。
 cx backend add s3 oss --bucket <桶> --endpoint https://oss-cn-hangzhou.aliyuncs.com --region cn-hangzhou --prefix clipboardx --access-key-id <AccessKeyId> --secret-stdin --virtual-host
 
+# STS 临时凭据：把会话令牌也走 stdin（长期 RAM Key 不需要这一步）
+cx backend add s3 oss --bucket <桶> --endpoint https://oss-cn-hangzhou.aliyuncs.com --region cn-hangzhou --access-key-id <AccessKeyId> --secret-stdin --session-token-stdin --virtual-host
+
 cx backend list          # 查看已配置后端（可配置多个，会同时生效）
 cx backend test <名字>    # 只读列举/元数据检查；不建桶、不验证写入或删除权限
 ```
@@ -131,6 +134,9 @@ peers = ["192.168.1.23:8699"]   # 可选：mDNS 被禁的网络里用显式地�
 - **安装包未签名**：首次安装会被系统拦一下（Windows 点「更多信息 → 仍要运行」，macOS 右键「打开」）。
   补上证书后 CI 会自动签名/公证，流程不变，见 [docs/packaging.md](docs/packaging.md)。
 - **空间密钥的密封下发未实现**：`GET /v1/spaces/{id}/key` 明确返回 501，当前用"口令 + `cx space join`"。
+- **STS 临时凭据只支持静态配置**：可以通过 `--session-token-stdin`（TUI 表单里是"会话令牌"）
+  或 `session_token_file` / `session_token_env` 提供，令牌会参与签名；但**不会自动续期**，
+  过期后需要重新配置并用 `cx restart` 重载，且报错只提示凭据问题，不会替你刷新。
 - **删除只作用于本机历史**（`cx delete <序号>` / TUI 里按 `d`）：后端对象与其他设备上的副本不受影响，
   已同步出去的内容也不会被追回。多端删除同步需要墓碑与冲突规则，尚未实现。
 - macOS 与 Linux 的行为只在 CI 上验证过，未在真机长期使用。

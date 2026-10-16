@@ -305,6 +305,12 @@ pub struct BackendSection {
     /// S3 Secret 环境变量名。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_access_key_env: Option<String>,
+    /// S3 会话令牌文件名（相对 `secrets/`）——STS 临时凭据需要它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token_file: Option<String>,
+    /// S3 会话令牌所在环境变量名——STS 临时凭据需要它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token_env: Option<String>,
     /// 是否使用 path-style 寻址（MinIO 通常需要）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_style: Option<bool>,
@@ -467,6 +473,12 @@ impl Config {
                             "后端 {name}（s3）同时配置了 secret_access_key_file 与 secret_access_key_env"
                         ));
                     }
+                    // STS 临时凭据：两者都配就说不清用哪个，和 secret 一样要求唯一来源
+                    if backend.session_token_file.is_some() && backend.session_token_env.is_some() {
+                        problems.push(format!(
+                            "后端 {name}（s3）同时配置了 session_token_file 与 session_token_env"
+                        ));
+                    }
                     // AWS 官方端点必须走 virtual-host；自建端点通常要 path-style
                     if backend.endpoint.is_none() && backend.path_style == Some(true) {
                         problems.push(format!(
@@ -587,6 +599,8 @@ mod tests {
             access_key_id: None,
             secret_access_key_file: None,
             secret_access_key_env: None,
+            session_token_file: None,
+            session_token_env: None,
             path_style: None,
             poll_interval_ms: Some(10_000),
         });
@@ -636,6 +650,8 @@ another_future = 3
                 access_key_id: None,
                 secret_access_key_file: None,
                 secret_access_key_env: None,
+                session_token_file: None,
+                session_token_env: None,
                 path_style: None,
                 poll_interval_ms: None,
             });
@@ -665,6 +681,8 @@ another_future = 3
             access_key_id: None,
             secret_access_key_file: None,
             secret_access_key_env: None,
+            session_token_file: None,
+            session_token_env: None,
             path_style: None,
             poll_interval_ms: None,
         });
@@ -697,6 +715,8 @@ another_future = 3
             access_key_id: None,
             secret_access_key_file: None,
             secret_access_key_env: None,
+            session_token_file: None,
+            session_token_env: None,
             path_style: None,
             poll_interval_ms: None,
         });
@@ -706,6 +726,45 @@ another_future = 3
                 .iter()
                 .any(|p| p.contains("password_file"))
         );
+    }
+
+    #[test]
+    fn 会话令牌双来源被拒绝() {
+        let mut config = Config::default();
+        config.backends.push(BackendSection {
+            name: "oss".to_string(),
+            kind: BackendKind::S3,
+            enabled: true,
+            url: None,
+            space: None,
+            token_file: None,
+            username: None,
+            password_file: None,
+            password_env: None,
+            ca_file: None,
+            insecure: false,
+            bucket: Some("clipboardx".to_string()),
+            prefix: None,
+            region: Some("cn-beijing".to_string()),
+            endpoint: Some("https://oss-cn-beijing.aliyuncs.com".to_string()),
+            access_key_id: Some("fake-ak".to_string()),
+            secret_access_key_file: Some("oss.key".to_string()),
+            secret_access_key_env: None,
+            session_token_file: Some("oss.sessiontoken".to_string()),
+            session_token_env: Some("CX_FAKE_STS".to_string()),
+            path_style: None,
+            poll_interval_ms: None,
+        });
+        assert!(
+            config
+                .problems()
+                .iter()
+                .any(|p| p.contains("session_token_file")),
+            "同时配令牌文件与环境变量必须报冲突"
+        );
+        // 只留一个来源就应当没有问题
+        config.backends[0].session_token_env = None;
+        assert!(config.problems().is_empty(), "{:?}", config.problems());
     }
 
     #[test]

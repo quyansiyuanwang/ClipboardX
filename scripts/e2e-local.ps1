@@ -31,6 +31,8 @@ $cx = if ($isWindowsHost) { Join-Path $repo 'target\release\cx.exe' } else { Joi
 $failures = [System.Collections.Generic.List[string]]::new()
 $originalClipboard = $null
 $daemonProc = $null
+# 本脚本启动过的分离进程 pid：清理时只动这些，绝不按进程名误杀用户自己的 daemon
+$spawnedPids = [System.Collections.Generic.List[int]]::new()
 
 function Step([string]$name) { Write-Host "==> $name" -ForegroundColor Cyan }
 function Ok([string]$message) { Write-Host "    [ok] $message" -ForegroundColor Green }
@@ -113,15 +115,19 @@ try {
     $startArgs = @('start', '--silent')
     if ($NoClipboard) { $startArgs += '--no-clipboard' }
     $startResult = Invoke-CxToFile @startArgs
+    if ($null -ne $startResult.DaemonPid) { $spawnedPids.Add([int]$startResult.DaemonPid) }
     Assert-True ($startResult.Code -eq 0) "cx start 退出码 0（$($startResult.Output)）"
     Assert-True (Test-Path (Join-Path $env:CX_DATA_DIR 'daemon.json')) '写入了 daemon.json'
     # --silent 时没有输出，因此改用 status 确认分离进程确实活着
     $startedStatus = AsJson (Invoke-Cx status --json).Output
     Assert-True ($startedStatus.pid -gt 0) "分离进程存活（pid $($startedStatus.pid)）"
-    Assert-True ($null -ne (Get-Process -Id $startedStatus.pid -ErrorAction SilentlyContinue)) '进程确实在运行'
+    $startedPid = $startedStatus.pid
+    Assert-True ($null -ne (Get-Process -Id $startedPid -ErrorAction SilentlyContinue)) '进程确实在运行'
     Assert-True ((Invoke-Cx stop).Code -eq 0) 'cx stop 能停掉它'
     Start-Sleep -Seconds 2
-    Assert-True ($null -eq (Get-Process cx -ErrorAction SilentlyContinue | Select-Object -First 1)) '分离进程已退出'
+    # 按 pid 判定，而不是按进程名全局查找：开发机上常常还跑着已安装的常驻
+    # 守护进程（同样叫 cx），按名字断言会把"别人的进程"算成脚本没停干净。
+    Assert-True ($null -eq (Get-Process -Id $startedPid -ErrorAction SilentlyContinue)) "分离进程（pid $startedPid）已退出"
 
     Step '启动守护进程（受管后台进程，后续断言都用它）'
     $daemonArgs = @('daemon', '--foreground', '--quiet')
@@ -308,7 +314,9 @@ try {
     Step '可重复 start/stop'
     $again = @('start', '--silent')
     if ($NoClipboard) { $again += '--no-clipboard' }
-    Assert-True ((Invoke-CxToFile @again).Code -eq 0) '再次启动成功'
+    $againResult = Invoke-CxToFile @again
+    if ($null -ne $againResult.DaemonPid) { $spawnedPids.Add([int]$againResult.DaemonPid) }
+    Assert-True ($againResult.Code -eq 0) '再次启动成功'
     Start-Sleep -Seconds 2
     Assert-True ((Invoke-Cx stop).Code -eq 0) '再次停止成功'
 }
@@ -322,11 +330,18 @@ finally {
     # 先请守护进程优雅退出（状态落盘），再兜底杀受管进程
     try { & $cx stop *> $null } catch { }
     Start-Sleep -Milliseconds 800
+    # 只兜底本脚本启动过的进程（受管进程 + 分离启动记录到的 pid）。
+    # 早先这里按进程名全局 Get-Process cx | Stop-Process，开发机上会把用户
+    # 已安装并正在运行的常驻守护进程一起杀掉——那不是本脚本该动的东西。
     if ($null -ne $daemonProc) {
         $still = Get-Process -Id $daemonProc.Id -ErrorAction SilentlyContinue
         if ($null -ne $still) { Stop-Process -Id $daemonProc.Id -Force -ErrorAction SilentlyContinue }
     }
-    Get-Process cx -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    foreach ($spawned in @($spawnedPids)) {
+        if ($null -eq $spawned) { continue }
+        $still = Get-Process -Id $spawned -ErrorAction SilentlyContinue
+        if ($null -ne $still) { Stop-Process -Id $spawned -Force -ErrorAction SilentlyContinue }
+    }
 
     $logPath = Join-Path $env:CX_CACHE_DIR 'logs/daemon.log'
     if (Test-Path $logPath) {
