@@ -273,6 +273,9 @@ pub enum BackendAddCommand {
         /// 从标准输入读私有密钥（避免出现在命令行历史里）
         #[arg(long)]
         secret_stdin: bool,
+        /// 从标准输入读 STS 会话令牌（临时凭据用；长期 RAM Key 不需要）
+        #[arg(long)]
+        session_token_stdin: bool,
         /// 强制 path-style 寻址（MinIO 通常需要；默认自动识别 OSS）
         #[arg(long, conflicts_with = "virtual_host")]
         path_style: bool,
@@ -1072,6 +1075,13 @@ fn add_draft_with_probe(
                 section.secret_access_key_file = Some(file.clone());
                 secrets.push((file, secret.to_string()));
             }
+            // 可选：STS 临时凭据的会话令牌
+            let session_token = draft.get("会话令牌");
+            if !session_token.is_empty() {
+                let file = format!("{name}.sessiontoken");
+                section.session_token_file = Some(file.clone());
+                secrets.push((file, session_token.to_string()));
+            }
         }
     }
     validate_addition(&config, &section)?;
@@ -1376,6 +1386,14 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
         | BackendAddCommand::S3 { name, .. } => name.trim().to_string(),
     };
     check_backend_name(&name)?;
+    // 在 match 借用/移动 kind 之前先取出这个可选开关，后面才知道要不要读会话令牌
+    let session_token_stdin = matches!(
+        &kind,
+        BackendAddCommand::S3 {
+            session_token_stdin: true,
+            ..
+        }
+    );
     let mut config = Config::load(paths)?;
     if let Err(err) = ensure_unique_name(&config, &name) {
         eprintln!("{err}");
@@ -1436,6 +1454,7 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
             prefix,
             access_key_id,
             secret_stdin,
+            session_token_stdin,
             path_style,
             virtual_host,
             ca_file,
@@ -1464,6 +1483,9 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
             };
             if *secret_stdin {
                 section.secret_access_key_file = Some(format!("{name}.key"));
+            }
+            if *session_token_stdin {
+                section.session_token_file = Some(format!("{name}.sessiontoken"));
             }
         }
     }
@@ -1519,6 +1541,13 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
         }
         _ => {}
     }
+    // 会话令牌是可选来源，所以单独判一次，不塞进上面的必需分支
+    if session_token_stdin {
+        secrets.push((
+            section.session_token_file.clone().unwrap(),
+            read_secret_stdin("会话令牌（STS）")?,
+        ));
+    }
     commit_backend(
         paths,
         &mut config,
@@ -1553,6 +1582,8 @@ fn empty_section(name: String, kind: cx_core::BackendKind) -> cx_core::BackendSe
         access_key_id: None,
         secret_access_key_file: None,
         secret_access_key_env: None,
+        session_token_file: None,
+        session_token_env: None,
         path_style: None,
         poll_interval_ms: None,
     }
@@ -1717,6 +1748,8 @@ mod backend_tests {
             access_key_id: None,
             secret_access_key_file: None,
             secret_access_key_env: None,
+            session_token_file: None,
+            session_token_env: None,
             path_style: None,
             poll_interval_ms: None,
         });
@@ -1766,6 +1799,8 @@ mod backend_tests {
             access_key_id: None,
             secret_access_key_file: None,
             secret_access_key_env: None,
+            session_token_file: None,
+            session_token_env: None,
             path_style: None,
             poll_interval_ms: None,
         });
@@ -1802,6 +1837,7 @@ mod backend_tests {
                 prefix: None,
                 access_key_id: "AK".to_string(),
                 secret_stdin: true,
+                session_token_stdin: false,
                 path_style: false,
                 virtual_host: false,
                 ca_file: None,
@@ -2208,6 +2244,40 @@ mod backend_tests {
     }
 
     #[test]
+    fn s3_草稿的寻址与会话令牌都落到配置且令牌原样保留() {
+        let paths = temp_paths("oss-session-token-draft");
+        let draft = cx_tui::BackendDraft {
+            kind: cx_tui::WizardKind::S3,
+            values: vec![
+                "fake-sts".into(),
+                "fake-bucket".into(),
+                "https://oss-cn-beijing.aliyuncs.com".into(),
+                "cn-beijing".into(),
+                "fake-ak".into(),
+                "fake-secret".into(),
+                "fake-prefix".into(),
+                "path".into(),
+                " fake-session-token ".into(),
+            ],
+        };
+        add_draft_with_probe(&paths, &draft, |paths, _, section| {
+            assert_eq!(section.path_style, Some(true), "显式 path 必须落进配置");
+            assert_eq!(
+                section.session_token_file.as_deref(),
+                Some("fake-sts.sessiontoken")
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.secret_file("fake-sts.sessiontoken")).unwrap(),
+                " fake-session-token ",
+                "会话令牌必须原样保留，不做 trim"
+            );
+            Ok(())
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
     fn oss_draft_keeps_auto_addressing_and_tests_before_commit() {
         let paths = temp_paths("oss-auto-draft");
         let draft = cx_tui::BackendDraft {
@@ -2462,6 +2532,7 @@ mod backend_tests {
                 prefix: Some("space-a".to_string()),
                 access_key_id: "minioadmin".to_string(),
                 secret_stdin: false,
+                session_token_stdin: false,
                 path_style: true,
                 virtual_host: false,
                 ca_file: None,
