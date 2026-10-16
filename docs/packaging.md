@@ -47,6 +47,23 @@ pwsh scripts/build-msi.ps1 -NoUi           # 不装 UI 扩展，产出无向导�
 - 自启开关不放在安装向导里，而是运行时命令 `cx service install|uninstall`
   （原因见 §6.1：productbuild 的产品归档会静默丢失 payload）。
 - DMG 内容：`ClipboardX.pkg` + `安装说明.txt` + `卸载.command`。
+- **卸载**（pkg 不自带卸载器，必须显式移除文件与收据）：
+  - 推荐：挂载 DMG 后双击 `卸载.command`——bootout LaunchAgent、删除
+    `/usr/local/bin/cx` 与 `/usr/local/bin/cx-server`、`pkgutil --forget` 两个收据，
+    最后询问是否一并删除用户数据。
+  - DMG 已丢失时手动执行等价命令：
+
+    ```bash
+    launchctl bootout "gui/$(stat -f%u /dev/console)" /Library/LaunchAgents/com.clipboardx.agent.plist 2>/dev/null || true
+    sudo rm -f /Library/LaunchAgents/com.clipboardx.agent.plist /usr/local/bin/cx /usr/local/bin/cx-server
+    sudo pkgutil --forget com.clipboardx.cli; sudo pkgutil --forget com.clipboardx.agent
+    rm -rf "$HOME/Library/Application Support/ClipboardX"   # 可选：配置/空间密钥/历史一起删
+    ```
+
+  - 只想关掉开机自启、保留程序：`cx service uninstall`。
+  - 注意 pkg 装了**两个**二进制（`cx` 与 `cx-server`）：只删 `cx` 会把 `cx-server`
+    留成残留文件，而收据已被 forget，之后 `pkgutil` 再也查不到它；CI 验收现在会
+    同时断言两者都已消失。
 - 构建时硬断言三层：二进制 ≥ 100 KB、`pkgutil --payload-files` 必须列出
   `usr/local/bin/cx` 与 LaunchAgent、pkg 与 DMG 体积下限。任何一层不满足即失败，
   避免再出现"安装成功但什么都没有"的情况。

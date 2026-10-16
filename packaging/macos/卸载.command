@@ -17,9 +17,10 @@ if [ -f "$PLIST" ]; then
   echo "  已移除 LaunchAgent"
 fi
 
-if [ -f /usr/local/bin/cx ]; then
-  sudo rm -f /usr/local/bin/cx
-  echo "  已移除 /usr/local/bin/cx"
+if [ -f /usr/local/bin/cx ] || [ -f /usr/local/bin/cx-server ]; then
+  # pkg 装了两个二进制；只删 cx 会把 cx-server 留成无人管理的残留文件
+  sudo rm -f /usr/local/bin/cx /usr/local/bin/cx-server
+  echo "  已移除 /usr/local/bin/cx 与 /usr/local/bin/cx-server"
 fi
 
 # 收据（可用 pkgutil --forget 清理）

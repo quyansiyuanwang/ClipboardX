@@ -89,10 +89,11 @@ CONSOLE_UID="$(stat -f%u /dev/console 2>/dev/null || echo '')"
 if [ -n "$CONSOLE_UID" ]; then
   launchctl bootout "gui/$CONSOLE_UID" /Library/LaunchAgents/com.clipboardx.agent.plist 2>/dev/null || true
 fi
-rm -f /Library/LaunchAgents/com.clipboardx.agent.plist /usr/local/bin/cx
+rm -f /Library/LaunchAgents/com.clipboardx.agent.plist /usr/local/bin/cx /usr/local/bin/cx-server
 pkgutil --forget com.clipboardx.cli >/dev/null 2>&1 || true
 pkgutil --forget com.clipboardx.agent >/dev/null 2>&1 || true
 [ ! -e /usr/local/bin/cx ] || fail "cx 未被移除"
+[ ! -e /usr/local/bin/cx-server ] || fail "cx-server 未被移除（pkg 装了两个二进制）"
 [ ! -e /Library/LaunchAgents/com.clipboardx.agent.plist ] || fail "LaunchAgent 未被移除"
 ok "卸载干净"
 
