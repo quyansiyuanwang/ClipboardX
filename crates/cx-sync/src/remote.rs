@@ -145,7 +145,12 @@ impl RemoteSync {
             if let Some(path) = layout::item_path(name)
                 && let Err(err) = self.backend.delete(&path)
             {
-                log::debug!("删除过期对象 {path} 失败：{err}");
+                // 保留策略删不掉通常是权限问题（缺 oss:DeleteObject），不是网络抖动：
+                // 用 warn 而不是 debug，否则旧对象会在桶里静默堆积、用户完全看不到。
+                log::warn!(
+                    "保留策略清理失败：删除过期对象 {path} 出错（{err}）；\
+                     检查该凭据是否具备删除权限（S3/OSS 需要 DeleteObject）"
+                );
             }
         }
 
