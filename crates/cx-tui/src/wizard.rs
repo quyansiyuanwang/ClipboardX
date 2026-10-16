@@ -420,6 +420,26 @@ impl Wizard {
     /// **一次标出所有空的必填项**并把焦点落到第一个上：像表单一样改完再交，
     /// 而不是"问答式"一步一拦、还把已填内容丢掉。
     pub fn submit(&mut self) -> Result<BackendDraft, Vec<usize>> {
+        // S3 的两个预填/校验放在必填检查之前：
+        // 1) 区域留空时按端点推断，用户不必自己记 cn-beijing 这类串；
+        // 2) 寻址只接受三个取值，就地拦下而不是等命令层报错。
+        // （权威的区域默认值在 cx-backend 构造后端时同样推导，这里只是表单预填）
+        if self.kind() == WizardKind::S3 {
+            if self.value(3).trim().is_empty()
+                && let Some(region) = region_from_oss_endpoint(self.value(2))
+            {
+                self.values[self.kind_index][3] = region;
+            }
+            let addressing = self.value(7).trim().to_string();
+            if !matches!(addressing.as_str(), "" | "auto" | "virtual-host" | "path") {
+                self.invalid = vec![7];
+                self.focus = Focus::Field(7);
+                self.follow_focus = true;
+                self.message = Some("寻址只能填 auto、virtual-host 或 path".to_string());
+                return Err(vec![7]);
+            }
+        }
+
         let missing: Vec<usize> = self
             .fields()
             .iter()
@@ -471,6 +491,20 @@ impl Wizard {
             _ => None,
         }
     }
+}
+
+/// 表单预填用的区域推断（与 cx-backend 的权威实现同规则：只认 `oss-<region>` 与 `s3.oss-<region>`）。
+fn region_from_oss_endpoint(endpoint: &str) -> Option<String> {
+    let host = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let host = host.split(['/', ':']).next().unwrap_or_default();
+    let rest = host.strip_suffix(".aliyuncs.com")?;
+    let rest = rest.strip_prefix("s3.").unwrap_or(rest);
+    let rest = rest.strip_prefix("oss-")?;
+    let rest = rest.strip_suffix("-internal").unwrap_or(rest);
+    (rest.contains('-') && !rest.contains('.')).then(|| rest.to_string())
 }
 
 #[cfg(test)]
@@ -623,6 +657,42 @@ mod tests {
         form.focus_field(1);
         form.push_char('h');
         assert!(!form.is_invalid(1));
+    }
+
+    #[test]
+    fn s3_区域按端点推断且非法寻址就地拦下() {
+        let mut form = Wizard::new();
+        form.set_kind(2);
+        for (index, value) in [
+            (0, "oss"),
+            (1, "clipboard-sync"),
+            (2, "https://oss-cn-beijing.aliyuncs.com"),
+            (4, "fake-ak"),
+            (5, "fake-sk"),
+        ] {
+            type_into(&mut form, index, value);
+        }
+        let draft = form.submit().expect("区域应当被自动推断出来");
+        assert_eq!(draft.get("区域"), "cn-beijing");
+        assert_eq!(draft.get("寻址"), "", "留空表示自动");
+
+        let mut bad = Wizard::new();
+        bad.set_kind(2);
+        for (index, value) in [
+            (0, "oss"),
+            (1, "b"),
+            (2, "https://oss-cn-beijing.aliyuncs.com"),
+            (4, "ak"),
+            (5, "sk"),
+            (7, "virtual"),
+        ] {
+            type_into(&mut bad, index, value);
+        }
+        assert_eq!(
+            bad.submit().unwrap_err(),
+            vec![7],
+            "非法寻址必须就地报错，而不是等命令层"
+        );
     }
 
     #[test]
