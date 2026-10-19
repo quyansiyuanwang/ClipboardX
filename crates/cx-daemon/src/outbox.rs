@@ -63,7 +63,12 @@ pub(crate) fn pending(
     paths.sort();
     let mut jobs = Vec::new();
     for path in paths.into_iter().take(limit) {
-        let raw = std::fs::read(&path).map_err(DaemonError::io)?;
+        // 并发的 acknowledge 可能刚好在这一瞬间删掉了这个条目：那不是错误，而是
+        // "已经发出去了"，跳过即可。早期版本在这里直接返回 Err，一次巧合就会让
+        // 整次读取失败——worker 的积压看起来像坏了（并行跑测试时能稳定复现）。
+        let Some(raw) = read_if_present(&path)? else {
+            continue;
+        };
         let entry: ManifestEntry = serde_json::from_slice(&raw)
             .map_err(|_| DaemonError::Protocol("发件箱元数据损坏，已保留文件供恢复".into()))?;
         cx_proto::ItemName::parse(&entry.name)
@@ -73,10 +78,27 @@ pub(crate) fn pending(
         {
             return Err(DaemonError::Protocol("发件箱对象身份不匹配".into()));
         }
-        let bytes = std::fs::read(dir.join(&entry.name)).map_err(DaemonError::io)?;
+        // 载荷也可能已被删除（元数据先删、载荷后删），同样视为已完成
+        let Some(bytes) = read_if_present(&dir.join(&entry.name))? else {
+            continue;
+        };
         jobs.push((entry, bytes));
     }
     Ok(jobs)
+}
+
+/// 读文件；文件已经不存在时返回 `Ok(None)`。
+///
+/// Windows 上"删除挂起"的文件会返回「拒绝访问（os error 5）」而不是 NotFound：
+/// 文件已被 `remove_file` 标记删除、还有别的句柄没关。对读者来说这与"不存在"等价，
+/// 因此按"已经没了"处理——**不能**当成 IO 错误把整次读取带崩。
+fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>, DaemonError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) if !path.exists() => Ok(None),
+        Err(err) => Err(DaemonError::io(err)),
+    }
 }
 
 pub(crate) fn acknowledge(dir: &Path, name: &str) -> Result<(), DaemonError> {
@@ -132,6 +154,61 @@ mod tests {
         );
         assert!(pending(&directory(&paths, "a"), 64).unwrap().is_empty());
         acknowledge(&dir, &name).unwrap();
+        assert!(pending(&dir, 64).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn 边读边确认不会让整次读取失败() {
+        // 读发件箱与确认（删除）是两条并行路径：列表拿到之后文件被删掉是**正常时序**，
+        // 不能因此让整次读取报错——早期版本就是这样，并行跑测试时能稳定复现
+        // （cx-daemon 的 worker 回归测试因此偶发失败）。
+        let root = std::env::temp_dir().join(format!(
+            "cx-outbox-race-{}-{}",
+            std::process::id(),
+            cx_core::now_ms()
+        ));
+        let paths = Paths::from_root(&root);
+        let dir = directory(&paths, "race");
+        let device = "c".repeat(32);
+        let entry_for = |index: u64| {
+            let name = cx_proto::ItemName::build(
+                1_759_299_998_712 + index,
+                &device,
+                &format!("{index:064x}"),
+            );
+            let entry = ManifestEntry {
+                name: name.clone(),
+                day: "20251001".into(),
+                size: 4,
+                hash: "d".repeat(64),
+                kind: cx_proto::Kind::Text,
+                created_ms: 1_759_299_998_712 + index,
+                mime: None,
+            };
+            (name, entry)
+        };
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_dir = dir.clone();
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut seen = 0usize;
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let jobs = pending(&reader_dir, 64)
+                    .unwrap_or_else(|err: DaemonError| panic!("并发确认不该让读取失败：{err}"));
+                seen += jobs.len();
+            }
+            seen
+        });
+        for index in 0..200u64 {
+            let (name, entry) = entry_for(index);
+            enqueue(&dir, &name, &entry, b"fake").unwrap();
+            let _ = pending(&dir, 64).unwrap();
+            acknowledge(&dir, &name).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
         assert!(pending(&dir, 64).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
