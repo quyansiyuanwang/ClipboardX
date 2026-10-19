@@ -27,6 +27,11 @@ WebDAV、S3 与自建服务端能力差异很大，能同时满足三者的最�
 > `409 FileAlreadyExists`）。端点认得出是 OSS 时直接用后者；认不出（CNAME / 自建域名）
 > 就先按 AWS 风格试，撞上那个 NotImplemented 再换过来并记住——真实 OSS 验收
 > （`scripts/e2e-oss.ps1`）覆盖了这条路径。
+>
+> 这条路径在 CI 里不需要真桶：仓库内测试服务端（`src/s3_testserver.rs`）有 **OSS 模式**
+> （`oss_mode(true)`）——它拒 `If-None-Match`、只认 `x-oss-forbid-overwrite`、冲突回
+> 409，`tests/s3_server.rs` 的三条用例据此回归。moto 恰恰两样都接受，所以本地假服务端
+> 单独跑并抓不到这类问题。
 
 ## 2. 目录布局
 

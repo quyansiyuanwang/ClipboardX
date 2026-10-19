@@ -178,6 +178,93 @@ fn 服务端忽略条件写时表现为覆盖() {
     );
 }
 
+/// 模拟阿里云 OSS：它**不认** `If-None-Match`（400 NotImplemented），只认
+/// `x-oss-forbid-overwrite`（冲突 409）。端点认不出是 OSS 时（这里是 127.0.0.1），
+/// 客户端必须自己撞一次、换成 OSS 的头、把对象写进去，并记住这次选择。
+///
+/// 这条就是"真实 OSS 上一个对象也传不上去"那个 bug 的回归——CI 不需要真桶。
+#[test]
+fn 模拟_oss_上写入会自动改用_x_oss_forbid_overwrite() {
+    let server = TestS3Server::start(ACCESS_KEY, SECRET_KEY, BUCKET);
+    server.oss_mode(true);
+    let mut backend = backend_for(&server, "space-a");
+
+    let outcome = backend
+        .put("v1/items/20251001/a.cxi", b"payload", true)
+        .expect("OSS 模式下必须仍能写入");
+    assert!(matches!(outcome, PutOutcome::Created { .. }), "{outcome:?}");
+    assert_eq!(
+        server.get("space-a/v1/items/20251001/a.cxi").unwrap(),
+        b"payload"
+    );
+
+    // 第一次是 if-none-match（被拒），第二次换成 x-oss-forbid-overwrite（成功）
+    let puts: Vec<String> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.starts_with("PUT"))
+        .collect();
+    assert_eq!(puts.len(), 2, "应当恰好重试一次：{puts:?}");
+
+    // 换过一次之后就记住了：第二次写入不再先撞 400
+    let again = backend
+        .put("v1/items/20251001/b.cxi", b"payload-b", true)
+        .unwrap();
+    assert!(matches!(again, PutOutcome::Created { .. }), "{again:?}");
+    let puts: Vec<String> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.starts_with("PUT"))
+        .collect();
+    assert_eq!(puts.len(), 3, "记住之后不该再试 if-none-match：{puts:?}");
+    assert!(
+        server.signature_failures().is_empty(),
+        "{:?}",
+        server.signature_failures()
+    );
+}
+
+/// 同一对象重复"仅当不存在"写入：OSS 用 409 FileAlreadyExists 表达已存在，
+/// 客户端必须映射成 AlreadyExists（而不是当成错误）。
+#[test]
+fn 模拟_oss_上重复的条件写映射为已存在() {
+    let server = TestS3Server::start(ACCESS_KEY, SECRET_KEY, BUCKET);
+    server.oss_mode(true);
+    let mut backend = backend_for(&server, "space-a");
+
+    backend
+        .put("v1/items/20251001/c.cxi", b"first", true)
+        .unwrap();
+    let outcome = backend
+        .put("v1/items/20251001/c.cxi", b"second", true)
+        .unwrap();
+    assert!(matches!(outcome, PutOutcome::AlreadyExists), "{outcome:?}");
+    assert_eq!(
+        server.get("space-a/v1/items/20251001/c.cxi").unwrap(),
+        b"first",
+        "不可变对象不能被覆盖"
+    );
+    assert!(
+        server.signature_failures().is_empty(),
+        "{:?}",
+        server.signature_failures()
+    );
+}
+
+/// 无条件写（覆盖语义）不受影响：OSS 模式也不带任何条件头。
+#[test]
+fn 模拟_oss_上的无条件写照常进行() {
+    let server = TestS3Server::start(ACCESS_KEY, SECRET_KEY, BUCKET);
+    server.oss_mode(true);
+    let mut backend = backend_for(&server, "space-a");
+
+    backend.put("cx-space.json", b"{}", false).unwrap();
+    let outcome = backend.put("cx-space.json", b"{\"v\":2}", false).unwrap();
+    // S3 对"新建"与"覆盖"都返回 200：客户端如实报 Created，不假装知道是覆盖
+    assert!(matches!(outcome, PutOutcome::Created { .. }), "{outcome:?}");
+    assert_eq!(server.get("space-a/cx-space.json").unwrap(), b"{\"v\":2}");
+}
+
 #[test]
 fn 分页列举能把所有对象取全() {
     let server = TestS3Server::start(ACCESS_KEY, SECRET_KEY, BUCKET);
