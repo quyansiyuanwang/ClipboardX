@@ -8,7 +8,10 @@
 # 3. Windows 上另外跑一遍**升级验收**（装旧版 → 装新版 → 只留一份 → 卸载干净）；
 # 4. 签名与公证是**可选步骤**：配了 secrets 就自动签，没配就跳过并在日志里写清楚，
 #    这样"首版不签名"与"补上证书"之间不需要改流程（见 docs/packaging.md §4）；
-# 5. 产物附带 SHA256SUMS，Release 说明里给出安装与校验方法。
+# 5. 产物附带 SHA256SUMS，Release 说明里给出安装与校验方法；
+# 6. Release 正文 = 自动生成的「本次更新」+ docs/release-notes.md 的稳定部分。
+#    **产品局限/已知问题不写进 Release 正文**（那里只放"能不能用起来"的信息），
+#    写在 README 与 docs/protocol.md、docs/packaging.md 里——查文档的人才会看那里。
 
 name: Release
 
