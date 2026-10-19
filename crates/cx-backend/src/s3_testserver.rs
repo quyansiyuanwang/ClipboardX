@@ -47,6 +47,10 @@ struct State {
     region: String,
     /// 是否忽略 `If-None-Match`（模拟不支持条件写的实现）。
     ignore_conditional_put: bool,
+    /// 阿里云 OSS 模式：**拒绝** `If-None-Match`（400 NotImplemented，与真实 OSS 的
+    /// 回应逐字相同），只认 `x-oss-forbid-overwrite: true`，冲突时返回
+    /// 409 FileAlreadyExists。CI 靠它回归"OSS 上写入全失败"那类 bug，不需要真桶。
+    oss_mode: bool,
     /// 下一次 PUT 强制返回 501（验证客户端退化路径）。
     force_next_put_501: bool,
     /// 下一次请求强制返回 `RequestTimeTooSkewed`（验证时钟校正重试）。
@@ -86,6 +90,7 @@ impl TestS3Server {
             bucket: bucket.to_string(),
             region: "us-east-1".to_string(),
             ignore_conditional_put: false,
+            oss_mode: false,
             force_next_put_501: false,
             force_next_skew_error: false,
             requests: Vec::new(),
@@ -145,6 +150,11 @@ impl TestS3Server {
     /// 让服务端忽略 `If-None-Match`。
     pub fn ignore_conditional_put(&self, value: bool) {
         self.state.lock().unwrap().ignore_conditional_put = value;
+    }
+
+    /// 打开阿里云 OSS 模式（拒绝 If-None-Match，只认 x-oss-forbid-overwrite）。
+    pub fn oss_mode(&self, value: bool) {
+        self.state.lock().unwrap().oss_mode = value;
     }
 
     /// 下一次 PUT 返回 501（测退化路径）。
@@ -418,6 +428,39 @@ fn dispatch(request: &RawRequest, state: &mut State) -> (u16, Vec<(String, Strin
                     "NotImplemented",
                     "conditional writes are not supported",
                 );
+            }
+            // 阿里云 OSS 模式：不认 `If-None-Match`（真实 OSS 的答复就是这句），
+            // 只认 `x-oss-forbid-overwrite`；冲突用 409 FileAlreadyExists。
+            // CI 靠它回归"OSS 上写入全失败"那一类 bug——不需要真实桶。
+            if state.oss_mode {
+                if request.header("if-none-match").is_some() {
+                    return error_response(
+                        400,
+                        "NotImplemented",
+                        "A header you provided implies functionality that is not implemented.",
+                    );
+                }
+                if request.header("x-oss-forbid-overwrite") == Some("true")
+                    && state.objects.contains_key(&object_key)
+                {
+                    return error_response(
+                        409,
+                        "FileAlreadyExists",
+                        "The object you specified already exists and can not be overwritten.",
+                    );
+                }
+                state.clock += 1;
+                let clock = state.clock;
+                let etag = format!("\"{}\"", etag_hash(&request.body));
+                state.objects.insert(
+                    object_key.clone(),
+                    Object {
+                        bytes: request.body.clone(),
+                        etag: etag.clone(),
+                        modified_ms: clock,
+                    },
+                );
+                return (200, vec![("ETag".to_string(), etag)], Vec::new());
             }
             let conditional =
                 request.header("if-none-match") == Some("*") && !state.ignore_conditional_put;
