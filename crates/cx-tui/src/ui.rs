@@ -560,7 +560,34 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let Some(form) = app.wizard.as_mut() else {
         return;
     };
-    let mut lines = Vec::new();
+
+    // 页面铺满整屏，但表单本身是一列**居中定宽**的内容：宽终端上标签列与输入列
+    // 不会被拉成两米宽，读起来才像一张表。
+    let content_w = inner.width.min(76);
+    let content = Rect::new(
+        inner.x + inner.width.saturating_sub(content_w) / 2,
+        inner.y,
+        content_w,
+        inner.height,
+    );
+
+    // 标签列宽度 = 最宽的那个标签（含必填星号）+ 1 列间隔；值列占剩下的全部。
+    let label_w = form
+        .fields()
+        .iter()
+        .map(|field| display_width(field.label) + usize::from(field.required()))
+        .max()
+        .unwrap_or(8)
+        + 1;
+    // 极窄（内容区 <46 列）时改成"标签一行、值一行"，否则同行排法只剩不到一半给值。
+    let stacked = (content_w as usize) < 46;
+    let value_w = if stacked {
+        (content_w as usize).saturating_sub(2)
+    } else {
+        (content_w as usize).saturating_sub(label_w)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut hits: Vec<(usize, u16, u16, Focus)> = Vec::new();
     let mut kinds = Vec::new();
     let mut kind_spans = Vec::new();
@@ -587,7 +614,7 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
     lines.push(Line::from(kind_spans));
     lines.push(Line::from(Span::styled(
-        clamp_width_value(form.kind().hint().to_string(), inner.width as usize),
+        clamp_width_value(form.kind().hint().to_string(), content_w as usize),
         Style::default().fg(Color::DarkGray),
     )));
     if form.kind() == WizardKind::Webdav {
@@ -601,22 +628,10 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         )));
     }
     let field_start = lines.len();
-    // 很窄的终端（<46 列）：标签单独一行、值下一行。
-    // "SecretAccessKey: ●●●" 这种同行排法在 40 列的窗口里只剩不到一半给值，
-    // 用户看不到自己打了什么；上下两行至少能看全。
-    let stacked = inner.width < 46;
     let mut field_rows: Vec<usize> = Vec::with_capacity(form.fields().len());
-    // 每个输入恰占一行（窄屏两行）。长值显示末尾视口，不让光标落在屏幕外。
     for (index, field) in form.fields().iter().enumerate() {
         let focused = form.focused_field() == Some(index);
         let invalid = form.is_invalid(index);
-        let style = if invalid {
-            Style::default().fg(Color::Red)
-        } else if focused {
-            Style::default().fg(Color::Black).bg(Color::White)
-        } else {
-            Style::default()
-        };
         let anonymous = form.kind() == WizardKind::Webdav
             && field.label == "口令"
             && form.value(2).trim().is_empty();
@@ -629,18 +644,15 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 ""
             }
         );
-        let prefix = if stacked { label } else { format!("{label}: ") };
-        let room = (inner.width as usize)
-            .saturating_sub(display_width(&prefix))
-            .saturating_sub(if stacked { 3 } else { 1 });
+        let room = value_w.saturating_sub(2);
         let raw = form.value(index);
         let shown = if field.is_choice() {
             // 选择题：`‹ 自动 ›`，箭头明确表示左右能拨（只回显中文字面，配置值是英文）
-            let label = field.choice_label(raw).unwrap_or("自定义");
+            let choice = field.choice_label(raw).unwrap_or("自定义");
             if focused {
-                format!("‹ {label} ›")
+                format!("‹ {choice} ›")
             } else {
-                label.to_string()
+                choice.to_string()
             }
         } else if field.secret {
             "●".repeat(raw.chars().count().min(room))
@@ -654,59 +666,75 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         } else {
             shown
         };
-        field_rows.push(lines.len());
-        // 整行都能点：点标签或点值都聚焦这个字段
-        hits.push((lines.len(), 0, inner.width, Focus::Field(index)));
+        // 值单元格：左侧留一格内边距，右侧补齐到值列宽度——聚焦整行高亮时
+        // 看上去就是一个输入框，未聚焦时也保持列对齐。
+        let value_style = if invalid {
+            Style::default().fg(Color::White).bg(Color::Red)
+        } else if focused {
+            Style::default().fg(Color::White).bg(Color::Indexed(238))
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let pad = value_w.saturating_sub(1 + display_width(&shown));
+        let cell = Span::styled(format!(" {shown}{}", " ".repeat(pad)), value_style);
         let label_style = if invalid {
             Style::default().fg(Color::Red)
         } else {
             Style::default().fg(Color::Cyan)
         };
+        field_rows.push(lines.len());
         if stacked {
-            lines.push(Line::from(Span::styled(format!("{prefix}:"), label_style)));
-            hits.push((lines.len(), 0, inner.width, Focus::Field(index)));
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(shown, style),
-            ]));
+            hits.push((lines.len(), 0, content_w, Focus::Field(index)));
+            lines.push(Line::from(Span::styled(label, label_style)));
+            hits.push((lines.len(), 0, content_w, Focus::Field(index)));
+            lines.push(Line::from(cell));
         } else {
+            // 整行都能点：点标签或点值都聚焦这个字段
+            hits.push((lines.len(), 0, content_w, Focus::Field(index)));
             lines.push(Line::from(vec![
-                Span::styled(prefix, label_style),
-                Span::styled(shown, style),
+                Span::styled(pad_display(&label, label_w), label_style),
+                cell,
             ]));
         }
     }
+
     let button_line = lines.len();
     let save = " [ 保存并测试 ] ";
     let cancel = " [ 取消 ] ";
     let save_width = display_width(save) as u16;
     let cancel_width = display_width(cancel) as u16;
-    hits.push((button_line, 0, save_width, Focus::Save));
+    // 按钮与值列左对齐（stacked 时顶格），看起来仍是一张表
+    let indent = if stacked { 0 } else { label_w as u16 };
+    hits.push((button_line, indent, save_width, Focus::Save));
     hits.push((
         button_line,
-        save_width.saturating_add(2),
+        indent.saturating_add(save_width).saturating_add(2),
         cancel_width,
         Focus::Cancel,
     ));
-    lines.push(Line::from(vec![
-        Span::styled(
-            save,
-            if form.focus() == Focus::Save {
-                Style::default().fg(Color::Black).bg(Color::Green)
-            } else {
-                Style::default().fg(Color::Green)
-            },
-        ),
-        Span::raw("  "),
-        Span::styled(
-            cancel,
-            if form.focus() == Focus::Cancel {
-                Style::default().fg(Color::Black).bg(Color::Gray)
-            } else {
-                Style::default().fg(Color::Gray)
-            },
-        ),
-    ]));
+    let mut button_spans = Vec::new();
+    if indent > 0 {
+        button_spans.push(Span::raw(" ".repeat(indent as usize)));
+    }
+    button_spans.push(Span::styled(
+        save,
+        if form.focus() == Focus::Save {
+            Style::default().fg(Color::Black).bg(Color::Green)
+        } else {
+            Style::default().fg(Color::Green)
+        },
+    ));
+    button_spans.push(Span::raw("  "));
+    button_spans.push(Span::styled(
+        cancel,
+        if form.focus() == Focus::Cancel {
+            Style::default().fg(Color::Black).bg(Color::Gray)
+        } else {
+            Style::default().fg(Color::Gray)
+        },
+    ));
+    lines.push(Line::from(button_spans));
+
     // 错误与当前字段帮助可滚动，不能挤掉字段/按钮。
     if let Some(message) = &form.message {
         lines.extend(wrapped_lines(
@@ -714,7 +742,7 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 message.clone(),
                 Style::default().fg(Color::Red),
             ))),
-            inner.width,
+            content_w,
         ));
     }
     if let Some(index) = form.focused_field() {
@@ -723,45 +751,60 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 form.fields()[index].help.to_string(),
                 Style::default().fg(Color::DarkGray),
             ))),
-            inner.width,
+            content_w,
         ));
     }
-    // 表单底部只留两行：怎么操作 + 最容易踩的一个坑（其余说明在字段自己的提示里）
     lines.extend(wrapped_lines(
         Text::from(
-            "Tab/↑↓ 焦点　←→ 类型　Ctrl+Y 示例　Enter 激活　Esc 取消\n\
+            "Tab/↑↓ 焦点　←→ 切换类型/选项　Ctrl+Y 示例　Enter 激活　Esc 取消\n\
              先建/加本机加密空间再连存储；连接检查不等于同步完成",
         ),
-        inner.width,
+        content_w,
     ));
+
+    // 定宽内容列是水平居中的：文本本身也要整体右移（命中矩形用的是 content.x，
+    // 只改矩形不改文字的话，点到的位置和看到的位置会错开）。
+    let shift = content.x.saturating_sub(inner.x) as usize;
+    if shift > 0 {
+        let pad = " ".repeat(shift);
+        lines = lines
+            .into_iter()
+            .map(|line| {
+                let mut spans = vec![Span::raw(pad.clone())];
+                spans.extend(line.spans);
+                Line::from(spans)
+            })
+            .collect();
+    }
+
     let focus_line = match form.focus() {
         Focus::Kind => 0,
         Focus::Field(index) => field_rows.get(index).copied().unwrap_or(field_start),
         Focus::Save | Focus::Cancel => button_line,
     };
-    form.viewport(inner.height, lines.len(), focus_line);
+    form.viewport(content.height, lines.len(), focus_line);
     let scroll = form.scroll;
     for (row, x, width, focus) in hits {
         if row >= scroll as usize
-            && row < scroll as usize + inner.height as usize
-            && x < inner.width
+            && row < scroll as usize + content.height as usize
+            && x < content.width
         {
             app.wizard_hits.push((
                 Rect::new(
-                    inner.x + x,
-                    inner.y + (row - scroll as usize) as u16,
-                    width.min(inner.width - x),
+                    content.x + x,
+                    content.y + (row - scroll as usize) as u16,
+                    width.min(content.width - x),
                     1,
                 ),
                 focus,
             ));
         }
     }
-    if scroll == 0 && inner.height > 0 {
+    if scroll == 0 && content.height > 0 {
         for (x, width, index) in kinds {
-            if x < inner.width {
+            if x < content.width {
                 app.wizard_kinds.push((
-                    Rect::new(inner.x + x, inner.y, width.min(inner.width - x), 1),
+                    Rect::new(content.x + x, content.y, width.min(content.width - x), 1),
                     index,
                 ));
             }
@@ -772,14 +815,13 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" 添加后端（可滚动） ")
+                    .title(" 添加后端 ")
                     .border_style(Style::default().fg(Color::Cyan)),
             )
             .scroll((scroll, 0)),
         popup,
     );
 }
-
 /// 输入框采用末尾视口；按显示列计算，不截断 UTF-8。
 fn input_tail(text: &str, width: usize) -> String {
     let mut result = String::new();
@@ -1190,6 +1232,16 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 /// 文本的显示宽度（CJK 算两列）。
+/// 按"显示列"右侧补空格（CJK 占两列，`format!` 的宽度补不齐）。
+fn pad_display(text: &str, width: usize) -> String {
+    let mut out = text.to_string();
+    let mut used = display_width(text);
+    while used < width {
+        out.push(' ');
+        used += 1;
+    }
+    out
+}
 fn display_width(text: &str) -> usize {
     Line::from(text).width()
 }
@@ -2001,7 +2053,7 @@ mod tests {
         let lines: Vec<String> = screen.lines().map(compact).collect();
         let label_line = lines
             .iter()
-            .position(|line| line.contains("端点:"))
+            .position(|line| line.contains("端点"))
             .unwrap_or_else(|| panic!("找不到端点标签行：{screen}"));
         assert!(
             !lines[label_line].contains("example.invalid"),
