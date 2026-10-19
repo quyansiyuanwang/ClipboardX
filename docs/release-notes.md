@@ -56,5 +56,4 @@ cx space init --passphrase-stdin && cx space publish home
 
 - 空间密钥的**密封下发**（用设备公钥加密 K）尚未实现，接口返回 501；当前用口令 + `cx space join`；
 - 建好空间之前产生的历史**不会回溯上传**，只有之后的新条目会同步；
-- 产物**未签名**（需要证书才能签，见 `docs/packaging.md` §4）；
-- 部分设置仍需手改 `config.toml`（CLI 尚未提供全部子命令）。
+- 产物**未签名**（需要证书才能签，见 `docs/packaging.md` §4）。

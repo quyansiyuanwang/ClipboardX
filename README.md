@@ -71,6 +71,21 @@ cx doctor                # 守护进程起不来时也能跑（本地回退检�
 cx stop
 ```
 
+改设置不必手改文件（键名与范围都有校验，写盘前会整体检查一遍）：
+
+```bash
+cx config get                     # 列出全部可设置项与当前值（含写法提示）
+cx config get lan.port            # 读一项
+cx config set sync.poll_active_ms 1200   # 改一项（这类热重载：cx reload 即生效）
+cx config set lan.port 8699               # 端口这类要重启：cx restart
+cx config show                    # 想看整份 config.toml 就用它
+```
+
+可设置的键：`device.name`、`sync.{watch_interval_ms,debounce_ms,poll_active_ms,poll_idle_ms,
+max_item_bytes,history_max_items,history_max_days,apply_remote,normalize_newlines,
+ignore_blank_text,ignore_globs}`、`lan.{enabled,port,use_mdns}`。
+`space.encrypt` 只能读不能从命令行关掉——关掉就是明文上传，要改请自己编辑文件并自负后果。
+
 终端界面（`cx tui`）的按键：
 
 | 按键 | 作用 |
@@ -157,6 +172,7 @@ peers = ["192.168.1.23:8699"]   # 可选：mDNS 被禁的网络里用显式地�
 - **安装包未签名**：首次安装会被系统拦一下（Windows 点「更多信息 → 仍要运行」，macOS 右键「打开」）。
   补上证书后 CI 会自动签名/公证，流程不变，见 [docs/packaging.md](docs/packaging.md)。
 - **空间密钥的密封下发未实现**：`GET /v1/spaces/{id}/key` 明确返回 501，当前用"口令 + `cx space join`"。
+- **建好空间之前的历史不会回头上传**：只有之后的新剪贴板条目才会同步出去（想补齐需要单独的"重发历史"能力）。
 - **STS 临时凭据只支持静态配置**：可以通过 `--session-token-stdin`（TUI 表单里是"会话令牌"）
   或 `session_token_file` / `session_token_env` 提供，令牌会参与签名；但**不会自动续期**，
   过期后需要重新配置并用 `cx restart` 重载，且报错只提示凭据问题，不会替你刷新。

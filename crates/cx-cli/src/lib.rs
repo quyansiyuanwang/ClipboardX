@@ -11,6 +11,7 @@
 //!   TUI 后端草稿先测试成功，再事务提交配置与凭据。
 
 mod commands;
+mod config_cmd;
 mod doctor;
 mod output;
 

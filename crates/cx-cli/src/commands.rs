@@ -175,6 +175,18 @@ pub enum ConfigCommand {
     Show,
     /// 打印配置问题清单（等同 doctor 的配置部分）
     Check,
+    /// 读取一个设置项（不带键名时列出全部可设置项）
+    Get {
+        /// 键名，例如 sync.poll_active_ms
+        key: Option<String>,
+    },
+    /// 修改一个设置项（代你改 config.toml，写盘前整体校验）
+    Set {
+        /// 键名，例如 lan.port
+        key: String,
+        /// 新值；列表类用逗号分隔
+        value: String,
+    },
 }
 
 /// `cx backend` 的子命令。
@@ -548,6 +560,46 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                     }
                     Ok(ExitCode::FAILURE)
                 }
+            }
+            ConfigCommand::Get { key } => {
+                let config = Config::load(paths)?;
+                match key {
+                    Some(key) => match crate::config_cmd::get(&config, key.trim()) {
+                        Some(value) => {
+                            println!("{value}");
+                            Ok(ExitCode::SUCCESS)
+                        }
+                        None => Err(DaemonError::Protocol(format!(
+                            "不认识的配置键「{key}」；`cx config get`（不带键名）可列出全部可设置项"
+                        ))),
+                    },
+                    // 不带键名：把可设置项连同当前值一起列出来，用户不必先猜键名
+                    None => {
+                        for key in crate::config_cmd::keys() {
+                            let value = crate::config_cmd::get(&config, key).unwrap_or_default();
+                            let hint = crate::config_cmd::hint(key).unwrap_or("");
+                            println!("{key} = {value}");
+                            println!("    {hint}");
+                        }
+                        Ok(ExitCode::SUCCESS)
+                    }
+                }
+            }
+            ConfigCommand::Set { key, value } => {
+                let key = key.trim().to_string();
+                // 用 load_or_create：配置文件还不存在时，先按默认值建一份再改，
+                // 而不是让用户先去跑一遍 cx start 才能设置
+                let mut config = Config::load_or_create(paths)?;
+                let needs_restart = crate::config_cmd::set(&mut config, &key, &value)
+                    .map_err(DaemonError::Protocol)?;
+                config.save(paths)?;
+                println!("{key} = {}", value.trim());
+                if needs_restart {
+                    println!("已写入配置；这个设置需要重启守护进程才生效：cx restart");
+                } else {
+                    println!("已写入配置；`cx reload` 即可让守护进程用上新值（无需重启）");
+                }
+                Ok(ExitCode::SUCCESS)
             }
         },
 
