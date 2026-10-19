@@ -50,9 +50,51 @@ const WEBDAV_FIELDS: [Field; 4] = [
     Field::secret("口令", "匿名时留空；账号模式建议用应用密码；粘贴原样保留"),
 ];
 
-const S3_FIELDS: [Field; 9] = [
+/// S3 端点模板：选一个服务商，把**端点 / 区域 / 寻址**一起填好。
+///
+/// 为什么要有它：这三项是"抄写题"——`oss-cn-beijing.aliyuncs.com` 与 `cn-beijing`
+/// 必须成对，MinIO 常常要 path 式寻址，R2 的区域字面值是 `auto`。凭记忆敲只会多出
+/// 一种输错的方式，而模板只填这三项：桶名与凭据永远由用户自己填（模板不知道你的账号）。
+const S3_TEMPLATE_CHOICES: &[(&str, &str)] = &[
+    ("自定义", ""),
+    ("阿里云 OSS（北京）", "oss-beijing"),
+    ("阿里云 OSS（杭州）", "oss-hangzhou"),
+    ("MinIO（本机）", "minio"),
+    ("Cloudflare R2", "r2"),
+    ("AWS S3", "aws"),
+];
+
+/// 模板 → `(端点, 区域, 寻址)`。
+fn s3_template(id: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match id {
+        "oss-beijing" => Some(("https://oss-cn-beijing.aliyuncs.com", "cn-beijing", "")),
+        "oss-hangzhou" => Some(("https://oss-cn-hangzhou.aliyuncs.com", "cn-hangzhou", "")),
+        // 本机 MinIO：path 式寻址最稳（虚拟主机名在 127.0.0.1 上解析不了）
+        "minio" => Some(("http://127.0.0.1:9000", "us-east-1", "path")),
+        // R2 的区域字面值就是 auto，端点里的账号 id 需要自己替换
+        "r2" => Some(("https://<账号id>.r2.cloudflarestorage.com", "auto", "")),
+        // AWS 官方：端点可留空（SDK 自己拼），区域必须填
+        "aws" => Some(("", "us-east-1", "")),
+        _ => None,
+    }
+}
+
+/// S3 表单里各字段的下标（插了模板行之后集中放在这里，免得数字散落各处）。
+mod s3_fields {
+    pub(super) const TEMPLATE: usize = 2;
+    pub(super) const ENDPOINT: usize = 3;
+    pub(super) const REGION: usize = 4;
+    pub(super) const ADDRESSING: usize = 8;
+}
+
+const S3_FIELDS: [Field; 10] = [
     Field::text("后端名", "oss", "唯一名字"),
     Field::text("桶名", "clipboardx", "请先创建桶；连接检查不自动创建"),
+    Field::choice(
+        "模板",
+        S3_TEMPLATE_CHOICES,
+        "←/→ 选服务商：自动填好端点、区域与寻址；桶名与凭据仍然自己填",
+    ),
     Field::text(
         "端点",
         "https://oss-cn-hangzhou.aliyuncs.com",
@@ -61,7 +103,7 @@ const S3_FIELDS: [Field; 9] = [
     Field::text(
         "区域",
         "cn-hangzhou",
-        "必须与端点同区域（阿里云杭州 = cn-hangzhou）",
+        "必须与端点同区域（阿里云杭州 = cn-hangzhou）；选模板会自动填",
     ),
     Field::text("AccessKeyId", "（RAM 控制台创建）", "只给该桶读写权限即可"),
     Field::secret("SecretAccessKey", "与 AccessKeyId 配对；密文输入，不回显"),
@@ -178,7 +220,12 @@ impl Field {
 
     /// 是否必填（端点 / 用户名 / 前缀可空）。
     pub fn required(&self) -> bool {
-        !matches!(self.label, "端点" | "用户名" | "前缀" | "寻址" | "会话令牌")
+        // 端点可空（AWS 官方留空由 SDK 拼）、用户名可空（匿名 WebDAV）、
+        // 前缀可空、模板/寻址/会话令牌都有默认值
+        !matches!(
+            self.label,
+            "端点" | "用户名" | "前缀" | "模板" | "寻址" | "会话令牌"
+        )
     }
 }
 
@@ -452,10 +499,35 @@ impl Wizard {
         if let Some(slot) = self.values[self.kind_index].get_mut(index) {
             *slot = value;
         }
+        // 模板不是普通选择题：拨到哪一项就顺手把端点/区域/寻址填好
+        if self.kind() == WizardKind::S3 && index == s3_fields::TEMPLATE {
+            self.apply_s3_template(index);
+        }
         self.invalid.retain(|invalid| *invalid != index);
         self.message = None;
         self.follow_focus = true;
         true
+    }
+
+    /// 按当前模板填充端点 / 区域 / 寻址。
+    ///
+    /// 只在用户**主动选了一个模板**时覆盖；选回"自定义"不动任何东西——
+    /// 否则手填的端点会被悄悄清掉。
+    fn apply_s3_template(&mut self, index: usize) {
+        let template = self.value(index).to_string();
+        let Some((endpoint, region, addressing)) = s3_template(&template) else {
+            return;
+        };
+        let row = &mut self.values[self.kind_index];
+        if let Some(slot) = row.get_mut(s3_fields::ENDPOINT) {
+            *slot = endpoint.to_string();
+        }
+        if let Some(slot) = row.get_mut(s3_fields::REGION) {
+            *slot = region.to_string();
+        }
+        if let Some(slot) = row.get_mut(s3_fields::ADDRESSING) {
+            *slot = addressing.to_string();
+        }
     }
 
     /// 当前字段是不是选择题（渲染与按键路由都要用）。
@@ -506,18 +578,18 @@ impl Wizard {
         // 2) 寻址只接受三个取值，就地拦下而不是等命令层报错。
         // （权威的区域默认值在 cx-backend 构造后端时同样推导，这里只是表单预填）
         if self.kind() == WizardKind::S3 {
-            if self.value(3).trim().is_empty()
-                && let Some(region) = region_from_oss_endpoint(self.value(2))
+            if self.value(s3_fields::REGION).trim().is_empty()
+                && let Some(region) = region_from_oss_endpoint(self.value(s3_fields::ENDPOINT))
             {
-                self.values[self.kind_index][3] = region;
+                self.values[self.kind_index][s3_fields::REGION] = region;
             }
-            let addressing = self.value(7).trim().to_string();
+            let addressing = self.value(s3_fields::ADDRESSING).trim().to_string();
             if !matches!(addressing.as_str(), "" | "auto" | "virtual-host" | "path") {
-                self.invalid = vec![7];
-                self.focus = Focus::Field(7);
+                self.invalid = vec![s3_fields::ADDRESSING];
+                self.focus = Focus::Field(s3_fields::ADDRESSING);
                 self.follow_focus = true;
                 self.message = Some("寻址只能填 auto、virtual-host 或 path".to_string());
-                return Err(vec![7]);
+                return Err(vec![s3_fields::ADDRESSING]);
             }
         }
 
@@ -598,6 +670,14 @@ mod tests {
         for ch in text.chars() {
             form.push_char(ch);
         }
+    }
+
+    /// 按标签取字段下标：表单结构以后再插字段，这些断言不会跟着一起错。
+    fn idx(kind: WizardKind, label: &str) -> usize {
+        kind.fields()
+            .iter()
+            .position(|field| field.label == label)
+            .unwrap_or_else(|| panic!("{kind:?} 表单里没有「{label}」字段"))
     }
 
     #[test]
@@ -698,27 +778,35 @@ mod tests {
 
     #[test]
     fn 提交时一次标出所有缺失必填项且不丢已填内容() {
+        let kind = WizardKind::S3;
         let mut form = Wizard::new();
         form.set_kind(2); // S3
-        type_into(&mut form, 1, "clipboardx");
-        type_into(&mut form, 4, "AKID");
+        let (bucket, ak, sk, region) = (
+            idx(kind, "桶名"),
+            idx(kind, "AccessKeyId"),
+            idx(kind, "SecretAccessKey"),
+            idx(kind, "区域"),
+        );
+        type_into(&mut form, bucket, "clipboardx");
+        type_into(&mut form, ak, "AKID");
         let missing = form.submit().unwrap_err();
-        assert!(missing.contains(&3), "区域必填：{missing:?}");
-        assert!(missing.contains(&5), "密钥必填：{missing:?}");
-        assert_eq!(form.value(1), "clipboardx", "已填内容不该被清掉");
+        assert!(missing.contains(&region), "区域必填：{missing:?}");
+        assert!(missing.contains(&sk), "密钥必填：{missing:?}");
+        assert_eq!(form.value(bucket), "clipboardx", "已填内容不该被清掉");
         assert_eq!(form.message.as_deref(), Some("还有 2 个必填项没填"));
-        assert!(form.is_invalid(3) && form.is_invalid(5));
-        assert_eq!(form.focus(), Focus::Field(3), "焦点落到第一个缺失项");
+        assert!(form.is_invalid(region) && form.is_invalid(sk));
+        assert_eq!(form.focus(), Focus::Field(region), "焦点落到第一个缺失项");
     }
 
     #[test]
     fn 补齐后可提交_端点可空() {
+        let kind = WizardKind::S3;
         let mut form = Wizard::new();
         form.set_kind(2);
-        type_into(&mut form, 1, "bucket");
-        type_into(&mut form, 3, "cn-hangzhou");
-        type_into(&mut form, 4, "AKID");
-        type_into(&mut form, 5, "SECRET");
+        type_into(&mut form, idx(kind, "桶名"), "bucket");
+        type_into(&mut form, idx(kind, "区域"), "cn-hangzhou");
+        type_into(&mut form, idx(kind, "AccessKeyId"), "AKID");
+        type_into(&mut form, idx(kind, "SecretAccessKey"), "SECRET");
         let draft = form.submit().unwrap();
         assert_eq!(draft.kind, WizardKind::S3);
         assert_eq!(draft.name(), "oss");
@@ -742,14 +830,22 @@ mod tests {
 
     #[test]
     fn s3_区域按端点推断且非法寻址就地拦下() {
+        let kind = WizardKind::S3;
+        let (bucket, endpoint, ak, sk, addressing) = (
+            idx(kind, "桶名"),
+            idx(kind, "端点"),
+            idx(kind, "AccessKeyId"),
+            idx(kind, "SecretAccessKey"),
+            idx(kind, "寻址"),
+        );
         let mut form = Wizard::new();
         form.set_kind(2);
         for (index, value) in [
             (0, "oss"),
-            (1, "clipboard-sync"),
-            (2, "https://oss-cn-beijing.aliyuncs.com"),
-            (4, "fake-ak"),
-            (5, "fake-sk"),
+            (bucket, "clipboard-sync"),
+            (endpoint, "https://oss-cn-beijing.aliyuncs.com"),
+            (ak, "fake-ak"),
+            (sk, "fake-sk"),
         ] {
             type_into(&mut form, index, value);
         }
@@ -762,24 +858,24 @@ mod tests {
         picked.set_kind(2);
         for (index, value) in [
             (0, "oss"),
-            (1, "b"),
-            (2, "https://oss-cn-beijing.aliyuncs.com"),
-            (4, "ak"),
-            (5, "sk"),
+            (bucket, "b"),
+            (endpoint, "https://oss-cn-beijing.aliyuncs.com"),
+            (ak, "ak"),
+            (sk, "sk"),
         ] {
             type_into(&mut picked, index, value);
         }
-        picked.focus_field(7);
+        picked.focus_field(addressing);
         picked.push_char('x');
-        assert_eq!(picked.value(7), "", "选择题不接受自由输入");
+        assert_eq!(picked.value(addressing), "", "选择题不接受自由输入");
         assert!(picked.cycle_value(1));
-        assert_eq!(picked.value(7), "virtual-host");
+        assert_eq!(picked.value(addressing), "virtual-host");
         assert!(picked.cycle_value(1));
-        assert_eq!(picked.value(7), "path");
+        assert_eq!(picked.value(addressing), "path");
         assert!(picked.cycle_value(1), "拨到最后应当绕回第一项");
-        assert_eq!(picked.value(7), "");
+        assert_eq!(picked.value(addressing), "");
         assert!(picked.cycle_value(-1));
-        assert_eq!(picked.value(7), "path", "向左也能反向拨");
+        assert_eq!(picked.value(addressing), "path", "向左也能反向拨");
         picked.cycle_value(1);
         assert_eq!(
             picked.submit().expect("选择题出来的值必定合法").get("寻址"),
@@ -789,28 +885,86 @@ mod tests {
 
         // 兜底：手工改过 config.toml 之类的路径仍可能带来非法值，
         // 提交时依旧就地拦下（而不是等命令层报错）
+        let mut values = vec![String::new(); kind.fields().len()];
+        values[0] = "oss".into();
+        values[bucket] = "b".into();
+        values[endpoint] = "https://oss-cn-beijing.aliyuncs.com".into();
+        values[idx(kind, "区域")] = "cn-beijing".into();
+        values[ak] = "ak".into();
+        values[sk] = "sk".into();
+        values[addressing] = "virtual".into();
         let mut restored = Wizard::from_draft(
             &BackendDraft {
                 kind: WizardKind::S3,
-                values: vec![
-                    "oss".into(),
-                    "b".into(),
-                    "https://oss-cn-beijing.aliyuncs.com".into(),
-                    "cn-beijing".into(),
-                    "ak".into(),
-                    "sk".into(),
-                    String::new(),
-                    "virtual".into(),
-                    String::new(),
-                ],
+                values,
             },
             String::new(),
         );
         assert_eq!(
             restored.submit().unwrap_err(),
-            vec![7],
+            vec![addressing],
             "非法寻址必须就地报错，而不是等命令层"
         );
+    }
+
+    #[test]
+    fn s3_模板一次填好端点区域与寻址() {
+        let kind = WizardKind::S3;
+        let template = idx(kind, "模板");
+        let (endpoint, region, addressing) =
+            (idx(kind, "端点"), idx(kind, "区域"), idx(kind, "寻址"));
+        let mut form = Wizard::new();
+        form.set_kind(2);
+        form.focus_field(template);
+        assert_eq!(form.value(template), "", "默认自定义");
+
+        // 选「阿里云 OSS（北京）」：端点与区域成对填好，寻址留自动
+        assert!(form.cycle_value(1));
+        assert_eq!(form.value(template), "oss-beijing");
+        assert_eq!(form.value(endpoint), "https://oss-cn-beijing.aliyuncs.com");
+        assert_eq!(form.value(region), "cn-beijing");
+        assert_eq!(form.value(addressing), "", "OSS 走自动（=virtual-host）");
+
+        // 换 MinIO：端点、区域、寻址三样一起换（本机要 path 式）
+        form.cycle_value(1);
+        form.cycle_value(1);
+        assert_eq!(form.value(template), "minio");
+        assert_eq!(form.value(endpoint), "http://127.0.0.1:9000");
+        assert_eq!(form.value(region), "us-east-1");
+        assert_eq!(form.value(addressing), "path");
+
+        // 选回「自定义」不再改任何字段：手填的区域必须保持原样
+        // （拨到「自定义」时模板不写任何字段，既不覆盖也不清空 ——
+        //  「选个选项反而弄丢已填内容」是最招人烦的一类 bug）
+        type_into(&mut form, region, "eu-west-1");
+        form.focus_field(template);
+        form.cycle_value(3);
+        assert_eq!(form.value(template), "");
+        assert_eq!(form.value(region), "eu-west-1", "拨到自定义不该动已有值");
+        form.cycle_value(-1);
+        assert_eq!(form.value(template), "aws", "往左拨会绕到最后一项");
+        assert_eq!(form.value(region), "us-east-1", "AWS 模板会填区域");
+        form.cycle_value(1);
+        assert_eq!(
+            form.value(region),
+            "us-east-1",
+            "从 AWS 拨回自定义，区域保持模板给的值"
+        );
+    }
+
+    #[test]
+    fn 选择模板后不必自己填端点与区域就能提交() {
+        let kind = WizardKind::S3;
+        let mut form = Wizard::new();
+        form.set_kind(2);
+        form.focus_field(idx(kind, "模板"));
+        form.cycle_value(1); // 阿里云 OSS（北京）
+        type_into(&mut form, idx(kind, "桶名"), "clipboard-sync");
+        type_into(&mut form, idx(kind, "AccessKeyId"), "ak");
+        type_into(&mut form, idx(kind, "SecretAccessKey"), "sk");
+        let draft = form.submit().expect("模板已填好端点与区域");
+        assert_eq!(draft.get("端点"), "https://oss-cn-beijing.aliyuncs.com");
+        assert_eq!(draft.get("区域"), "cn-beijing");
     }
 
     #[test]
@@ -842,13 +996,15 @@ mod tests {
 
     #[test]
     fn 按示例一键填入() {
+        let kind = WizardKind::S3;
+        let (endpoint, region) = (idx(kind, "端点"), idx(kind, "区域"));
         let mut form = Wizard::new();
         form.set_kind(2);
-        form.focus_field(2);
+        form.focus_field(endpoint);
         form.fill_sample();
-        assert_eq!(form.value(2), "https://oss-cn-hangzhou.aliyuncs.com");
-        form.focus_field(3);
+        assert_eq!(form.value(endpoint), "https://oss-cn-hangzhou.aliyuncs.com");
+        form.focus_field(region);
         form.fill_sample();
-        assert_eq!(form.value(3), "cn-hangzhou");
+        assert_eq!(form.value(region), "cn-hangzhou");
     }
 }
