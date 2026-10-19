@@ -18,7 +18,15 @@ WebDAV、S3 与自建服务端能力差异很大，能同时满足三者的最�
 | 读对象 | `GET /v1/items/{name}` | `GET {url}` | `GET /{bucket}/{key}` |
 | 删除 | `DELETE /v1/items/{name}` | `DELETE {url}` | `DELETE /{bucket}/{key}` |
 | 变更检测 | 响应 `ETag` | `getetag` 属性 | `ETag` + `LastModified` |
-| 条件写 | `If-Match` / `If-None-Match` | `If-None-Match: *` | `If-None-Match: *`（不支持时降级为 HEAD 后 PUT） |
+| 条件写 | `If-Match` / `If-None-Match` | `If-None-Match: *` | `If-None-Match: *`；阿里云 OSS 用等价的 `x-oss-forbid-overwrite: true`（409 = 已存在）。两者都不支持时**拒绝**降级为 HEAD 后 PUT |
+
+> 条件写的两种写法是同一个语义（"只有对象不存在时才写"），必须保持原子：
+> AWS / MinIO / R2 认 `If-None-Match: *`（已存在返回 412），阿里云 OSS **不认**这个头，
+> 会回 `400 NotImplemented（A header you provided implies functionality that is not
+> implemented）`，它的等价物是 `x-oss-forbid-overwrite: true`（已存在返回
+> `409 FileAlreadyExists`）。端点认得出是 OSS 时直接用后者；认不出（CNAME / 自建域名）
+> 就先按 AWS 风格试，撞上那个 NotImplemented 再换过来并记住——真实 OSS 验收
+> （`scripts/e2e-oss.ps1`）覆盖了这条路径。
 
 ## 2. 目录布局
 

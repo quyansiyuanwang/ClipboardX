@@ -76,6 +76,17 @@ pub struct S3Backend {
     settings: HttpSettings,
     /// 与服务器的时间偏差（毫秒）：本机时间 + 偏差 = 服务器时间。
     clock_skew_ms: i64,
+    /// 条件写用哪种"只有对象不存在才写"的头。
+    ///
+    /// AWS / MinIO / R2 用 `If-None-Match: *`（已存在返回 412）；阿里云 OSS **不支持**
+    /// 这个头，会回 `400 NotImplemented（A header you provided implies functionality
+    /// that is not implemented）`，它的等价物是 `x-oss-forbid-overwrite: true`
+    /// （已存在返回 409 FileAlreadyExists）。两者语义相同，都必须保持"原子条件写"，
+    /// 绝不能降级成 HEAD+PUT。
+    ///
+    /// 端点一眼能认出是 OSS 时直接用它；认不出（自建域名 / CNAME / 加速域名）
+    /// 就先按 AWS 风格试，撞上那个 NotImplemented 再换过来并记住。
+    forbid_overwrite: bool,
 }
 
 /// 一次 HTTP 往返的结果。
@@ -159,6 +170,7 @@ impl S3Backend {
 
         Ok(Self {
             name: options.name,
+            forbid_overwrite: looks_like_aliyun_oss(&endpoint),
             endpoint,
             region,
             bucket: options.bucket.trim().to_string(),
@@ -172,6 +184,17 @@ impl S3Backend {
         })
     }
 
+    /// "只有对象不存在才写"的请求头（不写时返回空）。
+    fn conditional_headers(&self, only_if_absent: bool) -> Vec<(&'static str, &'static str)> {
+        if !only_if_absent {
+            return Vec::new();
+        }
+        if self.forbid_overwrite {
+            vec![("x-oss-forbid-overwrite", "true")]
+        } else {
+            vec![("if-none-match", "*")]
+        }
+    }
     /// 已校正的"服务器时间"（毫秒）。
     fn server_now_ms(&self) -> i64 {
         cx_core::now_ms() as i64 + self.clock_skew_ms
@@ -636,6 +659,38 @@ fn conditional_write_unsupported(body: &[u8]) -> bool {
     })
 }
 
+/// 端点看起来是阿里云 OSS（含 CNAME/自定义域名之外的官方域名与内网域名）。
+fn looks_like_aliyun_oss(endpoint: &str) -> bool {
+    let host = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let host = host.split(['/', ':']).next().unwrap_or_default();
+    host.ends_with(".aliyuncs.com") || host == "aliyuncs.com"
+}
+
+/// 服务端明确表示"你给的这个头我没实现"。
+///
+/// OSS 对 `If-None-Match` 的回应就是这一句（Code=NotImplemented，Message 里只有
+/// "A header you provided implies functionality that is not implemented."），
+/// 既没提 if-none-match 也没提 conditional，所以不能只看 [`conditional_write_unsupported`]。
+fn is_header_not_implemented(reply: &S3Reply) -> bool {
+    let (code, message) = parse_error(&reply.body);
+    let code_says = matches!(
+        code.as_deref(),
+        Some("NotImplemented" | "NotSupported" | "UnsupportedHeader" | "UnsupportedOperation")
+    );
+    let has_message = message.is_some();
+    let message_says = match &message {
+        Some(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("not implemented") || message.contains("unsupported header")
+        }
+        None => false,
+    };
+    code_says && (message_says || !has_message)
+}
+
 /// ListObjectsV2 的一页结果。
 #[derive(Debug, Default)]
 struct ListPage {
@@ -1048,13 +1103,23 @@ impl RemoteBackend for S3Backend {
         only_if_absent: bool,
     ) -> Result<PutOutcome, BackendError> {
         let key = self.full_key(path);
-        let extra: Vec<(&str, &str)> = if only_if_absent {
-            vec![("if-none-match", "*")]
-        } else {
-            Vec::new()
-        };
+        let headers = self.conditional_headers(only_if_absent);
+        let reply = self.request("PUT", &key, &[], bytes.to_vec(), &headers)?;
 
-        let reply = self.request("PUT", &key, &[], bytes.to_vec(), &extra)?;
+        // 认不出的端点上，先按 AWS 风格试；OSS 系会明确回 NotImplemented，
+        // 这时换成它的等价头重试一次（400 表示什么都没写，重试是安全的）
+        let reply = if only_if_absent && !self.forbid_overwrite && is_header_not_implemented(&reply)
+        {
+            self.forbid_overwrite = true;
+            log::info!(
+                "后端 {}：服务端不支持 If-None-Match 条件写，改用 x-oss-forbid-overwrite",
+                self.name
+            );
+            let headers = self.conditional_headers(true);
+            self.request("PUT", &key, &[], bytes.to_vec(), &headers)?
+        } else {
+            reply
+        };
 
         match reply.status {
             // S3 对"新建"与"覆盖"都返回 200，无法区分；调用方只关心 AlreadyExists，
@@ -1063,6 +1128,8 @@ impl RemoteBackend for S3Backend {
                 etag: reply.etag.clone(),
             }),
             412 => Ok(PutOutcome::AlreadyExists),
+            // OSS 的 x-oss-forbid-overwrite 用 409 FileAlreadyExists 表达同一件事
+            409 if only_if_absent => Ok(PutOutcome::AlreadyExists),
             // An explicitly unsupported condition is a capability failure, not
             // permission to race HEAD against an unconditional overwriting PUT.
             400 | 501 if only_if_absent && conditional_write_unsupported(&reply.body) => {
@@ -1385,6 +1452,78 @@ mod tests {
             b"<Error><Code>NotImplemented</Code><Message>other operation</Message></Error>"
         ));
         assert!(conditional_write_unsupported(b"<Error><Code>NotImplemented</Code><Message>conditional writes are not supported</Message></Error>"));
+    }
+
+    #[test]
+    fn oss_endpoints_are_recognised_so_conditional_writes_use_its_header() {
+        for oss in [
+            "https://oss-cn-beijing.aliyuncs.com",
+            "https://oss-cn-beijing-internal.aliyuncs.com",
+            "http://oss-cn-hangzhou.aliyuncs.com:443",
+            "https://s3.oss-cn-beijing.aliyuncs.com",
+        ] {
+            assert!(looks_like_aliyun_oss(oss), "{oss} 是 OSS 端点");
+        }
+        for other in [
+            "https://s3.amazonaws.com",
+            "https://minio.example.com:9000",
+            "http://127.0.0.1:9000",
+            // 自定义域名 / CNAME：认不出来，靠"撞一次 NotImplemented 再换"兜底
+            "https://cn-beijing.taihangtop.cn",
+        ] {
+            assert!(!looks_like_aliyun_oss(other), "{other} 不是 OSS 官方端点");
+        }
+    }
+
+    #[test]
+    fn oss_not_implemented_reply_is_recognised() {
+        // 真实 OSS 的回应：消息里既没有 if-none-match 也没有 conditional，
+        // 只说"你给的头我没实现"——必须靠这一条换用 x-oss-forbid-overwrite
+        let body = b"<Error><Code>NotImplemented</Code><Message>A header you provided implies functionality that is not implemented.</Message><EC>0017-00000245</EC><RequestId>6AD58E733B3E2A3537A77DB2</RequestId></Error>";
+        let reply = S3Reply {
+            status: 400,
+            etag: None,
+            last_modified_ms: None,
+            size: None,
+            server_date_ms: None,
+            body: body.to_vec(),
+            hints: Default::default(),
+        };
+        assert!(is_header_not_implemented(&reply));
+        // 但这不是"条件写能力不受支持"的旧判定（那条消息没提条件写）
+        assert!(!conditional_write_unsupported(body));
+
+        // 别的 NotImplemented 不该触发换头（可能是完全不相关的能力缺失）
+        let other = S3Reply {
+            status: 400,
+            etag: None,
+            last_modified_ms: None,
+            size: None,
+            server_date_ms: None,
+            body: b"<Error><Code>NotImplemented</Code><Message>other operation</Message></Error>"
+                .to_vec(),
+            hints: Default::default(),
+        };
+        assert!(!is_header_not_implemented(&other));
+    }
+
+    #[test]
+    fn conditional_header_follows_the_provider() {
+        let aws = S3Backend::new(options()).unwrap();
+        assert_eq!(aws.conditional_headers(true), vec![("if-none-match", "*")]);
+        assert!(
+            aws.conditional_headers(false).is_empty(),
+            "无条件写不带任何头"
+        );
+
+        let mut oss_options = options();
+        oss_options.endpoint = Some("https://oss-cn-beijing.aliyuncs.com".to_string());
+        let oss = S3Backend::new(oss_options).unwrap();
+        assert_eq!(
+            oss.conditional_headers(true),
+            vec![("x-oss-forbid-overwrite", "true")],
+            "OSS 不认 If-None-Match，必须用它的等价头"
+        );
     }
 
     #[test]
