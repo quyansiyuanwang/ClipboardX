@@ -183,7 +183,10 @@ jobs:
     needs: [version, windows, macos, linux]
     runs-on: ubuntu-latest
     steps:
+      # 需要历史来生成"本次更新"（上一个 tag..本 tag）
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -213,6 +216,32 @@ jobs:
           set -euo pipefail
           version="${{ needs.version.outputs.version }}"
           tag="${GITHUB_REF_NAME}"
+
+          # Release 正文 = 「本次更新」（按上一个 tag..本 tag 的提交自动生成）+ docs/release-notes.md
+          # 的稳定部分（能力概览/安装/校验/上手/已知限制）。
+          #
+          # 为什么不能再直接 --notes-file docs/release-notes.md：那个文件是**静态**的，
+          # 一旦把某个版本的更新条目手写进去，下一版就会把它一起带上，Release 里于是出现
+          # 一串重复的「本次更新」（v0.1.1–v0.3.0 正是这么翻车的）。
+          {
+            echo "## 本次更新"
+            echo
+            prev="$(git describe --tags --abbrev=0 --match 'v*' "${tag}^" 2>/dev/null || true)"
+            if [ -n "$prev" ]; then
+              echo "_以下条目为 \`${prev}..${tag}\` 区间内的提交_"
+              echo
+              git log --no-merges --pretty='- %s（%h）' "${prev}..${tag}"
+            else
+              echo "_这是首个版本_"
+              echo
+              git log --no-merges --pretty='- %s（%h）' --max-count=40 "${tag}"
+            fi
+            echo
+            cat docs/release-notes.md
+          } > release-notes.md
+          echo "--- Release 正文（$version）---"
+          cat release-notes.md
+
           gh release view "$tag" >/dev/null 2>&1 && gh release delete "$tag" --yes || true
           # 0.x 阶段一律标为预发布：核心功能还在打磨，
           # 不该给人"正式版"的暗示。1.0 之后自动变成正式发布。
@@ -222,6 +251,6 @@ jobs:
           esac
           gh release create "$tag" \
             --title "ClipboardX $version" \
-            --notes-file docs/release-notes.md \
+            --notes-file release-notes.md \
             ${extra[@]+"${extra[@]}"} \
             release/*.msi release/*.dmg release/*.deb release/SHA256SUMS
