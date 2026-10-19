@@ -49,26 +49,28 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     app.wizard_hits.clear();
     app.wizard_kinds.clear();
-    if app.show_help {
-        draw_help(frame, area, app);
-    }
+    // 整屏页面按层级叠加：面板在下，帮助/确认在其上，表单最上。
+    // 每个页面都铺满整屏，顺序错了就是"后面那个把前面那个整块盖住"。
     if app.show_panel {
         draw_panel(frame, area, app);
+    }
+    if app.show_help {
+        draw_help(frame, area, app);
     }
     if let Some(position) = app.pending_delete {
         draw_confirm_delete(frame, area, position, app.pending_delete_name.as_deref());
     }
-    if app.wizard.is_some() {
-        draw_wizard(frame, area, app);
-    }
     if let Some(name) = &app.pending_backend_remove {
         draw_confirm_remove(frame, area, name);
+    }
+    if app.wizard.is_some() {
+        draw_wizard(frame, area, app);
     }
 }
 
 /// 移除后端的确认：与删除历史条目一样，破坏性操作默认"不删"。
 fn draw_confirm_remove(frame: &mut Frame<'_>, area: Rect, name: &str) {
-    let popup = centered(area, 90, 60);
+    let popup = area;
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
@@ -77,7 +79,7 @@ fn draw_confirm_remove(frame: &mut Frame<'_>, area: Rect, name: &str) {
         )),
         Line::from(""),
         Line::from("  只删本机配置与凭据，不删除已上传到该后端的对象；"),
-        Line::from("  其他已配置的后端不受影响。之后可以再按 a 添加回来。"),
+        Line::from("  其他已配置的后端不受影响；在 b 面板里按 a 可以再加回来。"),
         Line::from(""),
         Line::from(vec![
             Span::styled("  y / 回车", Style::default().fg(Color::Yellow)),
@@ -101,7 +103,7 @@ fn draw_confirm_remove(frame: &mut Frame<'_>, area: Rect, name: &str) {
 
 /// 删除确认：唯一会真的丢内容的操作，因此单独一个浮层，且默认是"不删"。
 fn draw_confirm_delete(frame: &mut Frame<'_>, area: Rect, position: usize, name: Option<&str>) {
-    let popup = centered(area, 90, 60);
+    let popup = area;
     frame.render_widget(Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
@@ -528,9 +530,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             " 回车 写回剪贴板　Esc 清过滤　? 帮助 "
         }
     } else if area.width >= 100 {
-        " 回车 写回剪贴板　空格 暂停　d 删除　b 后端　a 添加　/ 过滤　? 帮助　q 退出 "
+        " 回车 写回剪贴板　空格 暂停　d 删除　b 后端管理　/ 过滤　? 帮助　q 退出 "
     } else {
-        " 回车 写回剪贴板　d 删除　b 后端　/ 过滤　? 帮助 "
+        " 回车 写回剪贴板　d 删除　b 后端管理　/ 过滤　? 帮助 "
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -546,7 +548,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// 布局是"标签列 + 输入框列"，焦点行用高亮标出；密文字段只回显 ●；
 /// 提交失败时在字段右侧就地标红，并在下方给一行整体提示。
 fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let popup = centered(area, 92, 92);
+    let popup = area;
     app.modal_rect = popup;
     frame.render_widget(Clear, popup);
     let inner = Rect::new(
@@ -797,7 +799,7 @@ fn input_tail(text: &str, width: usize) -> String {
 /// 对齐，一眼扫一列就够了。停用·启用、移除、添加也都收在同一个面板里：
 /// 改配置不必退出界面再进来。
 fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let popup = centered(area, 82, 76);
+    let popup = area;
     app.modal_rect = popup;
     frame.render_widget(Clear, popup);
     let block = Block::default().borders(Borders::ALL).title(" 后端管理 ");
@@ -873,123 +875,66 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Style::default().fg(Color::Red),
         ))),
         Some(status) if status.backends.is_empty() => {
+            // 首次配置：只留三步，其余说明在命令与文档里。这一页要整屏看，不是拿来堆教程的。
             lines.push(Line::from(Span::styled(
-                "还没有配置同步后端；LAN 独立于云后端，范围请看下方诊断。",
+                "还没有同步后端。按 a 填表添加：",
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled(" 按 ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "a",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " 在界面里填表；交给命令层保存并检查（cx backend add）",
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(
-                " 下面是等价的命令行做法，适合脚本化或批量配置：",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " 1) 选一种落地方式",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
             lines.push(Line::from(
-                "    server  自建服务端 cx-server（自己完全掌控）",
-            ));
-            lines.push(Line::from("    webdav  WebDAV（Nextcloud 等）"));
-            lines.push(Line::from(
-                "    s3      S3 兼容（AWS / MinIO / R2 / 阿里云 OSS）",
-            ));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " 2) 准备凭据（密钥走标准输入，不进命令行历史）",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from("    s3      AccessKeyId + SecretAccessKey"));
-            lines.push(Line::from(
-                "            阿里云：RAM 控制台创建，只给该桶的读写权限",
+                " 1) 按 a 选一种：自建 cx-server / WebDAV / S3（含阿里云 OSS、MinIO、R2）",
             ));
             lines.push(Line::from(
-                "    webdav  用户名 + 口令（建议用应用专用密码）",
+                " 2) 填桶（或地址）与凭据：密钥密文输入，保存前会真的连一次做自测",
             ));
             lines.push(Line::from(
-                "    server  空间 id + 注册密钥（cx-server token issue 生成）",
-            ));
-            lines.push(Line::from(
-                "    在表单密文输入，或从安全凭据文件重定向 stdin；不要把密钥写进命令字面量。",
+                " 3) 加完回到本页按 空格 启用；首次同步还要建加密空间：",
             ));
             lines.push(Line::from(Span::styled(
-                "    凭据落在 secrets/ 下（权限 0600），不会写进 config.toml",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " 3) 填字段并添加",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from("    s3      桶名、端点、区域、前缀"));
-            lines.push(Line::from(Span::styled(
-                "            区域必须与端点同区域：阿里云杭州 = oss-cn-hangzhou.aliyuncs.com + cn-hangzhou",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from("    webdav  URL、用户名、口令"));
-            lines.push(Line::from("    server  服务端地址、空间 id、注册密钥"));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " 4) 加完先自测，再让守护进程用上它",
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(
-                "    cx backend test <名字>     # 不依赖守护进程",
-            ));
-            lines.push(Line::from(
-                "    cx stop && cx start       # 新增后端需要重启",
-            ));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "连接存储 → 创建/加入本机加密空间 → 验证两端收发；连接检查不等于同步完成。",
+                "    cx space init --passphrase-stdin && cx space publish <后端名>",
                 Style::default().fg(Color::Cyan),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " 命令行等价物：cx backend add <server|webdav|s3> …",
+                Style::default().fg(Color::DarkGray),
             )));
         }
         // 有后端时上面的表格已经把每个后端都说清楚了，这里不再重复
         Some(_) => {}
     }
 
-    // doctor 里那些 TUI 看不到、但排查时最先要问的几项
+    // 诊断区只列「需要你动手」的项：一切正常就不占任何版面。
+    // 剪贴板后端、监听方式、历史存储这类是给排障的人看的，界面上没有意义。
+    const NOISE: [&str; 3] = ["剪贴板", "监听方式", "历史存储"];
     if let Some(doctor) = &app.doctor {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "连接与安全",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        for check in &doctor.checks {
-            if !matches!(
-                check.name.as_str(),
-                "局域网" | "密钥权限" | "剪贴板" | "监听方式"
-            ) {
-                continue;
+        let problems: Vec<_> = doctor
+            .checks
+            .iter()
+            .filter(|check| !check.ok && !NOISE.contains(&check.name.as_str()))
+            .collect();
+        if !problems.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "需要处理",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for check in problems {
+                lines.push(Line::from(vec![
+                    Span::styled(" ▲ ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{}：", check.name),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(check.detail.clone()),
+                ]));
             }
-            lines.push(Line::from(vec![
-                Span::styled(
-                    // 形状与颜色一起变：只靠颜色区分，色觉障碍的用户就看不出来了
-                    if check.ok { "● " } else { "▲ " },
-                    if check.ok {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    },
-                ),
-                Span::styled(format!("{:<8}", check.name), Style::default()),
-                Span::raw(check.detail.clone()),
-            ]));
+            lines.push(Line::from(Span::styled(
+                "  完整检查：cx doctor",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
     if let Some(error) = &app.doctor_error {
@@ -998,7 +943,6 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Style::default().fg(Color::Red),
         )));
     } else if app.doctor.is_none() {
-        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "（正在读取诊断…；按 r 重试）",
             Style::default().fg(Color::DarkGray),
@@ -1156,7 +1100,7 @@ fn retry_in(backend: &cx_proto::control::BackendStatus) -> String {
     }
 }
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let popup = centered(area, 72, 76);
+    let popup = area;
     app.modal_rect = popup;
     frame.render_widget(Clear, popup);
     // 分组压行：同一类键写在一行，帮助页从 29 行收到 11 行（宽终端仍然好读）
@@ -1170,7 +1114,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Line::from(" 回车 写回剪贴板　d 删除（先确认）　/ 过滤　Esc 清过滤"),
         Line::from(" J/K 预览滚动　Ctrl+D/U 预览翻页　0 回到开头"),
         Line::from(" 空格 暂停/恢复　p 立即发布　r 刷新　R 重读配置"),
-        Line::from(" a 添加后端　b 后端管理（表：空格 开关　x 移除　a 添加）　? 帮助　q 退出"),
+        Line::from(" b 后端管理（a 添加　空格 开关　x 移除）　? 帮助　q 退出"),
         Line::from(" 鼠标 滚轮翻列表，左键点行即选中；表单里点行即聚焦"),
         Line::from(""),
         Line::from(Span::styled(
@@ -1198,27 +1142,6 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .scroll((app.help_scroll, 0)),
         popup,
     );
-}
-
-/// 居中放一个固定比例的弹窗（自动收进屏幕内）。
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1]);
-    horizontal[1]
 }
 
 fn short_hash(hash: &str) -> String {
@@ -2008,6 +1931,7 @@ mod tests {
         use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
         for (width, height) in [(80, 24), (60, 20), (120, 30)] {
             let mut app = app_with(1);
+            app.show_panel = true; // 添加后端现在只从「后端管理」面板发起
             app.on_key(key(KeyCode::Char('a')));
             app.wizard.as_mut().unwrap().set_kind(2);
             let count = app.wizard.as_ref().unwrap().fields().len();
@@ -2059,6 +1983,7 @@ mod tests {
     #[test]
     fn 窄终端表单标签与值分行且值不被挤没() {
         let mut app = App::new();
+        app.show_panel = true;
         app.on_key(key(crossterm::event::KeyCode::Char('a')));
         let form = app.wizard.as_mut().unwrap();
         form.set_kind(2);
@@ -2240,10 +2165,15 @@ mod tests {
         assert!(has(&screen, "失败 4 次"), "要给出失败次数：{screen}");
         assert!(has(&screen, "连接超时"), "要给出最近一次错误：{screen}");
         assert!(has(&screen, "秒后重试"), "要给出退避时间：{screen}");
-        // 局域网对端只有 doctor 知道，面板里必须能看到
-        assert!(has(&screen, "局域网"), "{screen}");
-        assert!(has(&screen, "ALEXLAPTOP"), "{screen}");
-        assert!(has(&screen, "密钥权限"), "{screen}");
+        // 诊断区只列"需要你动手"的项：一切正常时不显示任何检查项，
+        // 剪贴板/监听方式这类对用户没有意义的行也不再出现
+        assert!(
+            !has(&screen, "ALEXLAPTOP"),
+            "正常的局域网检查不该占版面：{screen}"
+        );
+        assert!(!has(&screen, "密钥权限"), "{screen}");
+        assert!(!has(&screen, "监听方式"), "{screen}");
+        assert!(!has(&screen, "连接与安全"), "{screen}");
     }
 
     #[test]
@@ -2266,7 +2196,8 @@ mod tests {
             .expect("状态 JSON 应当能反序列化"),
         )));
         app.show_panel = true;
-        let screen = render(&mut app, 64, 24);
+        // 整屏渲染后内容区 = 宽度 - 2，取 56 才落到窄屏分支（<62）
+        let screen = render(&mut app, 56, 24);
         assert!(has(&screen, "名称"), "{screen}");
         assert!(has(&screen, "开关"), "{screen}");
         assert!(
@@ -2306,7 +2237,7 @@ mod tests {
         let mut app = app_with(1);
         app.show_panel = true;
         let screen = render(&mut app, 120, 30);
-        assert!(has(&screen, "还没有配置同步后端"), "{screen}");
+        assert!(has(&screen, "还没有同步后端"), "{screen}");
         assert!(
             has(&screen, "cx backend add"),
             "要给出可执行的命令：{screen}"
@@ -2318,7 +2249,7 @@ mod tests {
         // 空后端
         let mut app = app_with(1);
         let screen = render(&mut app, 130, 24);
-        assert!(has(&screen, "还没有配置同步后端"), "{screen}");
+        assert!(has(&screen, "还没有同步后端"), "{screen}");
 
         // 有后端在失败
         let mut failing = App::new();
@@ -2337,7 +2268,7 @@ mod tests {
         let screen = render(&mut failing, 130, 24);
         assert!(has(&screen, "1 个正在失败"), "{screen}");
         assert!(has(&screen, "按 b"), "{screen}");
-        // 状态行本身还在（动态头部高度不能把它挤掉）
-        assert!(has(&screen, "守护进程已连接"), "状态行不该被裁掉：{screen}");
+        // 状态行本身还在（动态头部高度不能把它挤掉）；正常态不再重复"守护进程已连接"
+        assert!(has(&screen, "笔记本"), "状态行不该被裁掉：{screen}");
     }
 }

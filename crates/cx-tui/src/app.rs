@@ -991,10 +991,8 @@ impl App {
                 self.show_help = true;
                 KeyOutcome::None
             }
-            KeyCode::Char('a') => {
-                self.wizard = Some(Wizard::new());
-                KeyOutcome::None
-            }
+            // 添加后端只从"后端管理"面板里发起（面板里按 a）：
+            // 主界面只做历史与剪贴板，两种操作不放在同一层，界面才不糊在一起。
             KeyCode::Char('b') => {
                 self.show_panel = true;
                 self.doctor_error = None;
@@ -1123,15 +1121,12 @@ impl App {
         let status = self.status.as_ref()?;
         let (healthy, failing, disabled) = self.backend_health();
         if status.backends.is_empty() {
-            return Some((
-                "还没有配置同步后端；LAN 状态需按 b 查看。按 b 看配置引导与凭据说明".to_string(),
-                true,
-            ));
+            return Some(("还没有同步后端（按 b 添加）".to_string(), true));
         }
         if failing > 0 {
             return Some((
                 format!(
-                    "后端 {} 个：{} 个正在失败（按 b 看错误与退避时间）",
+                    "后端 {} 个：{} 个正在失败（按 b 看原因）",
                     status.backends.len(),
                     failing
                 ),
@@ -1268,27 +1263,31 @@ impl App {
         match &self.status {
             None => "未连接守护进程".to_string(),
             Some(status) => {
+                // 只留用户真正会看的东西：异常状态 + 设备名 + 历史条数。
+                // 设备 id（随机十六进制）、空间 id、后端个数都不是这里该背的信息——
+                // 后端明细在 b 面板里，空间状态异常时下面单独提示。
                 let state = if !self.connected {
                     "连接中断（状态已过期）"
                 } else if status.paused {
                     "已暂停"
                 } else {
-                    "守护进程已连接"
+                    ""
                 };
                 let space = if status.encrypted {
-                    format!("{}（加密）", status.space_id.as_deref().unwrap_or("-"))
+                    ""
                 } else if status.space_id.is_none() {
-                    "未初始化；远端是否可用请看诊断".to_string()
+                    "｜未建同步空间"
                 } else {
-                    "明文（未加密）".to_string()
+                    "｜明文（未加密）"
+                };
+                let head = if state.is_empty() {
+                    String::new()
+                } else {
+                    format!("{state}｜")
                 };
                 format!(
-                    "{state}｜设备 {}（{}）｜空间 {}｜历史 {} 条｜后端 {} 个",
-                    status.device_name,
-                    short(&status.device_id),
-                    space,
-                    status.history_len,
-                    status.backends.len()
+                    "{head}{}｜历史 {} 条{space}",
+                    status.device_name, status.history_len
                 )
             }
         }
@@ -1731,10 +1730,9 @@ mod tests {
         app.apply(UiEvent::Status(Box::new(status(false))));
         let (text, warn) = app.health_line().expect("空后端应当有提示");
         assert!(warn, "这是需要用户处理的提示");
-        // 提示要指向界面内的引导（面板里有分步说明与凭据怎么传），
-        // 而不是甩一条命令行——早先这里断言的是 "cx backend add"
+        // 一句话说清"去哪加"，不再顺带解释 LAN/凭据（那些进面板再看）
         assert!(text.contains("按 b"), "要指向界面内的配置引导：{text}");
-        assert!(text.contains("凭据"), "要提到凭据这件事：{text}");
+        assert!(!text.contains("LAN"), "提示行不该再塞这些细节：{text}");
         assert_eq!(app.backend_health(), (0, 0, 0));
     }
 
@@ -2130,6 +2128,7 @@ mod tests {
     #[test]
     fn 表单里寻址用左右键拨动() {
         let mut app = App::new();
+        app.show_panel = true; // 添加后端现在只从「后端管理」面板发起
         app.on_key(key(KeyCode::Char('a')));
         // 切到 S3，再把焦点落到"寻址"
         let form = app.wizard.as_mut().expect("表单已打开");
@@ -2178,6 +2177,7 @@ mod tests {
     #[test]
     fn 粘贴进表单字段_并去掉末尾换行() {
         let mut app = App::new();
+        app.show_panel = true; // 添加后端现在只从「后端管理」面板发起
         app.on_key(key(KeyCode::Char('a')));
         assert!(app.wizard.is_some());
         // 焦点先落到第一个字段（类型行 → Tab 到字段）
@@ -2220,6 +2220,8 @@ mod tests {
 
         // 表单开着但焦点在按钮上：也不该写进任何字段
         let mut form_app = App::new();
+        form_app.show_panel = true;
+        form_app.show_panel = true; // 添加后端现在只从「后端管理」面板发起
         form_app.on_key(key(KeyCode::Char('a')));
         let fields = form_app.wizard.as_ref().unwrap().fields().len();
         for _ in 0..=fields {
@@ -2292,6 +2294,7 @@ mod tests {
         for count in [0, 2] {
             let mut app = app_with(count);
             app.on_key(key(KeyCode::Char('b')));
+            app.show_panel = true; // 添加后端现在只从「后端管理」面板发起
             app.on_key(key(KeyCode::Char('a')));
             assert!(app.wizard.is_some());
             app.on_key(key(KeyCode::Esc));
@@ -2344,9 +2347,14 @@ mod tests {
         assert!(app.status_line().contains("未连接"));
         app.apply(UiEvent::Status(Box::new(status(false))));
         let line = app.status_line();
-        assert!(line.contains("守护进程已连接"), "{line}");
+        // 正常状态不再重复"守护进程已连接"，也不展示随机十六进制的设备/空间 id：
+        // 只留设备名与历史条数（后端明细在 b 面板里）。
+        assert!(!line.contains("守护进程已连接"), "{line}");
         assert!(line.contains("笔记本"), "{line}");
-        assert!(line.contains("ab12cd34"), "{line}");
+        assert!(
+            !line.contains("ab12cd34"),
+            "设备 id 不该出现在状态行：{line}"
+        );
         assert!(line.contains("历史 3 条"), "{line}");
 
         app.apply(UiEvent::Status(Box::new(status(true))));
