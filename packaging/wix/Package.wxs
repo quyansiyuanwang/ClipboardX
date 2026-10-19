@@ -7,6 +7,9 @@
     不注册 Windows 服务（Session 0 读不到剪贴板），安装过程不需要管理员权限。
   - 自启写 HKCU 下的 Run 键，指向 cx.exe 的 start 子命令（静默模式）；
     与 macOS LaunchAgent、Linux systemd user unit 语义一致。
+  - 覆盖安装 / 卸载会先停掉正在运行的 cx（cx stop + taskkill 兜底），装完再
+    cx start 放回后台：否则自启的守护进程正占着 cx.exe，MSI 会弹"文件正在使用"
+    对话框等人点（看起来就是卡住），静默安装则直接 1603。见文件末尾的 CustomAction。
   - 卸载保留用户数据（%APPDATA%\ClipboardX），REMOVEUSERDATA=1 时才清除。
 
   构建：pwsh scripts/build-msi.ps1
@@ -155,10 +158,64 @@
                   Execute="immediate"
                   Return="ignore" />
 
+    <!-- ── 覆盖安装 / 卸载：先让正在运行的 cx 退出 ──────────────────────────
+         为什么需要：cx.exe 就是守护进程（也是 TUI 的宿主）。它一直在后台运行，
+         因此升级时 %LOCALAPPDATA%\Programs\ClipboardX\cx.exe 正被占用，MSI 会弹出
+         「文件正在使用 / FilesInUse」对话框等用户点，静默安装则直接失败（1603）。
+         macOS 的 pkg 没这个问题（它换的是 inode），Windows 必须显式处理。
+
+         先礼后兵，两个动作都排在 InstallValidate 之前——文件占用检查就发生在
+         InstallValidate，晚了对话框已经弹出来了：
+         1) CxStopRunning：`cx stop` 走控制套接字，守护进程正常收尾（写出待同步
+            队列、关掉套接字），不会丢剪贴板条目；
+         2) CxKillRunning：兜底。守护进程是 CREATE_NO_WINDOW 创建的，没有窗口可发
+            WM_CLOSE；用户开着 cx tui、或守护进程不响应时只有强制结束才不阻塞安装。
+            注意 `cx tui` 也是 cx.exe，所以它会一起被关掉（必要时请重新打开）。 -->
+    <CustomAction Id="CxStopRunning"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]cx.exe&quot; stop"
+                  Execute="immediate"
+                  Impersonate="yes"
+                  Return="ignore" />
+    <CustomAction Id="CxKillRunning"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="cmd.exe /c taskkill /f /t /im cx.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im cx-server.exe &gt;nul 2&gt;nul &amp; exit 0"
+                  Execute="immediate"
+                  Impersonate="yes"
+                  Return="ignore" />
+
+    <!-- 装完之后把守护进程放回后台：否则升级一次 = 同步悄悄停到下次登录。
+         只在上面的动作真的执行过（已安装 / 升级）且不是卸载时才做。
+         asyncNoWait：不等它退出。守护进程本身是分离进程（不继承句柄），
+         但没必要让 MSI 卡在这里多等一次启动。 -->
+    <CustomAction Id="CxRestartDaemon"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]cx.exe&quot; start --silent"
+                  Execute="immediate"
+                  Impersonate="yes"
+                  Return="asyncNoWait" />
+
     <InstallExecuteSequence>
+      <Custom Action="CxStopRunning" Before="CxKillRunning"
+              Condition="Installed OR WIX_UPGRADE_DETECTED" />
+      <Custom Action="CxKillRunning" Before="InstallValidate"
+              Condition="Installed OR WIX_UPGRADE_DETECTED" />
+      <Custom Action="CxRestartDaemon" After="InstallFinalize"
+              Condition="(Installed OR WIX_UPGRADE_DETECTED) AND NOT REMOVE=&quot;ALL&quot;" />
       <Custom Action="CxRemoveUserData" After="InstallInitialize"
               Condition="REMOVE=&quot;ALL&quot; AND REMOVEUSERDATA=&quot;1&quot;" />
     </InstallExecuteSequence>
+
+    <!-- 交互式安装还要在 UI 序列里先做一遍：文件占用检查发生在 UI 序列的
+         InstallValidate 上，是它弹出 FilesInUse 对话框，那正是"安装卡住不动"的现场。
+         UI 序列里的标准动作是按需生成的，没有可引用的 InstallValidate 名字，
+         因此直接给序号：690/695 落在 CostFinalize(400) 与 InstallValidate(700) 之间。 -->
+    <InstallUISequence>
+      <Custom Action="CxStopRunning" Sequence="690"
+              Condition="Installed OR WIX_UPGRADE_DETECTED" />
+      <Custom Action="CxKillRunning" Sequence="695"
+              Condition="Installed OR WIX_UPGRADE_DETECTED" />
+    </InstallUISequence>
 
   </Package>
 </Wix>

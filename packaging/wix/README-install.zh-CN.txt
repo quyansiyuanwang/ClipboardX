@@ -16,6 +16,17 @@ msiexec /i ClipboardX-0.1.0-x64.msi /qn ADDLOCAL=Main,PathEnv,Autostart
 
 安装位置：`%LOCALAPPDATA%\Programs\ClipboardX`。
 
+## 覆盖安装（升级）
+
+直接双击新版本的 MSI 即可，**不需要先手动关掉后台的 cx**：安装包会先停掉正在运行的
+`cx.exe`（守护进程，以及你开着的 `cx tui`），再用新文件覆盖，最后自动把守护进程
+重新放回后台。所以：
+
+- 升级期间剪贴板同步会中断几秒，之后自动恢复；
+- 你开着的 `cx tui` 会被关闭，升级完成后重新打开即可；
+- 如果你在安装向导里点了「取消」，后台守护进程不会自动回来，手动跑一次
+  `cx start` 或重新登录即可（自启项没被改动）。
+
 ## 安装后可做的事
 
 ```powershell
