@@ -215,6 +215,9 @@ impl App {
             UiEvent::Status(report) => {
                 self.status = Some(*report);
                 self.connected = true;
+                // 后端数量会变（尤其刚在面板里移除/添加完）：选中下标必须夹回范围内，
+                // 否则面板里既没有 ▶、空格也没反应，看起来像键盘坏了
+                self.clamp_panel_selection();
             }
             UiEvent::History(items) => {
                 let selected = self.selected_item().map(|item| item.name.clone());
@@ -2066,6 +2069,29 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
         assert!(app.pending_backend_remove.is_none());
         assert!(app.notice.as_ref().unwrap().text.contains("没有可移除"));
+    }
+
+    #[test]
+    fn 后端变少时选中下标夹回范围内() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([
+                backend("home", true, 0, None),
+                backend("oss", true, 0, None)
+            ]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.selected_backend().as_deref(), Some("oss"));
+
+        // 移除之后守护进程报回来的后端少了一个：下标必须夹回范围内，
+        // 否则面板里既没有 ▶、空格也没反应，看起来像键盘坏了
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("home", true, 0, None)]),
+        ))));
+        assert_eq!(app.selected_backend().as_deref(), Some("home"));
     }
 
     #[test]
