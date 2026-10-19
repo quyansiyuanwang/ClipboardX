@@ -599,7 +599,12 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         )));
     }
     let field_start = lines.len();
-    // 每个输入恰占一行。长值显示末尾视口，不让光标落在屏幕外。
+    // 很窄的终端（<46 列）：标签单独一行、值下一行。
+    // "SecretAccessKey: ●●●" 这种同行排法在 40 列的窗口里只剩不到一半给值，
+    // 用户看不到自己打了什么；上下两行至少能看全。
+    let stacked = inner.width < 46;
+    let mut field_rows: Vec<usize> = Vec::with_capacity(form.fields().len());
+    // 每个输入恰占一行（窄屏两行）。长值显示末尾视口，不让光标落在屏幕外。
     for (index, field) in form.fields().iter().enumerate() {
         let focused = form.focused_field() == Some(index);
         let invalid = form.is_invalid(index);
@@ -613,8 +618,8 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let anonymous = form.kind() == WizardKind::Webdav
             && field.label == "口令"
             && form.value(2).trim().is_empty();
-        let prefix = format!(
-            "{}{}: ",
+        let label = format!(
+            "{}{}",
             field.label,
             if field.required() && !anonymous {
                 "*"
@@ -622,9 +627,10 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 ""
             }
         );
+        let prefix = if stacked { label } else { format!("{label}: ") };
         let room = (inner.width as usize)
             .saturating_sub(display_width(&prefix))
-            .saturating_sub(1);
+            .saturating_sub(if stacked { 3 } else { 1 });
         let raw = form.value(index);
         let shown = if field.is_choice() {
             // 选择题：`‹ 自动 ›`，箭头明确表示左右能拨（只回显中文字面，配置值是英文）
@@ -646,18 +652,27 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         } else {
             shown
         };
+        field_rows.push(lines.len());
+        // 整行都能点：点标签或点值都聚焦这个字段
         hits.push((lines.len(), 0, inner.width, Focus::Field(index)));
-        lines.push(Line::from(vec![
-            Span::styled(
-                prefix,
-                if invalid {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                },
-            ),
-            Span::styled(shown, style),
-        ]));
+        let label_style = if invalid {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        if stacked {
+            lines.push(Line::from(Span::styled(format!("{prefix}:"), label_style)));
+            hits.push((lines.len(), 0, inner.width, Focus::Field(index)));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(shown, style),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, label_style),
+                Span::styled(shown, style),
+            ]));
+        }
     }
     let button_line = lines.len();
     let save = " [ 保存并测试 ] ";
@@ -719,7 +734,7 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     ));
     let focus_line = match form.focus() {
         Focus::Kind => 0,
-        Focus::Field(index) => field_start + index,
+        Focus::Field(index) => field_rows.get(index).copied().unwrap_or(field_start),
         Focus::Save | Focus::Cancel => button_line,
     };
     form.viewport(inner.height, lines.len(), focus_line);
@@ -2006,8 +2021,16 @@ mod tests {
                     "{screen}"
                 );
             }
+            let endpoint = app
+                .wizard
+                .as_ref()
+                .unwrap()
+                .fields()
+                .iter()
+                .position(|field| field.label == "端点")
+                .expect("S3 表单必须有端点字段");
             let form = app.wizard.as_mut().unwrap();
-            form.focus_field(2);
+            form.focus_field(endpoint);
             for ch in format!("{}VISIBLE-END", "https://example.invalid/".repeat(10)).chars() {
                 form.push_char(ch);
             }
@@ -2031,6 +2054,40 @@ mod tests {
             );
             assert!(app.wizard.is_none());
         }
+    }
+
+    #[test]
+    fn 窄终端表单标签与值分行且值不被挤没() {
+        let mut app = App::new();
+        app.on_key(key(crossterm::event::KeyCode::Char('a')));
+        let form = app.wizard.as_mut().unwrap();
+        form.set_kind(2);
+        let endpoint = form
+            .fields()
+            .iter()
+            .position(|field| field.label == "端点")
+            .expect("S3 表单必须有端点字段");
+        form.focus_field(endpoint);
+        for ch in "https://example.invalid/end".chars() {
+            form.push_char(ch);
+        }
+        // 44 列：表单内容区不到 46 列，走"标签一行、值一行"
+        let screen = render(&mut app, 44, 20);
+        let lines: Vec<String> = screen.lines().map(compact).collect();
+        let label_line = lines
+            .iter()
+            .position(|line| line.contains("端点:"))
+            .unwrap_or_else(|| panic!("找不到端点标签行：{screen}"));
+        assert!(
+            !lines[label_line].contains("example.invalid"),
+            "标签行不该再挤着值（同行排法在窄屏看不到自己打了什么）：{screen}"
+        );
+        assert!(
+            lines
+                .get(label_line + 1)
+                .is_some_and(|line| line.contains("example.invalid/end")),
+            "值应当独占下一行，且末尾可见：{screen}"
+        );
     }
 
     #[test]

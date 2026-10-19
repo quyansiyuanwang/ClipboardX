@@ -2250,6 +2250,8 @@ mod backend_tests {
             values: vec![
                 "fake-sts".into(),
                 "fake-bucket".into(),
+                // 模板行（S3 表单的"服务商模板"，留空 = 自定义）
+                "".into(),
                 "https://oss-cn-beijing.aliyuncs.com".into(),
                 "cn-beijing".into(),
                 "fake-ak".into(),
@@ -2284,6 +2286,8 @@ mod backend_tests {
             values: vec![
                 "fake-oss".into(),
                 "fake-bucket".into(),
+                // 模板行（S3 表单的"服务商模板"，留空 = 自定义）
+                "".into(),
                 "https://oss-cn-beijing.aliyuncs.com".into(),
                 "cn-beijing".into(),
                 "fake-ak".into(),
