@@ -117,6 +117,12 @@ cx backend add s3 oss --bucket <桶> --endpoint https://oss-cn-hangzhou.aliyuncs
 # STS 临时凭据：把会话令牌也走 stdin（长期 RAM Key 不需要这一步）
 cx backend add s3 oss --bucket <桶> --endpoint https://oss-cn-hangzhou.aliyuncs.com --region cn-hangzhou --access-key-id <AccessKeyId> --secret-stdin --session-token-stdin --virtual-host
 
+# 连上真实 OSS 之后，想验证"两台设备经真实对象存储互相同步"（加密空间、会自动清空专用前缀）：
+#   $env:CX_OSS_ENDPOINT='https://oss-cn-beijing.aliyuncs.com'; $env:CX_OSS_BUCKET='clipboard-sync'
+#   $env:CX_OSS_PREFIX='clip/_diag/sync'; $env:CX_OSS_REGION='cn-beijing'
+#   $env:CX_OSS_ACCESS_KEY='<AccessKeyId>'; $env:CX_OSS_SECRET_KEY='<Secret>'
+#   pwsh scripts/e2e-oss.ps1
+
 cx backend list          # 查看已配置后端（可配置多个，会同时生效）
 cx backend test <名字>    # 只读列举/元数据检查；不建桶、不验证写入或删除权限
 ```
