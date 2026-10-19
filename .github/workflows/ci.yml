@@ -223,6 +223,31 @@ jobs:
           $msi = (Get-ChildItem -Path dist -Filter *.msi | Select-Object -First 1).FullName
           ./scripts/verify-msi.ps1 -Msi $msi
 
+      # 覆盖安装的回归：用户机器上 cx.exe 平时被自启的守护进程占着，MSI 若不先停掉它
+      # 就会弹「文件正在使用」等人点（看起来就是卡住），静默安装直接 1603。
+      # 这条以前只在 release.yml 里跑——等于「发布那天才发现装不上」，挪到日常 CI。
+      # 无头 runner 打不开剪贴板，脚本会退回 --no-clipboard（对文件占用没有区别），
+      # 并明确跳过「装完自动恢复守护进程」那条断言，不装作通过。
+      - name: 覆盖安装验收（守护进程运行中升级）
+        shell: pwsh
+        run: |
+          $new = Get-ChildItem -Path dist -Filter *.msi |
+            Where-Object { $_.Name -notlike '*0.0.9*' } |
+            Select-Object -First 1
+          $newVersion = $new.BaseName -replace '^ClipboardX-', '' -replace '-x64$', ''
+          $prop = Join-Path 'dist' 'ClipboardX-0.0.9-x64.msi'
+          try {
+            if (-not (Test-Path $prop)) {
+              # 旧版只是测试道具：复用同一份二进制，只改 MSI 元数据，几十秒就好
+              ./scripts/build-msi.ps1 -Version 0.0.9 -SkipBuild | Out-Null
+            }
+            ./scripts/verify-msi-upgrade.ps1 -OldVersion 0.0.9 -NewVersion $newVersion -SkipBuild
+          }
+          finally {
+            # 别把测试道具当成产物传上去
+            Remove-Item $prop -Force -ErrorAction SilentlyContinue
+          }
+
       - name: 上传 MSI
         uses: actions/upload-artifact@v4
         with:
