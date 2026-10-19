@@ -1155,7 +1155,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Line::from(" 回车 写回剪贴板　d 删除（先确认）　/ 过滤　Esc 清过滤"),
         Line::from(" J/K 预览滚动　Ctrl+D/U 预览翻页　0 回到开头"),
         Line::from(" 空格 暂停/恢复　p 立即发布　r 刷新　R 重读配置"),
-        Line::from(" a 添加后端　b 后端与连接　? 帮助　q 退出"),
+        Line::from(" a 添加后端　b 后端管理（表：空格 开关　x 移除　a 添加）　? 帮助　q 退出"),
         Line::from(" 鼠标 滚轮翻列表，左键点行即选中；表单里点行即聚焦"),
         Line::from(""),
         Line::from(Span::styled(
