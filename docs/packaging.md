@@ -22,6 +22,15 @@ macOS 目标也无法从 Windows 交叉编译（需要 macOS SDK，且剪贴板�
 - 可选特性：`PathEnv`（用户 PATH，默认开）、`Autostart`（`HKCU\...\Run`，默认开）、
   `DesktopShortcut`（默认关）；基础特性 `Main` 必装。
 - 开始菜单：`ClipboardX TUI` → `cx.exe tui`。
+- **覆盖安装 / 卸载会先停掉正在运行的 cx**：`cx.exe` 既是守护进程（自启装的，一直在后台）
+  也是 TUI 的宿主，升级时它占着 `%LOCALAPPDATA%\Programs\ClipboardX\cx.exe`，
+  MSI 会因此弹出「文件正在使用」对话框等人点（看起来就是"安装卡住"），静默安装则直接 1603。
+  处理方式是 `InstallValidate` 之前先礼后兵：`cx stop`（走控制套接字，正常收尾、不丢条目）
+  → `taskkill` 兜底（守护进程是 `CREATE_NO_WINDOW` 起的，没有窗口可发 `WM_CLOSE`；
+  用户开着 `cx tui` 或进程不响应时只有强制结束才不阻塞）。装完再用
+  `cx start --silent` 把守护进程放回后台——否则"升级一次 = 同步悄悄停到下次登录"。
+  交互式安装里这些动作跑在 UI 序列（序号 690/695，早于 UI 序列的 `InstallValidate`），
+  因为占用检查就在那里弹对话框。
 - 卸载：移除文件 / 快捷方式 / Run 键 / PATH 项；**保留** `%APPDATA%\ClipboardX` 用户数据，
   传 `REMOVEUSERDATA=1` 才清除。
 - 不使用 Windows 服务：Session 0 没有交互式桌面，服务账户读不到剪贴板。
@@ -31,6 +40,7 @@ macOS 目标也无法从 Windows 交叉编译（需要 macOS SDK，且剪贴板�
 ```powershell
 pwsh scripts/build-msi.ps1                 # 产物在 dist\
 pwsh scripts/verify-msi.ps1 -Msi dist\ClipboardX-0.1.0-x64.msi   # 安装→断言→卸载→断言
+pwsh scripts/verify-msi-upgrade.ps1 -SkipBuild                   # 升级（守护进程运行中）→断言
 pwsh scripts/build-msi.ps1 -NoUi           # 不装 UI 扩展，产出无向导的 MSI（离线兜底）
 ```
 
