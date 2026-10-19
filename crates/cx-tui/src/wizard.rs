@@ -66,10 +66,14 @@ const S3_FIELDS: [Field; 9] = [
     Field::text("AccessKeyId", "（RAM 控制台创建）", "只给该桶读写权限即可"),
     Field::secret("SecretAccessKey", "与 AccessKeyId 配对；密文输入，不回显"),
     Field::text("前缀", "clipboardx", "对象名会落在该前缀下"),
-    Field::text(
+    Field::choice(
         "寻址",
-        "auto",
-        "auto / virtual-host / path；OSS 自动使用 virtual-host",
+        &[
+            ("自动", ""),
+            ("虚拟主机", "virtual-host"),
+            ("路径式", "path"),
+        ],
+        "←/→ 切换；留自动即可：OSS / AWS 走 virtual-host，MinIO 可试路径式",
     ),
     Field::secret(
         "会话令牌",
@@ -120,6 +124,9 @@ pub struct Field {
     pub help: &'static str,
     /// 是否密文（只回显 ●）。
     pub secret: bool,
+    /// 可选值：`(显示名, 写入配置的值)`。非空表示这是个"选择题"而不是文本框
+    /// —— 让用户凭记忆敲 `virtual-host` 这种东西只会多一种输错的方式。
+    pub choices: Option<&'static [(&'static str, &'static str)]>,
 }
 
 impl Field {
@@ -129,6 +136,7 @@ impl Field {
             sample,
             help,
             secret: false,
+            choices: None,
         }
     }
 
@@ -138,13 +146,46 @@ impl Field {
             sample: "",
             help,
             secret: true,
+            choices: None,
         }
+    }
+
+    const fn choice(
+        label: &'static str,
+        choices: &'static [(&'static str, &'static str)],
+        help: &'static str,
+    ) -> Field {
+        Field {
+            label,
+            sample: "",
+            help,
+            secret: false,
+            choices: Some(choices),
+        }
+    }
+
+    /// 是不是选择题。
+    pub fn is_choice(&self) -> bool {
+        self.choices.is_some_and(|choices| !choices.is_empty())
+    }
+
+    /// 当前值的显示名（选择题才有意义）。
+    pub fn choice_label(&self, value: &str) -> Option<&'static str> {
+        let choices = self.choices?;
+        let index = choice_index(choices, value)?;
+        Some(choices[index].0)
     }
 
     /// 是否必填（端点 / 用户名 / 前缀可空）。
     pub fn required(&self) -> bool {
         !matches!(self.label, "端点" | "用户名" | "前缀" | "寻址" | "会话令牌")
     }
+}
+
+/// 值在选项表里的下标；`auto` 视同空值（配置里两种写法等价）。
+fn choice_index(choices: &'static [(&'static str, &'static str)], value: &str) -> Option<usize> {
+    let wanted = if value == "auto" { "" } else { value };
+    choices.iter().position(|(_, stored)| *stored == wanted)
 }
 
 /// 表单收集出来的草稿。
@@ -378,6 +419,11 @@ impl Wizard {
     /// 往当前字段输入一个字符。
     pub fn push_char(&mut self, ch: char) {
         if let Focus::Field(index) = self.focus {
+            // 选择题不接受自由输入：否则把 "virtual-host" 敲错一个字符，
+            // 提交前才发现，等于多一种失败方式
+            if self.fields()[index].is_choice() {
+                return;
+            }
             // 一动手输入就消掉该字段的红标
             self.invalid.retain(|invalid| *invalid != index);
             if let Some(value) = self.values[self.kind_index].get_mut(index) {
@@ -385,6 +431,36 @@ impl Wizard {
             }
             self.message = None;
         }
+    }
+
+    /// 在选择题上左右拨动；不是选择题时返回 false（让调用方去处理方向键）。
+    pub fn cycle_value(&mut self, delta: i32) -> bool {
+        let Focus::Field(index) = self.focus else {
+            return false;
+        };
+        let Some(choices) = self.fields()[index].choices else {
+            return false;
+        };
+        if choices.is_empty() {
+            return false;
+        }
+        let current = self.value(index);
+        let index_in_choices = choice_index(choices, current).unwrap_or(0) as i32;
+        let count = choices.len() as i32;
+        let next = (index_in_choices + delta).rem_euclid(count) as usize;
+        let value = choices[next].1.to_string();
+        if let Some(slot) = self.values[self.kind_index].get_mut(index) {
+            *slot = value;
+        }
+        self.invalid.retain(|invalid| *invalid != index);
+        self.message = None;
+        self.follow_focus = true;
+        true
+    }
+
+    /// 当前字段是不是选择题（渲染与按键路由都要用）。
+    pub fn focused_is_choice(&self) -> bool {
+        matches!(self.focus, Focus::Field(index) if self.fields()[index].is_choice())
     }
 
     /// 删掉当前字段末尾一个字符。
@@ -406,12 +482,17 @@ impl Wizard {
         }
     }
 
-    /// 清空当前字段。
+    /// 清空当前字段（选择题回到第一项）。
     pub fn clear_field(&mut self) {
-        if let Focus::Field(index) = self.focus
-            && let Some(value) = self.values[self.kind_index].get_mut(index)
-        {
-            value.clear();
+        let Focus::Field(index) = self.focus else {
+            return;
+        };
+        let reset = match self.fields()[index].choices {
+            Some(choices) if !choices.is_empty() => choices[0].1.to_string(),
+            _ => String::new(),
+        };
+        if let Some(value) = self.values[self.kind_index].get_mut(index) {
+            *value = reset;
         }
     }
 
@@ -676,20 +757,57 @@ mod tests {
         assert_eq!(draft.get("区域"), "cn-beijing");
         assert_eq!(draft.get("寻址"), "", "留空表示自动");
 
-        let mut bad = Wizard::new();
-        bad.set_kind(2);
+        // 寻址是**选择题**：打字输不进错误值，←/→ 只在三个合法取值之间拨
+        let mut picked = Wizard::new();
+        picked.set_kind(2);
         for (index, value) in [
             (0, "oss"),
             (1, "b"),
             (2, "https://oss-cn-beijing.aliyuncs.com"),
             (4, "ak"),
             (5, "sk"),
-            (7, "virtual"),
         ] {
-            type_into(&mut bad, index, value);
+            type_into(&mut picked, index, value);
         }
+        picked.focus_field(7);
+        picked.push_char('x');
+        assert_eq!(picked.value(7), "", "选择题不接受自由输入");
+        assert!(picked.cycle_value(1));
+        assert_eq!(picked.value(7), "virtual-host");
+        assert!(picked.cycle_value(1));
+        assert_eq!(picked.value(7), "path");
+        assert!(picked.cycle_value(1), "拨到最后应当绕回第一项");
+        assert_eq!(picked.value(7), "");
+        assert!(picked.cycle_value(-1));
+        assert_eq!(picked.value(7), "path", "向左也能反向拨");
+        picked.cycle_value(1);
         assert_eq!(
-            bad.submit().unwrap_err(),
+            picked.submit().expect("选择题出来的值必定合法").get("寻址"),
+            "",
+            "绕回自动"
+        );
+
+        // 兜底：手工改过 config.toml 之类的路径仍可能带来非法值，
+        // 提交时依旧就地拦下（而不是等命令层报错）
+        let mut restored = Wizard::from_draft(
+            &BackendDraft {
+                kind: WizardKind::S3,
+                values: vec![
+                    "oss".into(),
+                    "b".into(),
+                    "https://oss-cn-beijing.aliyuncs.com".into(),
+                    "cn-beijing".into(),
+                    "ak".into(),
+                    "sk".into(),
+                    String::new(),
+                    "virtual".into(),
+                    String::new(),
+                ],
+            },
+            String::new(),
+        );
+        assert_eq!(
+            restored.submit().unwrap_err(),
             vec![7],
             "非法寻址必须就地报错，而不是等命令层"
         );

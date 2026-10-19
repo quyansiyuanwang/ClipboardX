@@ -39,6 +39,8 @@ pub const HISTORY_LIMIT: usize = 500;
 ///
 /// `AddBackend` 用于"用户在界面里填完表单"这种情形：界面只负责收集，落盘与自测由
 /// 命令层完成（`cx tui` 与 `cx backend add` 是同一个二进制）。
+/// 注意：接入了 [`BackendAdmin`] 之后这些动作都不再退出界面——它们留在
+/// [`TuiExit`] 里只是为了"没有接入回调的调用方（比如独立复用 cx-tui 的测试）"仍能工作。
 #[derive(Debug)]
 pub enum TuiExit {
     /// 用户主动退出。
@@ -51,13 +53,42 @@ pub enum TuiExit {
     ToggleBackend(String),
 }
 
+/// 界面里能直接执行的后端管理动作。
+///
+/// 动机：停用 / 移除 / 新增原来都要**先退出界面**把动作交回命令层，改一次配置就得
+/// 离开界面再进来一次（面板里的选中位置、诊断内容全丢）。把动作做成回调后，界面
+/// 保持不动，只把结果回填成一行提示，面板原地刷新。
+///
+/// 约定：返回 `Ok(提示)` / `Err(原因)` 都是给用户看的一句话；实现方负责重启守护进程
+/// 之类的副作用，界面只负责显示。
+pub trait BackendAdmin {
+    /// 停用 / 启用，返回结果提示。
+    fn toggle(&mut self, name: &str) -> Result<String, String>;
+    /// 移除后端，返回结果提示。
+    fn remove(&mut self, name: &str) -> Result<String, String>;
+    /// 保存新后端（含连通性自测），返回结果提示。
+    fn add(&mut self, draft: &BackendDraft) -> Result<String, String>;
+}
+
 /// 进入全屏 TUI。
 pub fn run(paths: &Paths) -> Result<TuiExit, TuiError> {
-    run_with_app(paths, &mut App::new())
+    run_with_admin(paths, &mut App::new(), None)
 }
 
 /// 使用保留的界面状态再次进入，管理操作失败时无需重填草稿。
 pub fn run_with_app(paths: &Paths, app: &mut App) -> Result<TuiExit, TuiError> {
+    run_with_admin(paths, app, None)
+}
+
+/// 使用保留的界面状态进入，并把后端管理动作交给调用方在界面内执行。
+///
+/// `admin` 为 `None` 时，面板里的停用 / 移除 / 添加会以 [`TuiExit`] 的形式交回调用方
+/// （老行为）。
+pub fn run_with_admin(
+    paths: &Paths,
+    app: &mut App,
+    admin: Option<&mut dyn BackendAdmin>,
+) -> Result<TuiExit, TuiError> {
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     };
@@ -79,7 +110,7 @@ pub fn run_with_app(paths: &Paths, app: &mut App) -> Result<TuiExit, TuiError> {
         EnableBracketedPaste
     );
 
-    let result = run_loop(&mut terminal, paths, app);
+    let result = run_loop(&mut terminal, paths, app, admin);
 
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -96,6 +127,7 @@ fn run_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     paths: &Paths,
     app: &mut App,
+    mut admin: Option<&mut dyn BackendAdmin>,
 ) -> Result<TuiExit, TuiError> {
     use crossterm::event::{self, Event as TermEvent, KeyEventKind};
 
@@ -156,20 +188,47 @@ fn run_loop(
                         app.forget_previews();
                     }
                     KeyOutcome::Doctor => client.request_doctor(),
-                    // 表单填完：退出界面，把草稿交回命令层
-                    KeyOutcome::AddBackend(draft) => {
-                        exit = TuiExit::AddBackend(draft);
-                        break;
-                    }
-                    // 面板里确认移除后端：同样退出界面交给命令层处理
-                    KeyOutcome::RemoveBackend(name) => {
-                        exit = TuiExit::RemoveBackend(name);
-                        break;
-                    }
-                    KeyOutcome::ToggleBackend(name) => {
-                        exit = TuiExit::ToggleBackend(name);
-                        break;
-                    }
+                    // 表单填完：有回调就在界面里直接保存，否则退出界面交回命令层
+                    KeyOutcome::AddBackend(draft) => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::AddBackend(draft);
+                            break;
+                        }
+                        Some(handler) => run_admin_in_place(
+                            terminal,
+                            app,
+                            &client,
+                            handler,
+                            KeyOutcome::AddBackend(draft),
+                        ),
+                    },
+                    // 面板里确认移除后端
+                    KeyOutcome::RemoveBackend(name) => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::RemoveBackend(name);
+                            break;
+                        }
+                        Some(handler) => run_admin_in_place(
+                            terminal,
+                            app,
+                            &client,
+                            handler,
+                            KeyOutcome::RemoveBackend(name),
+                        ),
+                    },
+                    KeyOutcome::ToggleBackend(name) => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::ToggleBackend(name);
+                            break;
+                        }
+                        Some(handler) => run_admin_in_place(
+                            terminal,
+                            app,
+                            &client,
+                            handler,
+                            KeyOutcome::ToggleBackend(name),
+                        ),
+                    },
                     KeyOutcome::Delete(position) => {
                         if let Some(name) = app.delete_expected_name.take() {
                             client.request_delete_checked(position, name);
@@ -193,6 +252,96 @@ fn run_loop(
 
     client.shutdown();
     Ok(exit)
+}
+
+/// 管理动作要等网络与磁盘，先把"正在做…"画出来，别让界面看着像卡住。
+fn begin_inline_action(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    message: impl Into<String>,
+) {
+    app.note(message);
+    // 画不出来也只能继续：动作本身比这一帧重要
+    let _ = terminal.draw(|frame| ui::draw(frame, app));
+}
+
+/// 在界面里跑完一个管理动作：先画"正在做…"，再执行，再把结果画出来。
+fn run_admin_in_place(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    client: &DaemonClient,
+    handler: &mut dyn BackendAdmin,
+    outcome: KeyOutcome,
+) {
+    if let Some(message) = pending_message(&outcome) {
+        begin_inline_action(terminal, app, message);
+    }
+    perform_admin_action(app, handler, outcome);
+    refresh_after_action(app, client);
+}
+
+/// "正在做…"这句话（与动作一一对应，写在这里就不必在每个分支里各写一遍）。
+fn pending_message(outcome: &KeyOutcome) -> Option<String> {
+    match outcome {
+        KeyOutcome::AddBackend(_) => Some("正在保存并自测新后端…".to_string()),
+        KeyOutcome::RemoveBackend(name) => Some(format!("正在移除后端 {name}…")),
+        KeyOutcome::ToggleBackend(name) => Some(format!("正在停用/启用后端 {name}…")),
+        _ => None,
+    }
+}
+
+/// 执行一个管理动作并把结果回填到界面状态里（不涉及绘制，因此可以单测）。
+///
+/// 返回 `true` 表示这是一个管理动作。三个动作的共同约定：
+/// - 成功：留下面板 + 一行提示，让用户看到结果；
+/// - 失败：同样留下面板/表单，只是提示是错误色 —— 不退出、不丢用户已经填好的东西。
+fn perform_admin_action(
+    app: &mut App,
+    handler: &mut dyn BackendAdmin,
+    outcome: KeyOutcome,
+) -> bool {
+    match outcome {
+        KeyOutcome::AddBackend(draft) => {
+            match handler.add(&draft) {
+                Ok(message) => {
+                    app.note(message);
+                    // 回到面板并把新后端选中：用户刚做完的动作要看得见
+                    app.show_panel = true;
+                    app.select_backend(draft.name());
+                }
+                // 失败把草稿留在表单里：改一个字段就能重试，不必重填
+                Err(message) => {
+                    app.wizard = Some(Wizard::from_draft(&draft, message));
+                }
+            }
+            true
+        }
+        KeyOutcome::RemoveBackend(name) => {
+            match handler.remove(&name) {
+                Ok(message) => app.note(message),
+                Err(message) => app.warn(message),
+            }
+            app.show_panel = true;
+            true
+        }
+        KeyOutcome::ToggleBackend(name) => {
+            match handler.toggle(&name) {
+                Ok(message) => app.note(message),
+                Err(message) => app.warn(message),
+            }
+            app.show_panel = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 管理动作多半重启了守护进程：状态、诊断与历史全部重新拉一次。
+fn refresh_after_action(app: &mut App, client: &DaemonClient) {
+    client.request_status();
+    client.request_doctor();
+    client.request_history(HISTORY_LIMIT);
+    app.forget_previews();
 }
 
 /// 渲染一帧到 stdout（不需要终端，便于脚本与 CI 校验）。
@@ -279,5 +428,168 @@ pub fn preview_kind(preview: &HistoryPreview) -> &'static str {
         "图片"
     } else {
         "未知"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试用的"命令行层"：只记录调用，并按开关决定成功 / 失败。
+    #[derive(Default)]
+    struct FakeAdmin {
+        toggled: Vec<String>,
+        removed: Vec<String>,
+        added: Vec<String>,
+        fail_add: Option<&'static str>,
+        fail_toggle: Option<&'static str>,
+    }
+
+    impl BackendAdmin for FakeAdmin {
+        fn toggle(&mut self, name: &str) -> Result<String, String> {
+            match self.fail_toggle {
+                Some(message) => Err(message.to_string()),
+                None => {
+                    self.toggled.push(name.to_string());
+                    Ok(format!("后端 {name} 已停用"))
+                }
+            }
+        }
+
+        fn remove(&mut self, name: &str) -> Result<String, String> {
+            self.removed.push(name.to_string());
+            Ok(format!("后端 {name} 已移除"))
+        }
+
+        fn add(&mut self, draft: &BackendDraft) -> Result<String, String> {
+            if let Some(message) = self.fail_add {
+                return Err(message.to_string());
+            }
+            self.added.push(draft.name().to_string());
+            Ok(format!("后端 {} 已保存", draft.name()))
+        }
+    }
+
+    fn draft(name: &str) -> BackendDraft {
+        BackendDraft {
+            kind: WizardKind::Server,
+            values: vec![
+                name.to_string(),
+                "http://192.168.1.9:8688".to_string(),
+                "space-1".to_string(),
+                "token".to_string(),
+            ],
+        }
+    }
+
+    fn app_with_backends(names: &[&str]) -> App {
+        let backends: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name, "kind": "server", "enabled": true, "failures": 0,
+                    "next_attempt_ms": 0, "published": 0, "applied": 0
+                })
+            })
+            .collect();
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": backends,
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        app.show_panel = true;
+        app
+    }
+
+    #[test]
+    fn 添加成功回到面板并选中新行() {
+        let mut app = app_with_backends(&["home"]);
+        let mut admin = FakeAdmin::default();
+        assert!(perform_admin_action(
+            &mut app,
+            &mut admin,
+            KeyOutcome::AddBackend(Box::new(draft("office")))
+        ));
+        assert_eq!(admin.added, vec!["office".to_string()]);
+        assert!(app.show_panel, "加完要留在面板里，而不是掉回历史列表");
+        assert!(app.wizard.is_none(), "成功后表单要关掉");
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.clone()),
+            Some("后端 office 已保存".to_string())
+        );
+        assert!(!app.notice.as_ref().unwrap().is_error);
+    }
+
+    #[test]
+    fn 添加失败把草稿留在表单里() {
+        let mut app = app_with_backends(&[]);
+        app.wizard = Some(Wizard::from_draft(&draft("office"), String::new()));
+        let mut admin = FakeAdmin {
+            fail_add: Some("连接超时：dial tcp 10.0.0.9:9000"),
+            ..FakeAdmin::default()
+        };
+        perform_admin_action(
+            &mut app,
+            &mut admin,
+            KeyOutcome::AddBackend(Box::new(draft("office"))),
+        );
+        let form = app.wizard.as_ref().expect("失败后表单必须留着，草稿不能丢");
+        assert_eq!(form.value(0), "office", "已填的内容要原样保留");
+        assert_eq!(
+            form.message.as_deref(),
+            Some("连接超时：dial tcp 10.0.0.9:9000"),
+            "失败原因写在表单里，用户改一个字段就能重试"
+        );
+    }
+
+    #[test]
+    fn 停用成功回填提示_失败给错误提示() {
+        let mut app = app_with_backends(&["home"]);
+        let mut admin = FakeAdmin::default();
+        perform_admin_action(
+            &mut app,
+            &mut admin,
+            KeyOutcome::ToggleBackend("home".into()),
+        );
+        assert_eq!(admin.toggled, vec!["home".to_string()]);
+        assert!(app.show_panel);
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.text.clone()),
+            Some("后端 home 已停用".to_string())
+        );
+
+        let mut failing = FakeAdmin {
+            fail_toggle: Some("配置文件只读"),
+            ..FakeAdmin::default()
+        };
+        perform_admin_action(
+            &mut app,
+            &mut failing,
+            KeyOutcome::ToggleBackend("home".into()),
+        );
+        let notice = app.notice.as_ref().unwrap();
+        assert!(notice.is_error, "失败要用错误色提示");
+        assert_eq!(notice.text, "配置文件只读");
+        assert!(app.show_panel, "失败也要留在面板里，方便用户看状态再决定");
+    }
+
+    #[test]
+    fn 非管理动作不碰界面状态() {
+        let mut app = App::new();
+        let mut admin = FakeAdmin::default();
+        assert!(!perform_admin_action(
+            &mut app,
+            &mut admin,
+            KeyOutcome::Quit
+        ));
+        assert!(admin.added.is_empty() && admin.toggled.is_empty() && admin.removed.is_empty());
     }
 }
