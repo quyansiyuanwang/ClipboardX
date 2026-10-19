@@ -415,6 +415,17 @@ impl App {
         self.panel_backend
     }
 
+    /// 按名字选中面板里的某个后端（添加成功后把新行高亮出来）。
+    pub fn select_backend(&mut self, name: &str) {
+        if let Some(index) = self
+            .backend_names()
+            .iter()
+            .position(|candidate| candidate == name)
+        {
+            self.panel_backend = index;
+        }
+    }
+
     /// 打开面板时把选中项夹回范围内（后端数量会变）。
     pub fn clamp_panel_selection(&mut self) {
         let count = self.backend_names().len();
@@ -734,7 +745,10 @@ impl App {
                     KeyOutcome::None
                 }
                 KeyCode::Left => {
-                    if let Some(form) = self.wizard.as_mut() {
+                    // 选择题（寻址）用 ←/→ 拨动；不是选择题时方向键仍按原样走焦点
+                    if let Some(form) = self.wizard.as_mut()
+                        && !form.cycle_value(-1)
+                    {
                         match form.focus() {
                             Focus::Kind => form.kind_left(),
                             Focus::Cancel => form.focus_button(true),
@@ -744,7 +758,9 @@ impl App {
                     KeyOutcome::None
                 }
                 KeyCode::Right => {
-                    if let Some(form) = self.wizard.as_mut() {
+                    if let Some(form) = self.wizard.as_mut()
+                        && !form.cycle_value(1)
+                    {
                         match form.focus() {
                             Focus::Kind => form.kind_right(),
                             Focus::Save => form.focus_button(false),
@@ -856,8 +872,9 @@ impl App {
                     }
                     KeyOutcome::None
                 }
-                // t 是"停用/启用"：可逆操作，不需要确认
-                KeyCode::Char('t') => match self.selected_backend() {
+                // t / 空格 是"停用·启用"：可逆操作，不需要确认。
+                // 空格更像"开关"这个心智模型，t 留给习惯 vim 风格的人。
+                KeyCode::Char('t') | KeyCode::Char(' ') => match self.selected_backend() {
                     Some(name) => KeyOutcome::ToggleBackend(name),
                     None => {
                         self.warn("没有可切换的后端");
@@ -2049,6 +2066,70 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
         assert!(app.pending_backend_remove.is_none());
         assert!(app.notice.as_ref().unwrap().text.contains("没有可移除"));
+    }
+
+    #[test]
+    fn 面板里空格就是开关() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("home", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        // 空格在列表页是"暂停"，在面板里必须是"开关"：同一个键在不同上下文
+        // 有不同含义，但绝不能把面板里的开关变成暂停同步
+        assert_eq!(
+            app.on_key(key(KeyCode::Char(' '))),
+            KeyOutcome::ToggleBackend("home".to_string())
+        );
+        assert!(app.show_panel, "开关后端不该关掉面板");
+    }
+
+    #[test]
+    fn 面板里按_a_直接进表单且填完回到面板() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("home", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('a'))), KeyOutcome::None);
+        assert!(app.wizard.is_some(), "面板里按 a 应当直接打开表单");
+        // 取消后回到面板：用户的落点是"管理后端"，不是主界面
+        assert_eq!(app.on_key(key(KeyCode::Esc)), KeyOutcome::None);
+        assert!(app.wizard.is_none());
+        assert!(app.show_panel, "取消表单要回到面板，而不是掉回历史列表");
+    }
+
+    #[test]
+    fn 表单里寻址用左右键拨动() {
+        let mut app = App::new();
+        app.on_key(key(KeyCode::Char('a')));
+        // 切到 S3，再把焦点落到"寻址"
+        let form = app.wizard.as_mut().expect("表单已打开");
+        form.set_kind(2);
+        let index = form
+            .fields()
+            .iter()
+            .position(|field| field.label == "寻址")
+            .expect("S3 表单必须有寻址字段");
+        form.focus_field(index);
+        assert_eq!(form.value(index), "");
+
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(
+            app.wizard.as_ref().unwrap().value(index),
+            "virtual-host",
+            "→ 应当拨到下一项"
+        );
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.wizard.as_ref().unwrap().value(index), "path");
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(
+            app.wizard.as_ref().unwrap().value(index),
+            "virtual-host",
+            "← 应当拨回上一项"
+        );
     }
 
     #[test]

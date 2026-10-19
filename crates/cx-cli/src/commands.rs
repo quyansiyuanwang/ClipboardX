@@ -658,55 +658,42 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             // 从快捷方式启动时守护进程通常还没起来。这里先确保它在跑，
             // 否则界面会停在"未连接"上，用户看到的就是"黑窗一闪"。
             ensure_daemon_running(paths)?;
-            let mut app = cx_tui::App::new();
-            loop {
-                let exit = cx_tui::run_with_app(paths, &mut app)
-                    .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?;
-                match exit {
-                    cx_tui::TuiExit::Quit => return Ok(ExitCode::SUCCESS),
-                    cx_tui::TuiExit::AddBackend(draft) => {
-                        match add_backend_from_draft(paths, &draft) {
-                            Ok(()) => {
-                                app.show_panel = true;
-                                app.note("后端已测试并保存，正在更新连接状态");
-                            }
-                            Err(err) => {
-                                let saved = Config::load(paths).ok().is_some_and(|config| {
-                                    config.backend(draft.name().trim()).is_some()
-                                });
-                                if saved {
-                                    app.warn(format!("配置已保存，但运行时更新失败：{err}"));
-                                } else {
-                                    app.wizard =
-                                        Some(cx_tui::Wizard::from_draft(&draft, err.to_string()));
-                                }
-                            }
-                        }
-                    }
-                    cx_tui::TuiExit::ToggleBackend(name) => {
-                        match set_backend_enabled(paths, &name).and_then(|enabled| {
-                            restart_daemon(paths)?;
-                            Ok(enabled)
-                        }) {
-                            Ok(enabled) => app.note(if enabled {
-                                "后端已启用"
-                            } else {
-                                "后端已停用，云端对象和局域网设置未改变"
-                            }),
-                            Err(err) => app.warn(err.to_string()),
-                        }
-                        app.show_panel = true;
-                    }
-                    cx_tui::TuiExit::RemoveBackend(name) => {
-                        match remove_backend(paths, &name).and_then(|()| restart_daemon(paths)) {
-                            Ok(()) => app.note("后端已移除，云端对象未删除"),
-                            Err(err) => app.warn(err.to_string()),
-                        }
-                        app.show_panel = true;
-                    }
-                }
-            }
+            // 面板里的停用 / 移除 / 添加都在界面内执行：改一次配置不必退出界面
+            // 再进来一次（连面板选中位置、诊断内容都一起丢掉）。
+            // 出问题（配置写不进去、重启失败）也只回填一行提示，界面继续留在原地。
+            let mut admin = TuiBackendAdmin { paths };
+            let _ = cx_tui::run_with_admin(paths, &mut cx_tui::App::new(), Some(&mut admin))
+                .map_err(|err| DaemonError::Protocol(format!("终端界面退出：{err}")))?;
+            Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+/// 把后端管理动作接到命令行层：界面只负责按键，落盘与重启守护进程在这里做。
+struct TuiBackendAdmin<'a> {
+    paths: &'a Paths,
+}
+
+impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
+    fn toggle(&mut self, name: &str) -> Result<String, String> {
+        let enabled = set_backend_enabled(self.paths, name).map_err(|err| err.to_string())?;
+        restart_daemon(self.paths).map_err(|err| err.to_string())?;
+        Ok(if enabled {
+            format!("后端 {name} 已启用")
+        } else {
+            format!("后端 {name} 已停用，云端对象和局域网设置未改变")
+        })
+    }
+
+    fn remove(&mut self, name: &str) -> Result<String, String> {
+        remove_backend(self.paths, name).map_err(|err| err.to_string())?;
+        restart_daemon(self.paths).map_err(|err| err.to_string())?;
+        Ok(format!("后端 {name} 已移除，云端对象未删除"))
+    }
+
+    fn add(&mut self, draft: &cx_tui::BackendDraft) -> Result<String, String> {
+        add_backend_from_draft(self.paths, draft).map_err(|err| err.to_string())?;
+        Ok(format!("后端 {} 已保存并自测通过", draft.name().trim()))
     }
 }
 

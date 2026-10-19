@@ -8,12 +8,12 @@
 
 use crate::app::{App, PreviewState};
 use crate::wizard::{Focus, WizardKind};
-use cx_proto::control::HistorySummary;
+use cx_proto::control::{BackendStatus, HistorySummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 
 /// 低于这个宽度就改成上下布局。
 const NARROW_WIDTH: u16 = 84;
@@ -626,7 +626,15 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .saturating_sub(display_width(&prefix))
             .saturating_sub(1);
         let raw = form.value(index);
-        let shown = if field.secret {
+        let shown = if field.is_choice() {
+            // 选择题：`‹ 自动 ›`，箭头明确表示左右能拨（只回显中文字面，配置值是英文）
+            let label = field.choice_label(raw).unwrap_or("自定义");
+            if focused {
+                format!("‹ {label} ›")
+            } else {
+                label.to_string()
+            }
+        } else if field.secret {
             "●".repeat(raw.chars().count().min(room))
         } else {
             input_tail(raw, room)
@@ -767,23 +775,83 @@ fn input_tail(text: &str, width: usize) -> String {
     }
     result
 }
-/// "后端与连接"面板：后端健康、局域网对端、以及 doctor 里的其余检查。
+/// 后端管理面板：一张表（后端健康 + 开关）+ doctor 里 TUI 看不到的几项。
 ///
-/// 为什么需要它：TUI 原来只看得到"后端 N 个"，看不出**哪个后端在失败、退避到什么时候、
-/// 局域网到底连上没有**——而这些恰恰是"同步不工作"时最先要问的问题。
+/// 为什么是表：原来是"每个后端一段文字"，看得出行、看不出**列**——想比较"哪个在失败、
+/// 哪个被停用了、有几个后端"得逐行读。表格把名称 / 类型 / 目标 / 收发计数 / 状态 / 开关
+/// 对齐，一眼扫一列就够了。停用·启用、移除、添加也都收在同一个面板里：
+/// 改配置不必退出界面再进来。
 fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let popup = centered(area, 78, 74);
+    let popup = centered(area, 82, 76);
     app.modal_rect = popup;
     frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(" 后端管理 ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height < 4 || inner.width < 20 {
+        return;
+    }
 
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            "后端与连接",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let backends: &[BackendStatus] = app
+        .status
+        .as_ref()
+        .map(|status| status.backends.as_slice())
+        .unwrap_or(&[]);
+    // 窄屏（<62 列）砍掉"类型 / 目标 / 收发计数"三列：保留名称、状态与开关，
+    // 剩下的靠选中行下面那一行错误/提示补足。
+    let narrow = inner.width < 62;
 
+    // 有后端才画表格：表头 + 每后端一行；诊断区永远保留最少两行。
+    let table_height = if backends.is_empty() {
+        0
+    } else {
+        (backends.len() as u16 + 1).min(inner.height.saturating_sub(4))
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(table_height),
+            Constraint::Length(1), // 最近一次操作的结果 / 选中后端的错误
+            Constraint::Min(2),    // 连接与安全（可滚动）
+            Constraint::Length(1), // 按键
+        ])
+        .split(inner);
+
+    if !backends.is_empty() {
+        let selected = app.panel_backend();
+        draw_backend_table(frame, chunks[0], backends, selected, narrow);
+    }
+
+    // 结果行：优先显示"刚做过什么"，其次显示选中后端的错误。
+    // 选中的那个后端没出错、但别的后端在失败时，也要把那条错误露出来——
+    // 否则"表格里显示失败 4 次"却看不到原因，还得挨个选中去找。
+    let selected_backend = backends.get(app.panel_backend());
+    let error_backend = selected_backend
+        .filter(|backend| backend.last_error.is_some())
+        .or_else(|| backends.iter().find(|backend| backend.last_error.is_some()));
+    let result_line = match &app.notice {
+        Some(notice) => Some(Line::from(Span::styled(
+            format!(" {}", notice.text),
+            if notice.is_error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Cyan)
+            },
+        ))),
+        None => error_backend.and_then(|backend| {
+            backend.last_error.as_ref().map(|error| {
+                Line::from(Span::styled(
+                    format!(" {}：{error}", backend.name),
+                    Style::default().fg(Color::Red),
+                ))
+            })
+        }),
+    };
+    if let Some(line) = result_line {
+        frame.render_widget(Paragraph::new(line), chunks[1]);
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
     match &app.status {
         None => lines.push(Line::from(Span::styled(
             "还没连上守护进程，看不到后端状态。",
@@ -876,70 +944,8 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Style::default().fg(Color::Cyan),
             )));
         }
-        Some(status) => {
-            for backend in &status.backends {
-                let (mark, style) = if !backend.enabled {
-                    ("○", Style::default().fg(Color::DarkGray))
-                } else if backend.failures > 0 || backend.last_error.is_some() {
-                    ("●", Style::default().fg(Color::Red))
-                } else if backend.last_ok_ms.is_none() {
-                    ("?", Style::default().fg(Color::Yellow))
-                } else {
-                    ("●", Style::default().fg(Color::Green))
-                };
-                let selected = status
-                    .backends
-                    .iter()
-                    .position(|item| item.name == backend.name)
-                    == Some(app.panel_backend());
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if selected { "▶ " } else { "  " },
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(format!("{mark} "), style),
-                    Span::styled(
-                        format!("{:<10}", backend.name),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!("{:<8}", backend.kind), Style::default()),
-                    // 地址 / 桶 @ 端点 / 空间：配了两个同类后端时才分得清谁是谁
-                    match &backend.detail {
-                        Some(detail) if !detail.is_empty() => Span::styled(
-                            format!("{} ", clamp_width_value(detail.clone(), 28)),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        _ => Span::raw(""),
-                    },
-                    Span::raw(format!(
-                        "发布 {:<5} 接收 {:<5} ",
-                        backend.published, backend.applied
-                    )),
-                    if !backend.enabled {
-                        Span::styled("已禁用".to_string(), Style::default().fg(Color::DarkGray))
-                    } else if backend.failures > 0 {
-                        Span::styled(
-                            format!("失败 {} 次，{} 后重试", backend.failures, retry_in(backend)),
-                            Style::default().fg(Color::Red),
-                        )
-                    } else {
-                        Span::styled(
-                            match backend.last_ok_ms {
-                                Some(ms) => format!("最近成功 {}", relative_time(ms)),
-                                None => "还没成功过".to_string(),
-                            },
-                            Style::default().fg(Color::DarkGray),
-                        )
-                    },
-                ]));
-                if let Some(error) = &backend.last_error {
-                    lines.push(Line::from(Span::styled(
-                        format!("    └ {error}"),
-                        Style::default().fg(Color::Red),
-                    )));
-                }
-            }
-        }
+        // 有后端时上面的表格已经把每个后端都说清楚了，这里不再重复
+        Some(_) => {}
     }
 
     // doctor 里那些 TUI 看不到、但排查时最先要问的几项
@@ -984,26 +990,140 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         )));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        // 面板里也要说明怎么"再加一个"：空状态里提了 a，但已经有一个后端之后
-        // 就没有任何提示了，想配第二个后端的人只能猜。
-        "  ↑↓ 选后端　t 停用/启用　x 移除　a 添加　b/Esc 关闭　J/K、PgUp/PgDn 滚动　0 回开头",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let lines = wrapped_lines(Text::from(lines), popup.width.saturating_sub(2));
+    // 诊断区单独渲染：它可能很长（引导 + 诊断），只有它需要滚动，
+    // 表格与按键提示固定不动——滚一下把表头滚没了才是最难受的。
+    let lines = wrapped_lines(Text::from(lines), chunks[2].width);
     app.panel_max_scroll = lines
         .len()
-        .saturating_sub(popup.height.saturating_sub(2) as usize)
+        .saturating_sub(chunks[2].height as usize)
         .min(u16::MAX as usize) as u16;
     app.clamp_panel_scroll();
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title(" 后端与连接 "))
-            .scroll((app.panel_scroll(), 0)),
-        popup,
+        Paragraph::new(Text::from(lines)).scroll((app.panel_scroll(), 0)),
+        chunks[2],
     );
+
+    let keys = if chunks[3].width < 76 {
+        // 窄屏只留最常用的四个键：空格开关、a 添加、x 移除、Esc 关闭
+        "  ↑↓ 选择　空格 开关　a 添加　x 移除　Esc 关闭"
+    } else {
+        "  ↑↓ 选后端　空格/t 停用·启用　x 移除　a 添加　r 重读诊断　J/K 滚动　b/Esc 关闭"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            keys,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[3],
+    );
+}
+
+/// 表格：名称 / 类型 / 目标 / 收发计数 / 状态 / 开关。
+///
+/// 只有被选中那一行是粗体 + ▶，颜色只用于状态列与开关列：
+/// 整行上底色会让"状态"这一列的颜色失效，反而不容易扫。
+fn draw_backend_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    backends: &[BackendStatus],
+    selected: usize,
+    narrow: bool,
+) {
+    let header_cells: Vec<&str> = if narrow {
+        vec!["", "名称", "状态", "开关"]
+    } else {
+        vec!["", "名称", "类型", "目标", "发布/接收", "状态", "开关"]
+    };
+    let header = Row::new(header_cells).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows: Vec<Row<'_>> = backends
+        .iter()
+        .enumerate()
+        .map(|(index, backend)| {
+            let is_selected = index == selected;
+            let (state_text, state_style) = backend_state(backend);
+            let mut cells: Vec<Cell<'_>> = vec![
+                Cell::from(Span::styled(
+                    if is_selected { "▶" } else { " " },
+                    Style::default().fg(Color::Cyan),
+                )),
+                Cell::from(Span::styled(
+                    backend.name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+            ];
+            if !narrow {
+                cells.push(Cell::from(Span::raw(backend.kind.clone())));
+                // 地址 / 桶 @ 端点 / 空间：配了两个同类后端时才分得清谁是谁
+                cells.push(Cell::from(Span::styled(
+                    clamp_width_value(backend.detail.clone().unwrap_or_default(), 30),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                cells.push(Cell::from(Span::raw(format!(
+                    "{}/{}",
+                    backend.published, backend.applied
+                ))));
+            }
+            cells.push(Cell::from(Span::styled(state_text, state_style)));
+            cells.push(Cell::from(Span::styled(
+                if backend.enabled { "开" } else { "关" },
+                if backend.enabled {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            )));
+            Row::new(cells).style(if is_selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+        })
+        .collect();
+
+    let widths: Vec<Constraint> = if narrow {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(10),
+            Constraint::Min(12),
+            Constraint::Length(4),
+        ]
+    } else {
+        vec![
+            Constraint::Length(2),
+            Constraint::Length(10),
+            Constraint::Length(6),
+            Constraint::Min(10),
+            Constraint::Length(9),
+            Constraint::Min(12),
+            Constraint::Length(4),
+        ]
+    };
+    frame.render_widget(Table::new(rows, widths).header(header), area);
+}
+
+/// 一个后端在表格"状态"列里的文字与颜色（形状与颜色一起变，不只靠颜色区分）。
+fn backend_state(backend: &BackendStatus) -> (String, Style) {
+    if !backend.enabled {
+        return ("已停用".to_string(), Style::default().fg(Color::DarkGray));
+    }
+    if backend.failures > 0 {
+        return (
+            format!("失败 {} 次，{}后重试", backend.failures, retry_in(backend)),
+            Style::default().fg(Color::Red),
+        );
+    }
+    match backend.last_ok_ms {
+        Some(ms) => (
+            format!("最近成功 {}", relative_time(ms)),
+            Style::default().fg(Color::Green),
+        ),
+        None => ("还没成功过".to_string(), Style::default().fg(Color::Yellow)),
+    }
 }
 
 /// 退避还剩多久。
@@ -1722,7 +1842,7 @@ mod tests {
         old.show_panel = true;
         let screen = render(&mut old, 140, 30);
         assert!(has(&screen, "home"), "{screen}");
-        assert!(has(&screen, "后端与连接"), "{screen}");
+        assert!(has(&screen, "后端管理"), "{screen}");
     }
 
     #[test]
@@ -1752,7 +1872,10 @@ mod tests {
             "已经有一个后端时也要说明怎么再加一个：{screen}"
         );
         assert!(has(&screen, "x 移除"), "{screen}");
-        assert!(has(&screen, "t 停用/启用"), "要告诉用户能停用：{screen}");
+        assert!(
+            has(&screen, "空格/t 停用·启用"),
+            "要告诉用户能停用（空格就是开关）：{screen}"
+        );
 
         // 确认浮层
         app.pending_backend_remove = Some("home".to_string());
@@ -1925,6 +2048,30 @@ mod tests {
     }
 
     #[test]
+    fn 表单里寻址画成可选箭头() {
+        let mut app = App::new();
+        app.wizard = Some(crate::wizard::Wizard::new());
+        let form = app.wizard.as_mut().unwrap();
+        form.set_kind(2);
+        let index = form
+            .fields()
+            .iter()
+            .position(|field| field.label == "寻址")
+            .expect("S3 表单必须有寻址字段");
+        form.focus_field(index);
+        let screen = render(&mut app, 120, 34);
+        assert!(
+            has(&screen, "‹ 自动 ›"),
+            "聚焦时要用箭头表示左右能拨：{screen}"
+        );
+
+        // 拨到"路径式"：显示中文，写进配置的仍是 path
+        app.wizard.as_mut().unwrap().cycle_value(2);
+        let screen = render(&mut app, 120, 34);
+        assert!(has(&screen, "‹ 路径式 ›"), "{screen}");
+    }
+
+    #[test]
     fn 安全与时间文案不误导() {
         assert!(absolute_time(1_759_323_998_000).ends_with("UTC"));
         let mut app = app_with(1);
@@ -2026,10 +2173,13 @@ mod tests {
         app.show_panel = true;
         let screen = render(&mut app, 120, 30);
 
-        assert!(has(&screen, "后端与连接"), "{screen}");
+        assert!(has(&screen, "后端管理"), "{screen}");
+        // 表头：一眼看得出这几列是什么
+        assert!(has(&screen, "名称"), "{screen}");
+        assert!(has(&screen, "开关"), "要有一列明确显示启用状态：{screen}");
         assert!(has(&screen, "home"), "{screen}");
         assert!(has(&screen, "oss"), "{screen}");
-        assert!(has(&screen, "已禁用"), "禁用的后端要标出来：{screen}");
+        assert!(has(&screen, "已停用"), "停用的后端要标出来：{screen}");
         assert!(has(&screen, "失败 4 次"), "要给出失败次数：{screen}");
         assert!(has(&screen, "连接超时"), "要给出最近一次错误：{screen}");
         assert!(has(&screen, "秒后重试"), "要给出退避时间：{screen}");
@@ -2037,6 +2187,61 @@ mod tests {
         assert!(has(&screen, "局域网"), "{screen}");
         assert!(has(&screen, "ALEXLAPTOP"), "{screen}");
         assert!(has(&screen, "密钥权限"), "{screen}");
+    }
+
+    #[test]
+    fn 窄屏面板砍掉目标列但保留状态与开关() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": [
+                    { "name": "oss", "kind": "s3", "enabled": true, "failures": 4,
+                      "next_attempt_ms": 0, "published": 1, "applied": 1,
+                      "detail": "bucket-a @ https://oss-cn-hangzhou.aliyuncs.com" }
+                ],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        app.show_panel = true;
+        let screen = render(&mut app, 64, 24);
+        assert!(has(&screen, "名称"), "{screen}");
+        assert!(has(&screen, "开关"), "{screen}");
+        assert!(
+            has(&screen, "失败 4 次"),
+            "窄屏也必须看得到状态与退避：{screen}"
+        );
+        assert!(!has(&screen, "bucket-a"), "窄屏不画目标列：{screen}");
+    }
+
+    #[test]
+    fn 面板里显示上一操作的结果() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": "space-1", "encrypted": true,
+                "backends": [ backend("home", "server", true, 0, None) ],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        app.show_panel = true;
+        app.note("后端 home 已停用，云端对象和局域网设置未改变");
+        let screen = render(&mut app, 120, 30);
+        // 界面内执行的动作结果必须留在面板里可见：否则用户按了空格却不知道发生了什么
+        assert!(
+            has(&screen, "已停用，云端对象和局域网设置未改变"),
+            "面板里要能看到刚做完的动作：{screen}"
+        );
     }
 
     #[test]
