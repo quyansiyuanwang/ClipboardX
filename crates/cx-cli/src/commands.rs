@@ -322,6 +322,9 @@ pub enum SpaceCommand {
         /// 不加密（对象存储里可直接读到内容，仅调试用）
         #[arg(long)]
         no_encrypt: bool,
+        /// 已有空间时也重建（会换成新密钥，旧对象再也解不开）
+        #[arg(long)]
+        force: bool,
         /// 从标准输入读取口令（不提示）
         #[arg(long)]
         passphrase_stdin: bool,
@@ -622,6 +625,7 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             SpaceCommand::Init {
                 no_encrypt,
                 passphrase_stdin,
+                force,
             } => {
                 let passphrase = if no_encrypt {
                     None
@@ -638,6 +642,17 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                     && passphrase.is_empty()
                 {
                     return Err(DaemonError::Protocol("口令不能为空".to_string()));
+                }
+                // 已经有空间时**默认拒绝创建**：新建会生成新密钥并覆盖 space.json/space.key，
+                // 旧对象从此再也解不开（远端那份也会被 publish 覆盖）。要重建必须显式 --force。
+                if paths.space_file().exists() && !force {
+                    let existing = LocalSpace::load(paths)
+                        .map(|space| space.short_id())
+                        .unwrap_or_else(|_| "（读取失败）".to_string());
+                    return Err(DaemonError::Protocol(format!(
+                        "本机已有空间 {existing}；重建会换成新密钥、已上传的对象再也解不开。\
+                         确实要重建请先确认不再需要旧数据，再加 --force"
+                    )));
                 }
                 let space = LocalSpace::create(paths, passphrase.as_deref())?;
                 println!("已创建空间 {}", space.short_id());
@@ -754,6 +769,16 @@ impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
     /// 留空又会退化成明文上传。用户拿这句口令去 `cx space join`，也可以
     /// `cx space export-key` 备份空间密钥。
     fn create_space(&mut self, backend: &str) -> Result<String, String> {
+        // 界面里绝不做"覆盖已有空间"这种事：换密钥等于把已上传的对象全变成垃圾
+        if self.paths.space_file().exists() {
+            let existing = LocalSpace::load(self.paths)
+                .map(|space| space.short_id())
+                .unwrap_or_else(|_| "（读取失败）".to_string());
+            return Err(format!(
+                "本机已有空间 {existing}；重建会换成新密钥、已上传的对象再也解不开。\
+                 确实要重建请用命令行：cx space init --force"
+            ));
+        }
         // 36 个十六进制字符的随机口令：够强，也够短到能抄下来
         let passphrase = cx_core::random_passphrase().map_err(|err| err.to_string())?;
         let space =

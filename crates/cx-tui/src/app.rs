@@ -887,13 +887,25 @@ impl App {
                     }
                 },
                 // s：没有空间时一键建加密空间（口令自动生成并在结果里回显一次）
-                KeyCode::Char('s') => match self.selected_backend() {
-                    Some(name) => KeyOutcome::CreateSpace(name),
-                    None => {
-                        self.warn("先添加一个后端，才能把空间元数据发布上去");
-                        KeyOutcome::None
+                KeyCode::Char('s') => {
+                    // 已经有空间就只提示、不发起：换密钥会让已上传的对象全变成解不开的垃圾
+                    let has_space = self
+                        .status
+                        .as_ref()
+                        .map(|status| status.space_id.is_some())
+                        .unwrap_or(false);
+                    if has_space {
+                        self.warn("本机已有加密空间；重建会换成新密钥、旧对象再也解不开（命令行 cx space init --force 才能那么做）");
+                        return KeyOutcome::None;
                     }
-                },
+                    match self.selected_backend() {
+                        Some(name) => KeyOutcome::CreateSpace(name),
+                        None => {
+                            self.warn("先添加一个后端，才能把空间元数据发布上去");
+                            KeyOutcome::None
+                        }
+                    }
+                }
                 // 移除选中后端：先进确认，避免误删
                 KeyCode::Char('x') | KeyCode::Char('d') if !ctrl => match self.selected_backend() {
                     Some(name) => {
@@ -1697,6 +1709,29 @@ mod tests {
     }
 
     /// 带后端的诊断状态：用 JSON 构造，字段增删时测试不会碎。
+    /// 还没有加密空间、但已配后端的场景（面板里按 s 建空间用）。
+    fn status_without_space(backends: serde_json::Value) -> StatusReport {
+        serde_json::from_value(serde_json::json!({
+            "version": "0.1.0",
+            "pid": 42,
+            "started_ms": 1_759_323_000_000u64,
+            "paused": false,
+            "device_id": "ab12cd34ef567890",
+            "device_name": "笔记本",
+            "space_id": null,
+            "encrypted": false,
+            "backends": backends,
+            "history_len": 3,
+            "seen_len": 0,
+            "skipped_oversize": 0,
+            "skipped_ignored": 0,
+            "last_published_hash": null,
+            "clipboard": "系统剪贴板（测试）",
+            "watch": "平台事件通知",
+            "no_clipboard": false
+        }))
+        .expect("状态 JSON 应当能反序列化")
+    }
     fn status_with_backends(paused: bool, backends: serde_json::Value) -> StatusReport {
         serde_json::from_value(serde_json::json!({
             "version": "0.1.0",
@@ -2105,8 +2140,7 @@ mod tests {
     #[test]
     fn 面板里按_s_要求建加密空间() {
         let mut app = App::new();
-        app.apply(UiEvent::Status(Box::new(status_with_backends(
-            false,
+        app.apply(UiEvent::Status(Box::new(status_without_space(
             serde_json::json!([backend("oss", true, 0, None)]),
         ))));
         app.on_key(key(KeyCode::Char('b')));
@@ -2119,9 +2153,32 @@ mod tests {
     }
 
     #[test]
+    fn 已有空间时按_s_只提示不重建() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('s'))),
+            KeyOutcome::None,
+            "已有空间时按 s 绝不能发起重建（换密钥会让旧对象解不开）"
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("已有加密空间")),
+            "要说明为什么不动"
+        );
+    }
+    #[test]
     fn 没有后端时按_s_给出提示而不是发起建空间() {
         let mut app = App::new();
-        app.apply(UiEvent::Status(Box::new(status(false))));
+        // 没有空间、也没有后端：这才是"该先加后端"的场景
+        app.apply(UiEvent::Status(Box::new(status_without_space(
+            serde_json::json!([]),
+        ))));
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(app.on_key(key(KeyCode::Char('s'))), KeyOutcome::None);
         assert!(
