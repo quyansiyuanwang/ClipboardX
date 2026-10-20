@@ -93,12 +93,28 @@ pub(crate) fn pending(
 /// 文件已被 `remove_file` 标记删除、还有别的句柄没关。对读者来说这与"不存在"等价，
 /// 因此按"已经没了"处理——**不能**当成 IO 错误把整次读取带崩。
 fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>, DaemonError> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) if !path.exists() => Ok(None),
-        Err(err) => Err(DaemonError::io(err)),
+    for attempt in 0..4 {
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(Some(bytes)),
+            // 已经不在磁盘上：并发的 acknowledge 完成了
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Windows：remove_file 标记删除后、最后一个句柄关闭前，再打开会得到
+            // 「拒绝访问」(os error 5)。这不是"我们没有权限"，而是"它正在被删掉"，
+            // 等一两毫秒通常就消失了。续几轮都还不行，就当作已经没有了——
+            // 跳过只是"这一轮不发它"，文件还在，下一轮仍会重试，不会丢数据。
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                return Ok(None);
+            }
+            Err(_) if !path.exists() => return Ok(None),
+            Err(err) => return Err(DaemonError::io(err)),
+        }
     }
+    // 循环里每一条分支都 return/continue，走到这里说明重试全部命中删除竞态
+    Ok(None)
 }
 
 pub(crate) fn acknowledge(dir: &Path, name: &str) -> Result<(), DaemonError> {
