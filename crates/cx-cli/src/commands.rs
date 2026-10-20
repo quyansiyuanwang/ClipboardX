@@ -747,6 +747,24 @@ impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
         add_backend_from_draft(self.paths, draft).map_err(|err| err.to_string())?;
         Ok(format!("后端 {} 已保存并自测通过", draft.name().trim()))
     }
+
+    /// 面板里按 s：本机建加密空间 + 把元数据发布到该后端。
+    ///
+    /// 口令由这里随机生成并**在结果里回显一次**——界面里让用户当场想强口令不现实，
+    /// 留空又会退化成明文上传。用户拿这句口令去 `cx space join`，也可以
+    /// `cx space export-key` 备份空间密钥。
+    fn create_space(&mut self, backend: &str) -> Result<String, String> {
+        // 36 个十六进制字符的随机口令：够强，也够短到能抄下来
+        let passphrase = cx_core::random_passphrase().map_err(|err| err.to_string())?;
+        let space =
+            LocalSpace::create(self.paths, Some(&passphrase)).map_err(|err| err.to_string())?;
+        publish_space(self.paths, backend).map_err(|err| err.to_string())?;
+        restart_daemon(self.paths).map_err(|err| err.to_string())?;
+        Ok(format!(
+            "已建加密空间 {} 并上传到 {backend}；空间口令（加第二台设备要用，请记下）：{passphrase}",
+            space.short_id()
+        ))
+    }
 }
 
 fn checked_history_args(

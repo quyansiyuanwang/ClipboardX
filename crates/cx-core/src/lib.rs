@@ -28,6 +28,13 @@ pub use space::{LocalSpace, SealedPayload, SpaceCipher, SpaceMeta};
 pub use state::{BackendState, Cursor, DaemonState};
 pub use suppress::{SeenSet, TtlSet};
 
+/// 生成一个用户能抄下来的随机口令（hex，36 字符）。
+///
+/// 用随机口令而不是让用户在终端里现想一个：现想的往往太弱，留空又会退化成明文上传。
+pub fn random_passphrase() -> Result<String, CoreError> {
+    cx_crypto::random_hex(18).map_err(|err| CoreError::SpaceKey(err.to_string()))
+}
+
 /// 对象存储布局版本（`v1/` 目录下的落盘格式版本，见 `docs/protocol.md`）。
 pub const STORE_LAYOUT_VERSION: u32 = 1;
 

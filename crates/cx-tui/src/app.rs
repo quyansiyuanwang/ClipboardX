@@ -52,6 +52,8 @@ pub enum KeyOutcome {
     RemoveBackend(String),
     /// 停用 / 启用某个后端（面板里按 t）。
     ToggleBackend(String),
+    /// 在本机建加密空间并把元数据发布到该后端（面板里按 s）。
+    CreateSpace(String),
 }
 
 /// 一条提示信息。
@@ -881,6 +883,14 @@ impl App {
                     Some(name) => KeyOutcome::ToggleBackend(name),
                     None => {
                         self.warn("没有可切换的后端");
+                        KeyOutcome::None
+                    }
+                },
+                // s：没有空间时一键建加密空间（口令自动生成并在结果里回显一次）
+                KeyCode::Char('s') => match self.selected_backend() {
+                    Some(name) => KeyOutcome::CreateSpace(name),
+                    None => {
+                        self.warn("先添加一个后端，才能把空间元数据发布上去");
                         KeyOutcome::None
                     }
                 },
@@ -2092,6 +2102,35 @@ mod tests {
         assert_eq!(app.selected_backend().as_deref(), Some("home"));
     }
 
+    #[test]
+    fn 面板里按_s_要求建加密空间() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('s'))),
+            KeyOutcome::CreateSpace("oss".to_string()),
+            "面板里按 s 应当发起建空间，发布目标是选中的后端"
+        );
+        assert!(app.show_panel, "建空间不该关掉面板");
+    }
+
+    #[test]
+    fn 没有后端时按_s_给出提示而不是发起建空间() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status(false))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('s'))), KeyOutcome::None);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("先添加一个后端")),
+            "要说明没后端时建不了空间"
+        );
+    }
     #[test]
     fn 面板里空格就是开关() {
         let mut app = App::new();

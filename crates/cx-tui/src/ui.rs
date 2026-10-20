@@ -946,6 +946,29 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Some(_) => {}
     }
 
+    // 有后端但本机还没有加密空间：这是唯一必须动手的配置步骤，直接在面板里给出按键。
+    // （诊断项来自 doctor，管道里没有"空间是否已建"这条，所以单独判断 status）
+    if let Some(status) = &app.status
+        && !status.backends.is_empty()
+        && status.space_id.is_none()
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "需要处理",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled(" ▲ ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "还没有加密空间",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("：按 s 在本机建一个并上传（口令会自动生成并显示一次）"),
+        ]));
+    }
+
     // 诊断区只列「需要你动手」的项：一切正常就不占任何版面。
     // 剪贴板后端、监听方式、历史存储这类是给排障的人看的，界面上没有意义。
     const NOISE: [&str; 3] = ["剪贴板", "监听方式", "历史存储"];
@@ -1008,7 +1031,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // 窄屏只留最常用的四个键：空格开关、a 添加、x 移除、Esc 关闭
         "  ↑↓ 选择　空格 开关　a 添加　x 移除　Esc 关闭"
     } else {
-        "  ↑↓ 选后端　空格/t 停用·启用　x 移除　a 添加　r 重读诊断　J/K 滚动　b/Esc 关闭"
+        "  ↑↓ 选后端　空格/t 停用·启用　x 移除　a 添加　s 建空间　r 重读诊断　J/K 滚动　Esc 返回"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2259,6 +2282,27 @@ mod tests {
         assert!(!has(&screen, "bucket-a"), "窄屏不画目标列：{screen}");
     }
 
+    #[test]
+    fn 有后端但没空间时面板给出按_s_的提示() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "version": "0.1.0", "pid": 1, "started_ms": 0u64, "paused": false,
+                "device_id": "ab12cd34ef567890", "device_name": "笔记本",
+                "space_id": null, "encrypted": false,
+                "backends": [backend("oss", "s3", true, 0, None)],
+                "history_len": 0, "seen_len": 0, "skipped_oversize": 0,
+                "skipped_ignored": 0, "last_published_hash": null,
+                "clipboard": "系统剪贴板（测试）", "watch": "平台事件通知", "no_clipboard": false
+            }))
+            .expect("状态 JSON 应当能反序列化"),
+        )));
+        app.show_panel = true;
+        let screen = render(&mut app, 100, 24);
+        assert!(has(&screen, "还没有加密空间"), "{screen}");
+        assert!(has(&screen, "按 s"), "要告诉用户按什么键：{screen}");
+        assert!(has(&screen, "s 建空间"), "页脚也要有：{screen}");
+    }
     #[test]
     fn 面板里显示上一操作的结果() {
         let mut app = App::new();
