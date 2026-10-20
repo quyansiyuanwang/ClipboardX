@@ -11,7 +11,8 @@
 use crate::error::CoreError;
 use crate::fsutil;
 use crate::paths::Paths;
-use cx_crypto::{KdfParams, SpaceKey, unwrap_space_key, wrap_space_key};
+pub use cx_crypto::SpaceKey;
+use cx_crypto::{KdfParams, unwrap_space_key, wrap_space_key};
 use cx_proto::{Cipher, Item};
 use serde::{Deserialize, Serialize};
 
@@ -251,6 +252,31 @@ impl LocalSpace {
         Ok(space)
     }
 
+    /// 用**原始空间密钥**加入（不经过口令包裹）。
+    ///
+    /// 用于"另一台设备已经能解密、直接把密钥搬过来"的场景（`cx space join --key-stdin`）：
+    /// 口令丢了、或者本来就是自己两台机器之间搬，没必要再绕一道口令。
+    /// 元数据仍然从后端拉下来的那份，只有密钥是本地给的。
+    pub fn join_with_key(
+        paths: &Paths,
+        space_json: &str,
+        key: SpaceKey,
+    ) -> Result<Self, CoreError> {
+        let meta = SpaceMeta::from_json(space_json)?;
+        if !meta.is_encrypted() {
+            return Err(CoreError::malformed(
+                "space.json",
+                "远端空间是明文空间，不需要密钥（用 cx space join 直接加入）",
+            ));
+        }
+        let space = Self {
+            meta,
+            cipher: SpaceCipher::Encrypted(key),
+        };
+        space.save(paths)?;
+        Ok(space)
+    }
+
     /// 读取本机空间（`space.json` + `space.key`）。
     pub fn load(paths: &Paths) -> Result<Self, CoreError> {
         let text = fsutil::read_to_string_optional(&paths.space_file())?.ok_or_else(|| {
@@ -317,6 +343,74 @@ mod tests {
     use super::*;
     use cx_proto::{ItemMeta, Kind};
 
+    #[test]
+    fn 用原始密钥加入与用口令加入得到同一把钥匙() {
+        let source = temp_paths("join-key-source");
+        let space = LocalSpace::create(&source, Some("pw-123456")).unwrap();
+        let json = space.meta.to_json().unwrap();
+        let key = space.cipher.space_key().unwrap().to_hex();
+
+        let target = temp_paths("join-key-target");
+        let joined = LocalSpace::join_with_key(
+            &target,
+            &json,
+            SpaceKey::from_hex(&key).expect("64 位十六进制"),
+        )
+        .unwrap();
+        assert_eq!(joined.meta.space_id, space.meta.space_id, "同一个空间");
+        assert_eq!(
+            joined.cipher.space_key().unwrap().to_hex(),
+            key,
+            "密钥必须是同一把（否则远端对象解不开）"
+        );
+        // 落地了才说明下次启动能用
+        let reloaded = LocalSpace::load(&target).unwrap();
+        assert_eq!(reloaded.cipher.space_key().unwrap().to_hex(), key);
+
+        // 用这把钥匙真能解开源空间加密过的对象
+        let item = sample_item(
+            &space.cipher,
+            "1759323998000-ab12cd34-deadbeef.cxi",
+            b"hello",
+        );
+        assert_eq!(
+            reloaded
+                .cipher
+                .open("1759323998000-ab12cd34-deadbeef.cxi", &item)
+                .unwrap(),
+            b"hello"
+        );
+
+        let _ = std::fs::remove_dir_all(source.config_dir.parent().unwrap());
+        let _ = std::fs::remove_dir_all(target.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn 明文空间不接受密钥加入() {
+        let source = temp_paths("join-key-plain");
+        let space = LocalSpace::create(&source, None).unwrap();
+        let json = space.meta.to_json().unwrap();
+        let target = temp_paths("join-key-plain-target");
+        let err =
+            LocalSpace::join_with_key(&target, &json, SpaceKey::generate().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("明文空间"), "{err}");
+        assert!(!target.space_file().exists(), "失败时不该留下半份空间");
+
+        let _ = std::fs::remove_dir_all(source.config_dir.parent().unwrap());
+        let _ = std::fs::remove_dir_all(target.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn 密钥格式不对会被拒绝() {
+        for bad in ["", "abc", "zz".repeat(32).as_str()] {
+            assert!(
+                SpaceKey::from_hex(bad).is_err(),
+                "「{}」不该被当成密钥",
+                bad
+            );
+        }
+        assert!(SpaceKey::from_hex(&"a".repeat(64)).is_ok());
+    }
     fn temp_paths(tag: &str) -> Paths {
         let root = std::env::temp_dir().join(format!("cx-space-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

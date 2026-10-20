@@ -24,7 +24,7 @@ pub use device::{Identity, hostname, now_ms};
 pub use error::CoreError;
 pub use history::{History, HistoryEntry};
 pub use paths::Paths;
-pub use space::{LocalSpace, SealedPayload, SpaceCipher, SpaceMeta};
+pub use space::{LocalSpace, SealedPayload, SpaceCipher, SpaceKey, SpaceMeta};
 pub use state::{BackendState, Cursor, DaemonState};
 pub use suppress::{SeenSet, TtlSet};
 

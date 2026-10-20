@@ -334,13 +334,17 @@ pub enum SpaceCommand {
         /// 后端名
         backend: String,
     },
-    /// 从某个后端加入已有空间（需要口令）
+    /// 从某个后端加入已有空间（口令或直接给空间密钥）
     Join {
         /// 后端名
         backend: String,
         /// 从标准输入读取口令（不提示）
         #[arg(long)]
         passphrase_stdin: bool,
+        /// 从标准输入读取**空间密钥**（64 位十六进制，见 `cx space export-key`）；
+        /// 与 --passphrase-stdin 二选一
+        #[arg(long)]
+        key_stdin: bool,
     },
     /// 打印本机空间信息
     Show {
@@ -671,18 +675,30 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
             SpaceCommand::Join {
                 backend,
                 passphrase_stdin,
+                key_stdin,
             } => {
-                let passphrase = if passphrase_stdin {
-                    Some(strip_line_terminator(read_stdin_text(4096)?))
-                } else {
-                    None
-                };
-                if let Some(text) = &passphrase
-                    && text.is_empty()
-                {
-                    return Err(DaemonError::Protocol("口令不能为空".to_string()));
+                if passphrase_stdin && key_stdin {
+                    return Err(DaemonError::Protocol(
+                        "--passphrase-stdin 与 --key-stdin 只能选一个".to_string(),
+                    ));
                 }
-                ok_or_failure(join_space(paths, &backend, passphrase.as_deref())?)
+                if key_stdin {
+                    let text = strip_line_terminator(read_stdin_text(4096)?);
+                    let key = parse_space_key(&text)?;
+                    ok_or_failure(join_space_with_key(paths, &backend, key)?)
+                } else {
+                    let passphrase = if passphrase_stdin {
+                        Some(strip_line_terminator(read_stdin_text(4096)?))
+                    } else {
+                        None
+                    };
+                    if let Some(text) = &passphrase
+                        && text.is_empty()
+                    {
+                        return Err(DaemonError::Protocol("口令不能为空".to_string()));
+                    }
+                    ok_or_failure(join_space(paths, &backend, passphrase.as_deref())?)
+                }
             }
             SpaceCommand::Show { json } => {
                 let space = LocalSpace::load(paths)?;
@@ -912,6 +928,96 @@ fn publish_space(paths: &Paths, backend: &str) -> Result<bool, DaemonError> {
     Ok(true)
 }
 
+/// 解析用户粘进来的空间密钥（64 位十六进制；容忍空白与换行）。
+fn parse_space_key(text: &str) -> Result<cx_core::SpaceKey, DaemonError> {
+    let trimmed = text.trim();
+    cx_core::SpaceKey::from_hex(trimmed).map_err(|_| {
+        DaemonError::Protocol(format!(
+            "空间密钥应当是 64 位十六进制（在已加入的设备上 `cx space export-key` 可得到），\
+             当前是 {} 个字符",
+            trimmed.chars().count()
+        ))
+    })
+}
+
+/// 用空间密钥加入（口令方案之外的替代路径）。
+fn join_space_with_key(
+    paths: &Paths,
+    backend: &str,
+    key: cx_core::SpaceKey,
+) -> Result<bool, DaemonError> {
+    let mut remote = build_named_backend(paths, backend)?;
+    let json = cx_backend::load_space_meta(&mut *remote)
+        .map_err(|err| DaemonError::Protocol(format!("读取空间元数据失败：{err}")))?
+        .ok_or_else(|| {
+            DaemonError::Protocol(format!(
+                "后端 {backend} 上还没有空间元数据（先在已加入的设备上执行 `cx space publish {backend}`）"
+            ))
+        })?;
+    let space = LocalSpace::join_with_key(paths, &json, key)?;
+    // 立刻校验这把钥匙对不对：拿远端任意一个条目试着解开。
+    // 否则用户要等到同步报错才发现密钥抄错了，而那时空间已经被写下来了。
+    // 校验的取样必须来自**清单里引用的条目**：桶里可能还留着上一个空间遗留的孤儿对象，
+    // 那些用任何新密钥都解不开，拿它们做校验只会误报"密钥错了"。
+    let mut remote = build_named_backend(paths, backend)?;
+    let mut probe: Option<(String, cx_proto::Item)> = None;
+    'outer: for manifest in remote
+        .list(cx_backend::layout::MANIFESTS_PREFIX)
+        .map_err(|err| DaemonError::Protocol(format!("列举远端清单失败：{err}")))?
+    {
+        let Some(bytes) = remote
+            .get(&manifest.path)
+            .map_err(|err| DaemonError::Protocol(format!("读取远端清单失败：{err}")))?
+        else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(manifest) = cx_proto::Manifest::from_json(text) else {
+            continue;
+        };
+        for entry in manifest.items.iter().rev() {
+            let Some(path) = cx_backend::layout::item_path(&entry.name) else {
+                continue;
+            };
+            let Some(bytes) = remote
+                .get(&path)
+                .map_err(|err| DaemonError::Protocol(format!("读取远端条目失败：{err}")))?
+            else {
+                continue;
+            };
+            if let Ok(item) = cx_proto::Item::decode(&bytes) {
+                probe = Some((entry.name.clone(), item));
+                break 'outer;
+            }
+        }
+    }
+    if let Some((name, item)) = probe {
+        if space.cipher.open(&name, &item).is_err() {
+            // 密钥不对：把刚写下的空间删掉，别留下一个"看起来配好了"的坏状态
+            let _ = std::fs::remove_file(paths.space_file());
+            let _ = std::fs::remove_file(paths.space_key_file());
+            return Err(DaemonError::Protocol(
+                "这把空间密钥解不开远端已有条目：多半是抄错了，或者两台机器不在同一个空间。\
+                 已撤销本次加入，请重新 `cx space export-key` 核对"
+                    .to_string(),
+            ));
+        }
+        println!(
+            "已用空间密钥加入 {}（并验证过能解开远端条目）",
+            space.short_id()
+        );
+    } else {
+        println!("已用空间密钥加入 {}", space.short_id());
+        println!("远端还没有任何条目，暂时无法验证这把钥匙（等第一台设备上传后自然会验证）");
+    }
+    println!("加密：XChaCha20-Poly1305");
+    println!(
+        "下一步：cx start（若密钥不对，守护进程会报解不开远端对象，重新 `cx space export-key` 核对）"
+    );
+    Ok(true)
+}
 /// 从某个后端加入已有空间。
 fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<bool, DaemonError> {
     let mut remote = build_named_backend(paths, backend)?;

@@ -120,6 +120,17 @@ cx-server space create 家庭空间 --quota 512MB    # 输出空间 id 与注册
 cx-server serve --listen 0.0.0.0:8688           # 前台跑（systemd / Docker 都按前台进程管理）
 cx backend add server home http://<主机>:8688 --space <空间 id> --enroll-secret <注册密钥>
 cx space init --passphrase-stdin && cx space publish home
+```
+
+加第二台设备（两台都是你自己的机器时，直接搬密钥比记口令更省事）：
+
+```bash
+cx space join <后端名> --passphrase-stdin   # 用口令（cx space init 时那个）
+cx space join <后端名> --key-stdin          # 或者粘 `cx space export-key` 打印的 64 位十六进制
+```
+
+`--key-stdin` 会拿远端清单里的条目**先试解一次**：密钥不对就当场报错并撤销本次加入，
+不会留下一个"看起来配好了、其实解不开"的状态。
 # 另一台设备：cx space join home --passphrase-stdin
 
 # WebDAV（Nextcloud 等）
