@@ -206,16 +206,16 @@
               Condition="REMOVE=&quot;ALL&quot; AND REMOVEUSERDATA=&quot;1&quot;" />
     </InstallExecuteSequence>
 
-    <!-- 交互式安装还要在 UI 序列里先做一遍：文件占用检查发生在 UI 序列的
-         InstallValidate 上，是它弹出 FilesInUse 对话框，那正是"安装卡住不动"的现场。
-         UI 序列里的标准动作是按需生成的，没有可引用的 InstallValidate 名字，
-         因此直接给序号：690/695 落在 CostFinalize(400) 与 InstallValidate(700) 之间。 -->
-    <InstallUISequence>
-      <Custom Action="CxStopRunning" Sequence="690"
-              Condition="Installed OR WIX_UPGRADE_DETECTED" />
-      <Custom Action="CxKillRunning" Sequence="695"
-              Condition="Installed OR WIX_UPGRADE_DETECTED" />
-    </InstallUISequence>
+    <!-- 这里**故意没有** InstallUISequence 的自定义动作。
+         曾经为"交互式安装也会做文件占用检查"在 UI 序列里放了一份 `cx stop` / `taskkill`，
+         结果连错两次，两次都只在**双击安装**时炸（`/qn` 不跑 UI 序列，所以静默安装一直绿）：
+           1) 放 690/695（照执行序列的编号）→ 早于 CostInitialize(800)，
+              报「Directory Manager not initialized」，即用户看到的**错误代码 2732**；
+           2) 放 1350/1355 → 晚于 ExecuteAction(1300)，等于装完之后才停进程，
+              反而会把刚被 CxRestartDaemon 拉起来的守护进程杀掉。
+         而且这个包的 UI 序列里根本没有 InstallValidate——文件占用检查由**执行序列**的
+         InstallValidate(1400) 做，而下面的 CxStopRunning(1398)/CxKillRunning(1399) 就在它前面。
+         所以只保留执行序列这一份：静默与交互两条路径都由它生效。 -->
 
   </Package>
 </Wix>
