@@ -54,6 +54,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.show_panel {
         draw_panel(frame, area, app);
     }
+    if app.join_space.is_some() {
+        draw_join_space(frame, area, app);
+    }
     if app.show_help {
         draw_help(frame, area, app);
     }
@@ -68,6 +71,82 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+/// 用空间密钥加入已有空间：一个整屏的输入页，只有一行输入框。
+///
+/// 为什么单独一页而不是塞进"添加后端"表单：加入空间既不是改后端、也不是改配置，
+/// 它只做一件事——把另一台设备已经能解密的密钥搬过来。
+fn draw_join_space(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let popup = area;
+    app.modal_rect = popup;
+    frame.render_widget(Clear, popup);
+    let inner = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1),
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    );
+    let Some((backend, typed)) = app.join_space.clone() else {
+        return;
+    };
+    let content_w = inner.width.min(76) as usize;
+    let indent = " ".repeat((inner.width as usize).saturating_sub(content_w) / 2);
+    let typed_short = if typed.chars().count() > 32 {
+        // 密钥太长，只回显尾部，避免超过一屏
+        typed
+            .chars()
+            .skip(typed.chars().count() - 32)
+            .collect::<String>()
+    } else {
+        typed.clone()
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{indent}用空间密钥加入 {backend} 上的空间"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{indent}在已加入的设备上执行 cx space export-key，把打印出来的"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("{indent}64 位十六进制粘到这里（只接受 0-9a-f）："),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(format!("{indent} ")),
+            Span::styled(
+                format!("{typed_short}▏"),
+                Style::default().fg(Color::White).bg(Color::Indexed(238)),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{indent}已输入 {} / 64 位", typed.chars().count().min(64)),
+            Style::default().fg(if typed.chars().count() == 64 {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{indent}回车 加入　Esc 取消　（加入成功后守护进程会自动重启）"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 加入空间 ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+}
 /// 移除后端的确认：与删除历史条目一样，破坏性操作默认"不删"。
 fn draw_confirm_remove(frame: &mut Frame<'_>, area: Rect, name: &str) {
     let popup = area;
@@ -957,7 +1036,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 "还没有加密空间",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("：按 s 在本机建一个并上传（口令会自动生成并显示一次）"),
+            Span::raw("：按 s 在本机建一个，或按 i 用密钥加入（口令/密钥会自动验证）"),
         ]));
     }
 
@@ -1023,7 +1102,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // 窄屏只留最常用的四个键：空格开关、a 添加、x 移除、Esc 关闭
         "  ↑↓ 选择　空格 开关　a 添加　x 移除　Esc 关闭"
     } else {
-        "  ↑↓ 选后端　空格/t 停用·启用　x 移除　a 添加　s 建空间　r 重读诊断　J/K 滚动　Esc 返回"
+        "  ↑↓ 选后端　空格 开关　x 移除　a 添加　s 建空间　i 加入　r 重读　Esc 返回"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1878,9 +1957,10 @@ mod tests {
         );
         assert!(has(&screen, "x 移除"), "{screen}");
         assert!(
-            has(&screen, "空格/t 停用·启用"),
+            has(&screen, "空格 开关"),
             "要告诉用户能停用（空格就是开关）：{screen}"
         );
+        assert!(has(&screen, "i 加入"), "要告诉用户能加入已有空间：{screen}");
 
         // 确认浮层
         app.pending_backend_remove = Some("home".to_string());

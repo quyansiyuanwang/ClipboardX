@@ -54,6 +54,13 @@ pub enum KeyOutcome {
     ToggleBackend(String),
     /// 在本机建加密空间并把元数据发布到该后端（面板里按 s）。
     CreateSpace(String),
+    /// 用空间密钥加入已有空间（面板里按 j 并输入密钥）。
+    JoinSpace {
+        /// 后端名。
+        backend: String,
+        /// 64 位十六进制空间密钥。
+        key: String,
+    },
 }
 
 /// 一条提示信息。
@@ -170,6 +177,8 @@ pub struct App {
     panel_backend: usize,
     /// 等待确认移除的后端名。
     pub pending_backend_remove: Option<String>,
+    /// 正在"用密钥加入空间"的输入缓冲：`(后端名, 已输入的密钥文本)`。
+    pub join_space: Option<(String, String)>,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
     pub doctor: Option<DoctorReport>,
     /// 面板内独立错误，避免失败后永远显示读取中。
@@ -728,6 +737,50 @@ impl App {
             };
         }
 
+        // 加入空间的输入态：只收十六进制字符，回车提交、Esc 取消
+        if let Some((backend, mut typed)) = self.join_space.take() {
+            let outcome = match key.code {
+                KeyCode::Esc => {
+                    self.note("已取消加入空间");
+                    KeyOutcome::None
+                }
+                KeyCode::Backspace => {
+                    typed.pop();
+                    self.join_space = Some((backend, typed));
+                    KeyOutcome::None
+                }
+                KeyCode::Enter => {
+                    let key_text = typed.trim().to_string();
+                    if key_text.len() != 64 || !key_text.chars().all(|c| c.is_ascii_hexdigit()) {
+                        // 不合法就留在输入态，用户能接着改
+                        self.warn(format!(
+                            "空间密钥是 64 位十六进制（现在是 {} 个字符）",
+                            key_text.chars().count()
+                        ));
+                        self.join_space = Some((backend, typed));
+                        KeyOutcome::None
+                    } else {
+                        KeyOutcome::JoinSpace {
+                            backend,
+                            key: key_text,
+                        }
+                    }
+                }
+                KeyCode::Char(ch) if ch.is_ascii_hexdigit() => {
+                    if typed.chars().count() < 128 {
+                        typed.push(ch.to_ascii_lowercase());
+                    }
+                    self.join_space = Some((backend, typed));
+                    KeyOutcome::None
+                }
+                _ => {
+                    self.join_space = Some((backend, typed));
+                    KeyOutcome::None
+                }
+            };
+            return outcome;
+        }
+
         // 表单态：键盘全部交给表单（否则打字会触发退出/复制等命令）
         if self.wizard.is_some() {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -902,6 +955,29 @@ impl App {
                         Some(name) => KeyOutcome::CreateSpace(name),
                         None => {
                             self.warn("先添加一个后端，才能把空间元数据发布上去");
+                            KeyOutcome::None
+                        }
+                    }
+                }
+                // i（join）：已经有空间时没用；没有空间才能用空间密钥加入。
+                // 不用 j：面板里 j 是"下一个后端"（vim 风格）。
+                KeyCode::Char('i') => {
+                    let has_space = self
+                        .status
+                        .as_ref()
+                        .map(|status| status.space_id.is_some())
+                        .unwrap_or(false);
+                    if has_space {
+                        self.note("本机已经在同步空间里了；换空间请先在命令行备份后重建");
+                        return KeyOutcome::None;
+                    }
+                    match self.selected_backend() {
+                        Some(name) => {
+                            self.join_space = Some((name, String::new()));
+                            KeyOutcome::None
+                        }
+                        None => {
+                            self.warn("先添加一个后端，才谈得上加入空间");
                             KeyOutcome::None
                         }
                     }
@@ -2137,6 +2213,71 @@ mod tests {
         assert_eq!(app.selected_backend().as_deref(), Some("home"));
     }
 
+    #[test]
+    fn 面板里按_i_进入加入空间的输入态() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_without_space(
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('i'))), KeyOutcome::None);
+        assert!(
+            app.join_space
+                .as_ref()
+                .is_some_and(|(backend, typed)| backend == "oss" && typed.is_empty()),
+            "应当进入输入态，目标是选中的后端"
+        );
+    }
+
+    #[test]
+    fn 加入空间只收十六进制_满_64_位才是有效提交() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_without_space(
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::Char('i')));
+        // 非十六进制字符被忽略
+        for ch in "zz".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.join_space.as_ref().unwrap().1, "", "只收 0-9a-f");
+        // 位数不够时回车只提示、留在输入态
+        for ch in "abc".chars() {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.on_key(key(KeyCode::Enter)), KeyOutcome::None);
+        assert!(app.join_space.is_some(), "位数不够不该退出输入态");
+        assert!(app.notice.as_ref().unwrap().text.contains("64 位"));
+        // 补齐 64 位后回车产生 JoinSpace
+        for ch in "0123456789abcdef".repeat(4).chars().take(61) {
+            app.on_key(key(KeyCode::Char(ch)));
+        }
+        match app.on_key(key(KeyCode::Enter)) {
+            KeyOutcome::JoinSpace { backend, key } => {
+                assert_eq!(backend, "oss");
+                assert_eq!(key.len(), 64);
+            }
+            other => panic!("期望 JoinSpace，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 已有空间时按_i_不进入输入态() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('i'))), KeyOutcome::None);
+        assert!(app.join_space.is_none(), "已经有空间就不该再走加入流程");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("已经在同步空间里"))
+        );
+    }
     #[test]
     fn 面板里按_s_要求建加密空间() {
         let mut app = App::new();

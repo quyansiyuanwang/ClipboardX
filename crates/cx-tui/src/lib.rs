@@ -53,6 +53,13 @@ pub enum TuiExit {
     ToggleBackend(String),
     /// 用户在面板里要建加密空间（并发布到该后端）。
     CreateSpace(String),
+    /// 用户在面板里要用密钥加入空间。
+    JoinSpace {
+        /// 后端名。
+        backend: String,
+        /// 空间密钥。
+        key: String,
+    },
 }
 
 /// 界面里能直接执行的后端管理动作。
@@ -75,6 +82,8 @@ pub trait BackendAdmin {
     /// 口令由实现方随机生成并在结果里回显一次（用户要拿它给第二台设备 `space join`），
     /// 因为界面里让用户当场想一个强口令不现实、留空又会退化成明文。
     fn create_space(&mut self, backend: &str) -> Result<String, String>;
+    /// 用空间密钥加入已有空间（`key` 是 64 位十六进制）。返回结果提示。
+    fn join_space(&mut self, backend: &str, key: &str) -> Result<String, String>;
 }
 
 /// 进入全屏 TUI。
@@ -249,6 +258,19 @@ fn run_loop(
                             KeyOutcome::CreateSpace(backend),
                         ),
                     },
+                    KeyOutcome::JoinSpace { backend, key } => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::JoinSpace { backend, key };
+                            break;
+                        }
+                        Some(handler) => run_admin_in_place(
+                            terminal,
+                            app,
+                            &client,
+                            handler,
+                            KeyOutcome::JoinSpace { backend, key },
+                        ),
+                    },
                     KeyOutcome::Delete(position) => {
                         if let Some(name) = app.delete_expected_name.take() {
                             client.request_delete_checked(position, name);
@@ -307,6 +329,9 @@ fn pending_message(outcome: &KeyOutcome) -> Option<String> {
         KeyOutcome::RemoveBackend(name) => Some(format!("正在移除后端 {name}…")),
         KeyOutcome::ToggleBackend(name) => Some(format!("正在停用/启用后端 {name}…")),
         KeyOutcome::CreateSpace(backend) => Some(format!("正在建加密空间并上传到 {backend}…")),
+        KeyOutcome::JoinSpace { backend, .. } => {
+            Some(format!("正在用密钥加入 {backend} 上的空间…"))
+        }
         _ => None,
     }
 }
@@ -355,6 +380,14 @@ fn perform_admin_action(
         }
         KeyOutcome::CreateSpace(backend) => {
             match handler.create_space(&backend) {
+                Ok(message) => app.note(message),
+                Err(message) => app.warn(message),
+            }
+            app.show_panel = true;
+            true
+        }
+        KeyOutcome::JoinSpace { backend, key } => {
+            match handler.join_space(&backend, &key) {
                 Ok(message) => app.note(message),
                 Err(message) => app.warn(message),
             }
@@ -471,6 +504,7 @@ mod tests {
         removed: Vec<String>,
         added: Vec<String>,
         spaces: Vec<String>,
+        joins: Vec<(String, usize)>,
         fail_add: Option<&'static str>,
         fail_toggle: Option<&'static str>,
     }
@@ -502,6 +536,11 @@ mod tests {
         fn create_space(&mut self, backend: &str) -> Result<String, String> {
             self.spaces.push(backend.to_string());
             Ok(format!("已建空间 abc（后端 {backend}）；口令：p4ss"))
+        }
+
+        fn join_space(&mut self, backend: &str, key: &str) -> Result<String, String> {
+            self.joins.push((backend.to_string(), key.len()));
+            Ok(format!("已加入空间 abc（后端 {backend}）"))
         }
     }
 
