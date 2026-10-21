@@ -9,7 +9,9 @@
 param(
     [Parameter(Mandatory = $true)][string]$Msi,
     [ValidateSet('Install', 'Extract')][string]$Mode = 'Install',
-    [string]$LogDir = 'dist\msi-logs'
+    [string]$LogDir = 'dist\msi-logs',
+    # 无 UI 构建（build-msi.ps1 -NoUi）时跳过「安装向导存在性」检查
+    [switch]$NoUiBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,6 +97,31 @@ try {
 }
 catch {
     Write-Host "    [skip] 无法读取 MSI 表做静态检查：$($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# ---- 静态检查：带 UI 构建时，对话框表不能是空的 ----
+# 出现过这种情况：CI 打出来的 MSI 只有 1 个对话框（没有 Welcome / License / Custom Setup），
+# 而本机同样的脚本打出来有 22 个。安装照样能过，但用户双击时看不到任何向导，
+# 也没法勾选 PATH / 自启 / 桌面快捷方式。这里让它显形（先只告警，不拦）。
+if (-not $NoUiBuild) {
+    $dialogs = 0
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Msi, 0))
+        $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @('SELECT Dialog FROM Dialog'))
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+        while ($view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)) { $dialogs++ }
+    }
+    catch {
+        # 连 Dialog 表都没有 = 完全没编 UI（比"对话框少"更严重），按 0 处理
+        $dialogs = 0
+    }
+    if ($dialogs -lt 5) {
+        Write-Host "    [warn] 这份 MSI 只有 $dialogs 个对话框：没有安装向导（UI 扩展没生效或用了 -NoUi）" -ForegroundColor Yellow
+    }
+    else {
+        Assert-True $true "MSI 含安装向导（$dialogs 个对话框）"
+    }
 }
 
 Write-Host '==> 静默安装（per-user，无需提权）'
