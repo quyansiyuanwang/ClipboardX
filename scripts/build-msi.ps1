@@ -47,7 +47,9 @@ try {
     # 校验载荷版本：最容易踩的坑是复用 target 里的旧二进制（v0.3.2 的 MSI 因此缺了
     # --key-stdin）。打"道具"版本（升级验收用 0.0.9 打同一个载荷）时用
     # -AllowPayloadMismatch 显式放行，别用 -SkipBuild 当判别条件——那条路上两边都在用。
-    if (-not $AllowPayloadMismatch) {
+    # 只有"复用已有二进制"（-SkipBuild）才可能打过期载荷；nightly 会用
+    # 0.3.<天>.<序号> 这样的版本号覆盖同一个新编出来的载荷，那是有意的。
+    if ($SkipBuild -and -not $AllowPayloadMismatch) {
         $reportedVersion = (& $cxExe version 2>$null | Select-Object -First 1) -replace '^cx\s+', ''
         if ($reportedVersion -ne $Version) {
             throw ("载荷版本（cx $reportedVersion）与要打包的版本（$Version）不一致。" +
