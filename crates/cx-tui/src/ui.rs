@@ -755,10 +755,7 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         ));
     }
     lines.extend(wrapped_lines(
-        Text::from(
-            "Tab/↑↓ 焦点　←→ 切换类型/选项　Ctrl+Y 示例　Enter 激活　Esc 取消\n\
-             先建/加本机加密空间再连存储；连接检查不等于同步完成",
-        ),
+        Text::from("Tab/↑↓ 焦点　←→ 切换类型/选项　Ctrl+Y 示例　Enter 激活　Esc 取消"),
         content_w,
     ));
 
@@ -935,11 +932,6 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             lines.push(Line::from(Span::styled(
                 "    cx space init --passphrase-stdin && cx space publish <后端名>",
                 Style::default().fg(Color::Cyan),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " 命令行等价物：cx backend add <server|webdav|s3> …",
-                Style::default().fg(Color::DarkGray),
             )));
         }
         // 有后端时上面的表格已经把每个后端都说清楚了，这里不再重复
@@ -1184,10 +1176,6 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Line::from(""),
         Line::from(Span::styled(
             " ↑ 本机发出，↓ 来自别的设备，· 状态未知",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            " 行内摘要按需加载，因此过滤只能匹配已加载的摘要",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -1642,7 +1630,11 @@ mod tests {
         ] {
             assert!(has(&screen, needle), "帮助页缺少 {needle}：\n{screen}");
         }
-        assert!(has(&screen, "按需加载"), "应当说明过滤的局限：{screen}");
+        // 说明性长句已删：帮助页只留按键，不再解释"摘要按需加载"的实现细节
+        assert!(
+            !has(&screen, "按需加载"),
+            "帮助页不该再塞实现细节：{screen}"
+        );
     }
 
     #[test]
@@ -2100,7 +2092,7 @@ mod tests {
             app.on_key(key(KeyCode::End));
             let screen = render(&mut app, width, height);
             assert!(app.show_help);
-            assert!(has(&screen, "行内摘要按需加载"), "{screen}");
+            assert!(has(&screen, "鼠标"), "{screen}");
         }
     }
 
@@ -2335,8 +2327,8 @@ mod tests {
         let screen = render(&mut app, 120, 30);
         assert!(has(&screen, "还没有同步后端"), "{screen}");
         assert!(
-            has(&screen, "cx backend add"),
-            "要给出可执行的命令：{screen}"
+            has(&screen, "按 a 选一种"),
+            "要给出可执行的第一步：{screen}"
         );
     }
 

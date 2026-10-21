@@ -668,7 +668,7 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                         "未加密"
                     }
                 );
-                println!("下一步：用 `cx backend add server|webdav|s3` 配置同步后端。");
+
                 Ok(ExitCode::SUCCESS)
             }
             SpaceCommand::Publish { backend } => ok_or_failure(publish_space(paths, &backend)?),
@@ -924,7 +924,7 @@ fn publish_space(paths: &Paths, backend: &str) -> Result<bool, DaemonError> {
         "已把空间元数据上传到后端 {backend}（空间 {}）",
         space.short_id()
     );
-    println!("其他设备现在可以用 `cx space join {backend} --passphrase-stdin` 加入。");
+
     Ok(true)
 }
 
@@ -1013,9 +1013,7 @@ fn join_space_with_key(
         println!("远端还没有任何条目，暂时无法验证这把钥匙（等第一台设备上传后自然会验证）");
     }
     println!("加密：XChaCha20-Poly1305");
-    println!(
-        "下一步：cx start（若密钥不对，守护进程会报解不开远端对象，重新 `cx space export-key` 核对）"
-    );
+    println!("cx start 后生效");
     Ok(true)
 }
 /// 从某个后端加入已有空间。
@@ -1745,7 +1743,7 @@ fn add_backend(paths: &Paths, kind: BackendAddCommand) -> Result<bool, DaemonErr
         |config, paths| config.save(paths).map_err(Into::into),
     )?;
     println!("已添加后端 {name}");
-    println!("下一步：cx backend test {name}   测试通过后再重启守护进程：cx restart");
+    println!("重启后生效：cx restart");
     Ok(true)
 }
 

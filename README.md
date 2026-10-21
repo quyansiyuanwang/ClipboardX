@@ -61,7 +61,7 @@ main 上的提交会产出滚动更新的 nightly：同一个 `nightly` 标签�
 
 ```bash
 cx start                 # 后台挂载守护进程（登录自启：cx service install）
-cx status                # 设备、后端、历史、各后端计数
+cx status                # 运行状态、设备、空间、历史、各后端收发计数
 cx tui                   # 全屏终端界面（历史、行内内容摘要、预览滚动、过滤、写回剪贴板）
 cx history --limit 20
 cx copy 0                # 把最新一条写回剪贴板

@@ -50,26 +50,18 @@ pub fn status(data: &Value, json: bool) -> Result<ExitCode, cx_daemon::DaemonErr
     let report: StatusReport = serde_json::from_value(data.clone())
         .map_err(|err| cx_daemon::DaemonError::protocol(format!("状态响应无法解析：{err}")))?;
 
-    println!(
-        "守护进程   运行中（pid {}，启动于 {})",
-        report.pid,
-        format_time(report.started_ms)
-    );
-    println!(
-        "同步状态   {}",
-        if report.paused {
-            "已暂停（cx resume 恢复）"
-        } else {
-            "运行中"
-        }
-    );
-    println!(
-        "设备       {}（{}）",
-        report.device_name,
-        short_id(&report.device_id)
-    );
+    // 只打印"用户会拿来做决定"的信息：暂停了没、哪个设备、哪个空间、
+    // 历史多少条、各后端发出去/收回来多少。
+    // 剪贴板后端、监听方式、已处理对象数、跳过计数、最后发布哈希都是排障细节，
+    // 需要就看 `cx status --json` 或 `cx doctor`——别堆在默认输出里。
     match &report.space_id {
-        Some(id) => println!(
+        Some(_) if !report.paused => println!("运行中"),
+        Some(_) => println!("已暂停（cx resume 恢复）"),
+        None => println!("运行中（未加入同步空间）"),
+    }
+    println!("设备       {}", report.device_name);
+    if let Some(id) = &report.space_id {
+        println!(
             "空间       {}（{}）",
             short_id(id),
             if report.encrypted {
@@ -77,29 +69,12 @@ pub fn status(data: &Value, json: bool) -> Result<ExitCode, cx_daemon::DaemonErr
             } else {
                 "未加密"
             }
-        ),
-        None => println!("空间       未加入（cx space init / cx space join）"),
-    }
-    println!("剪贴板     {}", report.clipboard);
-    println!("监听       {}", report.watch);
-    println!(
-        "历史       {} 条；已处理对象 {} 个",
-        report.history_len, report.seen_len
-    );
-    if report.skipped_oversize > 0 || report.skipped_ignored > 0 {
-        println!(
-            "跳过       超限 {} 条，忽略规则 {} 条",
-            report.skipped_oversize, report.skipped_ignored
         );
     }
-    if let Some(hash) = &report.last_published_hash {
-        println!("最后发布   {}", short_hash(hash));
-    }
+    println!("历史       {} 条", report.history_len);
 
     if report.backends.is_empty() {
-        // 别只说"只记录本机历史"：局域网直连不配后端也能同步，
-        // 这句话会让人误判成"同步根本没在跑"。
-        println!("后端       未配置（内容只留在本机；局域网直连若已启用仍然生效，cx doctor 可查）");
+        println!("后端       未配置");
     } else {
         println!("后端：");
         for backend in &report.backends {

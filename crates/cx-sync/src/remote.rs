@@ -110,7 +110,7 @@ impl RemoteSync {
         // 只读：不调用 ensure_root，不建桶，也不把读取元数据当成写权限验证。
         self.backend.list(layout::MANIFESTS_PREFIX)?;
         let space = if cx_backend::load_space_meta(&mut *self.backend)?.is_some() {
-            "空间元数据：已存在（仍需本机加入空间）"
+            "空间元数据：已存在"
         } else {
             "空间元数据：尚未写入（需要 cx space init/publish 或 join）"
         };
