@@ -88,14 +88,20 @@ $newMsi = Join-Path $repo "dist\ClipboardX-$NewVersion-x64.msi"
 
 try {
     if (-not $SkipBuild) {
-        Step "构建两个版本的 MSI（$OldVersion → $NewVersion）"
+        # 只构建"旧版道具"。**新版绝不重建**：它由发布流水线刚用 build-msi.ps1 打好，
+        # 这里若再用 -NoUi 重建，会把这个待发布的 MSI 原地覆盖成"没有安装向导"的版本，
+        # 随后上传的就是那份——v0.3.2 发出去的 1.9 MB 无向导 MSI 正是这么来的。
+        Step "构建旧版道具 MSI（$OldVersion）"
         & pwsh -File scripts/build-msi.ps1 -Version $OldVersion -NoUi 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -ne 0) { throw "构建 $OldVersion MSI 失败" }
-        & pwsh -File scripts/build-msi.ps1 -Version $NewVersion -NoUi 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host "    $_" }
-        if ($LASTEXITCODE -ne 0) { throw "构建 $NewVersion MSI 失败" }
     }
     Assert-True (Test-Path $oldMsi) "旧版 MSI 存在：$oldMsi"
     Assert-True (Test-Path $newMsi) "新版 MSI 存在：$newMsi"
+    if (-not (Test-Path $newMsi)) {
+        throw "找不到待验收的新版 MSI：$newMsi（先用 build-msi.ps1 打好包）"
+    }
+    # 验收过程绝不允许改动待发布的产物：记下哈希，最后再核对一次
+    $newMsiHash = (Get-FileHash $newMsi -Algorithm SHA256).Hash
 
     Step "安装旧版 $OldVersion"
     Install-Msi $oldMsi "upgrade-$OldVersion-install.log"
@@ -176,6 +182,10 @@ try {
     Step '顺带确认旧版 MSI 也能卸载（幂等）'
     $code = Uninstall-Msi $oldMsi "upgrade-$OldVersion-uninstall.log"
     Assert-True ($code -eq 0 -or $code -eq 1605 -or $code -eq 3010) "重复卸载不报硬错误（exit $code；1605 = 已不存在）"
+
+    # 待发布的产物必须与验收前逐字节一致（验收只允许读它，不允许改它）
+    $after = (Get-FileHash $newMsi -Algorithm SHA256).Hash
+    Assert-True ($after -eq $newMsiHash) '升级验收没有改动待发布的新版 MSI'
 }
 catch {
     Fail "未预期的异常：$($_.Exception.Message)"
