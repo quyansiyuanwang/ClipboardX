@@ -42,6 +42,14 @@ try {
     if (-not (Test-Path $cxExe)) { throw "找不到 $cxExe，请先构建（去掉 -SkipBuild）" }
     if (-not (Test-Path $cxServerExe)) { throw "找不到 $cxServerExe，请先构建（去掉 -SkipBuild）" }
 
+    # 载荷必须与要打包的版本一致：`-SkipBuild` 最容易踩的坑就是 target 里的二进制
+    # 早就不在前面的提交上了（v0.3.2 的 MSI 因此打进去一份缺少 --key-stdin 的旧载荷）。
+    $reportedVersion = (& $cxExe version 2>$null | Select-Object -First 1) -replace '^cx\s+', ''
+    if ($reportedVersion -ne $Version) {
+        throw ("载荷版本（cx $reportedVersion）与要打包的版本（$Version）不一致。" +
+            "去掉 -SkipBuild 重新编译，或先 cargo build --release --target $Target --bin cx --bin cx-server")
+    }
+
     $distDir = Join-Path $repo 'dist'
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 
