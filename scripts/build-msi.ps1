@@ -71,7 +71,10 @@ try {
         if (-not $extDll) {
             throw "找不到 WixToolset.UI.wixext/$wixVersion。请联网后重试，或用 -NoUi 构建无向导的 MSI。"
         }
-        Write-Host "==> 使用 UI 扩展：$($extDll.FullName)"
+        # 把扩展的路径、大小、文件版本都打出来：CI 上一旦再出现"有扩展却没向导"，
+        # 日志里就能看出到底加载的是哪一份（是不是 flavor/版本不匹配）
+        Write-Host ("==> 使用 UI 扩展：{0}（{1} KB，文件版本 {2}）" -f $extDll.FullName,
+            [math]::Round($extDll.Length / 1KB, 0), $extDll.VersionInfo.FileVersion)
         $wixExtArgs = @('-ext', $extDll.FullName)
     }
 
@@ -92,6 +95,34 @@ try {
     Write-Host "==> wix build -> $out"
     & dotnet @wixArgs
     if ($LASTEXITCODE -ne 0) { throw "wix build 失败 (exit $LASTEXITCODE)" }
+
+    # 构建后自检：要 UI 就必须真的带安装向导。
+    # 出现过「扩展找到了、wix build 成功、产物却没有 Dialog 表」的情况（CI 上 0 个对话框，
+    # 本机 21 个）：这种包能装能升级，验收脚本也全绿，只是双击时没有任何向导。
+    # 与其等发版后靠人发现，不如这里直接失败。
+    if (-not $NoUi) {
+        $dialogs = 0
+        try {
+            # wix build 刚返回时文件句柄可能还没完全释放，先等一下再打开数据库
+            Start-Sleep -Milliseconds 300
+            $installer = New-Object -ComObject WindowsInstaller.Installer
+            # 注意：COM 反射调用要求参数是**明确的**类型。`$out` 是从 Join-Path 来的
+            # 普通变量（PSObject 包装），直接传会 DISP_E_TYPEMISMATCH，所以这里显式转型。
+            $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @([string]$out, [int]0))
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @('SELECT Dialog FROM Dialog'))
+            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            while ($view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)) { $dialogs++ }
+        }
+        catch {
+            Write-Host "    [自检] 读 MSI 的 Dialog 表失败：$($_.Exception.Message)" -ForegroundColor Yellow
+            $dialogs = 0
+        }
+        if ($dialogs -lt 5) {
+            throw ("构建出来的 MSI 只有 $dialogs 个对话框——UI 扩展没有真正生效。" +
+                "扩展路径：$($wixExtArgs -join ' ')。请检查扩展与 WiX 版本是否匹配，或用 -NoUi 显式构建无向导版本。")
+        }
+        Write-Host "==> 自检通过：含安装向导（$dialogs 个对话框）"
+    }
 
     $size = [math]::Round((Get-Item $out).Length / 1KB, 1)
     Write-Host "==> 完成：$out ($size KB)"
