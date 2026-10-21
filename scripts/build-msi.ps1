@@ -15,7 +15,9 @@ param(
     [string]$Configuration = 'Release',
     [string]$Target = 'x86_64-pc-windows-msvc',
     [switch]$NoUi,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # 打"道具"版本（升级验收用的 0.0.9 之类）时，允许载荷版本与 -Version 不一致
+    [switch]$AllowPayloadMismatch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,10 +44,10 @@ try {
     if (-not (Test-Path $cxExe)) { throw "找不到 $cxExe，请先构建（去掉 -SkipBuild）" }
     if (-not (Test-Path $cxServerExe)) { throw "找不到 $cxServerExe，请先构建（去掉 -SkipBuild）" }
 
-    # 只在 -SkipBuild 时校验载荷版本：这条路最容易把 target 里的旧二进制打进包
-    # （v0.3.2 的 MSI 因此缺失 --key-stdin）。不带 -SkipBuild 时刚刚重新编译过，
-    # 版本对不上是**故意的**——升级验收会用 0.0.9 这样的道具版本打同一个载荷。
-    if ($SkipBuild) {
+    # 校验载荷版本：最容易踩的坑是复用 target 里的旧二进制（v0.3.2 的 MSI 因此缺了
+    # --key-stdin）。打"道具"版本（升级验收用 0.0.9 打同一个载荷）时用
+    # -AllowPayloadMismatch 显式放行，别用 -SkipBuild 当判别条件——那条路上两边都在用。
+    if (-not $AllowPayloadMismatch) {
         $reportedVersion = (& $cxExe version 2>$null | Select-Object -First 1) -replace '^cx\s+', ''
         if ($reportedVersion -ne $Version) {
             throw ("载荷版本（cx $reportedVersion）与要打包的版本（$Version）不一致。" +

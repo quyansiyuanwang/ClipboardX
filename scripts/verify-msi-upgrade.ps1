@@ -92,7 +92,7 @@ try {
         # 这里若再用 -NoUi 重建，会把这个待发布的 MSI 原地覆盖成"没有安装向导"的版本，
         # 随后上传的就是那份——v0.3.2 发出去的 1.9 MB 无向导 MSI 正是这么来的。
         Step "构建旧版道具 MSI（$OldVersion）"
-        & pwsh -File scripts/build-msi.ps1 -Version $OldVersion -NoUi 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host "    $_" }
+        & pwsh -File scripts/build-msi.ps1 -Version $OldVersion -NoUi -AllowPayloadMismatch 2>&1 | Select-Object -Last 2 | ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -ne 0) { throw "构建 $OldVersion MSI 失败" }
     }
     Assert-True (Test-Path $oldMsi) "旧版 MSI 存在：$oldMsi"

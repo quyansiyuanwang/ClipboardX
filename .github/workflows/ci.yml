@@ -239,7 +239,7 @@ jobs:
           try {
             if (-not (Test-Path $prop)) {
               # 旧版只是测试道具：复用同一份二进制，只改 MSI 元数据，几十秒就好
-              ./scripts/build-msi.ps1 -Version 0.0.9 -SkipBuild | Out-Null
+              ./scripts/build-msi.ps1 -Version 0.0.9 -SkipBuild -AllowPayloadMismatch | Out-Null
             }
             ./scripts/verify-msi-upgrade.ps1 -OldVersion 0.0.9 -NewVersion $newVersion -SkipBuild
           }
