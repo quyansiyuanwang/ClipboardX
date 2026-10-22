@@ -57,6 +57,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.join_space.is_some() {
         draw_join_space(frame, area, app);
     }
+    if let Some(backend) = &app.pending_space_rebuild {
+        draw_confirm_space(frame, area, backend, SpaceRisk::Rebuild);
+    }
+    if let Some(backend) = &app.pending_space_switch {
+        draw_confirm_space(frame, area, backend, SpaceRisk::Switch);
+    }
+    if let Some(key) = &app.exported_key {
+        draw_export_key(frame, area, key);
+    }
     if app.show_help {
         draw_help(frame, area, app);
     }
@@ -71,6 +80,115 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+/// 已有空间时的两个危险动作的确认页。
+#[derive(Debug, Clone, Copy)]
+enum SpaceRisk {
+    /// 重建空间（等价 `cx space init --force`）：换新密钥，旧对象永久打不开。
+    Rebuild,
+    /// 换到别的空间（等价重新 `cx space join`）：当前空间的对象同样解不开了。
+    Switch,
+}
+
+fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: SpaceRisk) {
+    let popup = area;
+    frame.render_widget(Clear, popup);
+    let (title, question, consequences) = match risk {
+        SpaceRisk::Rebuild => (
+            " 确认重建空间 ",
+            format!("在本机重建加密空间（并上传到 {backend}）？"),
+            [
+                "会生成新的空间密钥：已上传到云端的对象仍然收得回来，但再也解不开。",
+                "如果只是想换机器同步，应该用 i 拿另一台设备的密钥加入，而不是重建。",
+            ],
+        ),
+        SpaceRisk::Switch => (
+            " 确认换空间 ",
+            format!("用另一个空间的密钥覆盖本机空间（{backend}）？"),
+            [
+                "本机当前空间与它的对象会留在原地，但不会再被使用/解不开。",
+                "换过去之后，本机历史里旧空间的条目仍在，只是不再参与同步。",
+            ],
+        ),
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {question}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", consequences[0]),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", consequences[1]),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y / 回车", Style::default().fg(Color::Yellow)),
+            Span::raw("  继续　　"),
+            Span::styled("其他任意键", Style::default().fg(Color::DarkGray)),
+            Span::raw("  取消"),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        popup,
+    );
+}
+
+/// 空间密钥展示页（`cx space export-key` 的等价物）。
+fn draw_export_key(frame: &mut Frame<'_>, area: Rect, key: &str) {
+    let popup = area;
+    frame.render_widget(Clear, popup);
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let indent = " ".repeat(inner_w.saturating_sub(inner_w.min(76)) / 2);
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{indent}空间密钥"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(format!("{indent} ")),
+            Span::styled(
+                key.to_string(),
+                Style::default().fg(Color::White).bg(Color::Indexed(238)),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{indent}任何人拿到它都能解开你的剪贴板内容。"),
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            format!("{indent}新设备用它加入：cx space join <后端> --key-stdin"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{indent}任意键返回"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 空间密钥 ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+}
 /// 用空间密钥加入已有空间：一个整屏的输入页，只有一行输入框。
 ///
 /// 为什么单独一页而不是塞进"添加后端"表单：加入空间既不是改后端、也不是改配置，
@@ -256,7 +374,18 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         )));
     }
-    if let Some(notice) = &app.notice {
+    // 提示只在"主界面"显示。面板/表单/确认页都是整屏页，它们自己会显示结果；
+    // 两头都画会让文字从边框缝里漏出来（实测就是这么花的）。
+    let full_screen_page = app.show_panel
+        || app.show_help
+        || app.wizard.is_some()
+        || app.pending_delete.is_some()
+        || app.pending_backend_remove.is_some()
+        || app.join_space.is_some()
+        || app.pending_space_rebuild.is_some()
+        || app.pending_space_switch.is_some()
+        || app.exported_key.is_some();
+    if !full_screen_page && let Some(notice) = &app.notice {
         lines.push(Line::from(Span::styled(
             format!(" {}", notice.text),
             if notice.is_error {
@@ -1102,7 +1231,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // 窄屏只留最常用的四个键：空格开关、a 添加、x 移除、Esc 关闭
         "  ↑↓ 选择　空格 开关　a 添加　x 移除　Esc 关闭"
     } else {
-        "  ↑↓ 选后端　空格 开关　x 移除　a 添加　s 建空间　i 加入　r 重读　Esc 返回"
+        "  ↑↓ 选后端　空格 开关　x 移除　a 添加　s 建空间　i 加入　e 导出密钥　Esc 返回"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(

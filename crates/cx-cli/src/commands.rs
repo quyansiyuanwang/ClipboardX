@@ -779,7 +779,17 @@ impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
         Ok(format!("后端 {} 已保存并自测通过", draft.name().trim()))
     }
 
-    /// 面板里按 j：用空间密钥加入已有空间（先试解远端条目验证密钥）。
+    /// 面板里按 e：导出空间密钥（与 `cx space export-key` 同一个值）。
+    fn export_key(&mut self) -> Result<String, String> {
+        let space = LocalSpace::load(self.paths).map_err(|err| err.to_string())?;
+        space
+            .cipher
+            .space_key()
+            .map(|key| key.to_hex())
+            .ok_or_else(|| "该空间未加密，没有密钥".to_string())
+    }
+
+    /// 面板里按 i：用空间密钥加入已有空间（先试解远端条目验证密钥）。
     fn join_space(&mut self, backend: &str, key: &str) -> Result<String, String> {
         let parsed = parse_space_key(key).map_err(|err| err.to_string())?;
         join_space_with_key(self.paths, backend, parsed).map_err(|err| err.to_string())?;
@@ -792,9 +802,10 @@ impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
     /// 口令由这里随机生成并**在结果里回显一次**——界面里让用户当场想强口令不现实，
     /// 留空又会退化成明文上传。用户拿这句口令去 `cx space join`，也可以
     /// `cx space export-key` 备份空间密钥。
-    fn create_space(&mut self, backend: &str) -> Result<String, String> {
-        // 界面里绝不做"覆盖已有空间"这种事：换密钥等于把已上传的对象全变成垃圾
-        if self.paths.space_file().exists() {
+    fn create_space(&mut self, backend: &str, force: bool) -> Result<String, String> {
+        // 重建（force）由界面上的确认页保证"用户确实点了同意"；
+        // 没带 force 时仍然拒绝覆盖——这条和命令行 `cx space init` 完全一致。
+        if !force && self.paths.space_file().exists() {
             let existing = LocalSpace::load(self.paths)
                 .map(|space| space.short_id())
                 .unwrap_or_else(|_| "（读取失败）".to_string());

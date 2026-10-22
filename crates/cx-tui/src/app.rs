@@ -53,7 +53,15 @@ pub enum KeyOutcome {
     /// 停用 / 启用某个后端（面板里按 t）。
     ToggleBackend(String),
     /// 在本机建加密空间并把元数据发布到该后端（面板里按 s）。
-    CreateSpace(String),
+    /// `force` 为真表示"已有空间也重建"（命令行 `cx space init --force` 的等价物）。
+    CreateSpace {
+        /// 后端名。
+        backend: String,
+        /// 是否强制重建。
+        force: bool,
+    },
+    /// 导出空间密钥（`cx space export-key` 的等价物）。
+    ExportKey,
     /// 用空间密钥加入已有空间（面板里按 j 并输入密钥）。
     JoinSpace {
         /// 后端名。
@@ -179,6 +187,12 @@ pub struct App {
     pub pending_backend_remove: Option<String>,
     /// 正在"用密钥加入空间"的输入缓冲：`(后端名, 已输入的密钥文本)`。
     pub join_space: Option<(String, String)>,
+    /// 已有空间时按 s：等用户在确认页上点头，值是要重建到的后端。
+    pub pending_space_rebuild: Option<String>,
+    /// 已有空间时按 i：等用户确认"换空间"，值是目标后端。
+    pub pending_space_switch: Option<String>,
+    /// 导出出来的空间密钥（`e`）：单独一页展示，不在提示行里塞 64 个字符。
+    pub exported_key: Option<String>,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
     pub doctor: Option<DoctorReport>,
     /// 面板内独立错误，避免失败后永远显示读取中。
@@ -448,6 +462,14 @@ impl App {
         } else if self.panel_backend >= count {
             self.panel_backend = count - 1;
         }
+    }
+
+    /// 本机是否已经在某个加密空间里（很多"危险动作"都要先问这个）。
+    pub fn has_space(&self) -> bool {
+        self.status
+            .as_ref()
+            .map(|status| status.space_id.is_some())
+            .unwrap_or(false)
     }
 
     pub(crate) fn clamp_panel_scroll(&mut self) {
@@ -724,6 +746,40 @@ impl App {
             return KeyOutcome::None;
         }
 
+        // 重建空间的确认（已有空间时按 s）：只有 y/回车 才真的重建
+        if let Some(backend) = self.pending_space_rebuild.take() {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    KeyOutcome::CreateSpace {
+                        backend,
+                        force: true,
+                    }
+                }
+                _ => {
+                    self.note("已取消重建");
+                    KeyOutcome::None
+                }
+            };
+        }
+        // 换空间的确认（已有空间时按 i）：确认后进密钥输入页
+        if let Some(backend) = self.pending_space_switch.take() {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.join_space = Some((backend, String::new()));
+                    KeyOutcome::None
+                }
+                _ => {
+                    self.note("已取消");
+                    KeyOutcome::None
+                }
+            };
+        }
+        // 空间密钥展示页：任意键返回
+        if self.exported_key.is_some() {
+            self.exported_key = None;
+            return KeyOutcome::None;
+        }
+
         // 移除后端的确认：只有 y/回车 才真的移除
         if let Some(name) = self.pending_backend_remove.take() {
             return match key.code {
@@ -941,34 +997,33 @@ impl App {
                 },
                 // s：没有空间时一键建加密空间（口令自动生成并在结果里回显一次）
                 KeyCode::Char('s') => {
-                    // 已经有空间就只提示、不发起：换密钥会让已上传的对象全变成解不开的垃圾
-                    let has_space = self
-                        .status
-                        .as_ref()
-                        .map(|status| status.space_id.is_some())
-                        .unwrap_or(false);
-                    if has_space {
-                        self.warn("本机已有加密空间；重建会换成新密钥、旧对象再也解不开（命令行 cx space init --force 才能那么做）");
+                    let Some(backend) = self.selected_backend() else {
+                        self.warn("先添加一个后端，才能把空间元数据发布上去");
                         return KeyOutcome::None;
-                    }
-                    match self.selected_backend() {
-                        Some(name) => KeyOutcome::CreateSpace(name),
-                        None => {
-                            self.warn("先添加一个后端，才能把空间元数据发布上去");
-                            KeyOutcome::None
+                    };
+                    // 已经有空间时**照样能做**（等价于 cx space init --force），
+                    // 但先弹确认：换密钥会让已上传的对象永久打不开。
+                    if self.has_space() {
+                        self.pending_space_rebuild = Some(backend);
+                        KeyOutcome::None
+                    } else {
+                        KeyOutcome::CreateSpace {
+                            backend,
+                            force: false,
                         }
                     }
                 }
                 // i（join）：已经有空间时没用；没有空间才能用空间密钥加入。
                 // 不用 j：面板里 j 是"下一个后端"（vim 风格）。
                 KeyCode::Char('i') => {
-                    let has_space = self
-                        .status
-                        .as_ref()
-                        .map(|status| status.space_id.is_some())
-                        .unwrap_or(false);
+                    let has_space = self.has_space();
+                    let Some(name) = self.selected_backend() else {
+                        self.warn("先添加一个后端，才谈得上加入空间");
+                        return KeyOutcome::None;
+                    };
                     if has_space {
-                        self.note("本机已经在同步空间里了；换空间请先在命令行备份后重建");
+                        // 换空间同样是"能做但有风险"：确认后进输入页
+                        self.pending_space_switch = Some(name);
                         return KeyOutcome::None;
                     }
                     match self.selected_backend() {
@@ -980,6 +1035,15 @@ impl App {
                             self.warn("先添加一个后端，才谈得上加入空间");
                             KeyOutcome::None
                         }
+                    }
+                }
+                // e：把空间密钥显示出来（等价于 cx space export-key）
+                KeyCode::Char('e') => {
+                    if self.has_space() {
+                        KeyOutcome::ExportKey
+                    } else {
+                        self.warn("本机还没有空间，没有密钥可导出");
+                        KeyOutcome::None
                     }
                 }
                 // 移除选中后端：先进确认，避免误删
@@ -2214,6 +2278,65 @@ mod tests {
     }
 
     #[test]
+    fn 已有空间时按_s_进确认页_同意后带_force_重建() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('s'))), KeyOutcome::None);
+        assert_eq!(
+            app.pending_space_rebuild.as_deref(),
+            Some("oss"),
+            "应当停在确认页，而不是直接拒绝"
+        );
+        // 取消：不动手
+        assert_eq!(app.on_key(key(KeyCode::Char('n'))), KeyOutcome::None);
+        assert!(app.pending_space_rebuild.is_none());
+        // 再按一次并同意：等价 cx space init --force
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('y'))),
+            KeyOutcome::CreateSpace {
+                backend: "oss".to_string(),
+                force: true
+            }
+        );
+    }
+
+    #[test]
+    fn 已有空间时按_i_确认后进入密钥输入页() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('i'))), KeyOutcome::None);
+        assert_eq!(app.pending_space_switch.as_deref(), Some("oss"));
+        assert_eq!(app.on_key(key(KeyCode::Char('y'))), KeyOutcome::None);
+        assert!(
+            app.join_space.is_some(),
+            "确认之后应当进入密钥输入页（换空间也做得到，只是要先问）"
+        );
+    }
+
+    #[test]
+    fn 面板里按_e_导出空间密钥() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('e'))), KeyOutcome::ExportKey);
+        // 展示页任意键返回
+        app.exported_key = Some("a".repeat(64));
+        assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
+        assert!(app.exported_key.is_none());
+    }
+    #[test]
     fn 面板里按_i_进入加入空间的输入态() {
         let mut app = App::new();
         app.apply(UiEvent::Status(Box::new(status_without_space(
@@ -2271,12 +2394,9 @@ mod tests {
         ))));
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(app.on_key(key(KeyCode::Char('i'))), KeyOutcome::None);
-        assert!(app.join_space.is_none(), "已经有空间就不该再走加入流程");
-        assert!(
-            app.notice
-                .as_ref()
-                .is_some_and(|notice| notice.text.contains("已经在同步空间里"))
-        );
+        // 不直接进输入页：先要用户确认"换空间"（确认后才进输入页）
+        assert_eq!(app.pending_space_switch.as_deref(), Some("oss"));
+        assert!(app.join_space.is_none(), "确认之前不该进入输入页");
     }
     #[test]
     fn 面板里按_s_要求建加密空间() {
@@ -2287,14 +2407,17 @@ mod tests {
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(
             app.on_key(key(KeyCode::Char('s'))),
-            KeyOutcome::CreateSpace("oss".to_string()),
+            KeyOutcome::CreateSpace {
+                backend: "oss".to_string(),
+                force: false
+            },
             "面板里按 s 应当发起建空间，发布目标是选中的后端"
         );
         assert!(app.show_panel, "建空间不该关掉面板");
     }
 
     #[test]
-    fn 已有空间时按_s_只提示不重建() {
+    fn 已有空间时按_s_先要确认() {
         let mut app = App::new();
         app.apply(UiEvent::Status(Box::new(status_with_backends(
             false,
@@ -2306,12 +2429,8 @@ mod tests {
             KeyOutcome::None,
             "已有空间时按 s 绝不能发起重建（换密钥会让旧对象解不开）"
         );
-        assert!(
-            app.notice
-                .as_ref()
-                .is_some_and(|notice| notice.text.contains("已有加密空间")),
-            "要说明为什么不动"
-        );
+        // 不直接重建：先停在确认页（确认后才带 force 执行）
+        assert_eq!(app.pending_space_rebuild.as_deref(), Some("oss"));
     }
     #[test]
     fn 没有后端时按_s_给出提示而不是发起建空间() {
