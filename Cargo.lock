@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "cx"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "clap",
  "cx-cli",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "cx-backend"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "attohttpc",
  "base64 0.23.1",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "cx-cli"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "cx-clip"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "blake3",
  "clipboard-rs",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "cx-core"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "cx-crypto",
  "cx-proto",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "cx-crypto"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "argon2",
  "chacha20poly1305 0.11.0",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "cx-daemon"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "crossbeam-channel",
  "cx-backend",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "cx-lan"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "cx-proto"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "blake3",
  "chacha20poly1305 0.11.0",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "cx-server"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "blake3",
  "clap",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "cx-server-bin"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "clap",
  "cx-core",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "cx-sync"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "cx-backend",
  "cx-clip",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "cx-tui"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "crossbeam-channel",
  "crossterm",
