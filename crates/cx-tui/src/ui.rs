@@ -222,7 +222,9 @@ fn draw_join_space(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Span::styled(format!("{indent}回车"), Style::default().fg(Color::Yellow)),
             Span::raw(" 加入　"),
             Span::styled("Esc", Style::default().fg(Color::DarkGray)),
-            Span::raw(" 取消"),
+            Span::raw(" 取消　"),
+            Span::styled("Ctrl+V", Style::default().fg(Color::DarkGray)),
+            Span::raw(" 粘贴"),
         ]),
     ];
     frame.render_widget(

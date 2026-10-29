@@ -694,6 +694,21 @@ impl App {
             }
             return;
         }
+        // 加入空间的密钥输入：粘贴时只留十六进制、转小写，并且**允许一次贴满 64 位**
+        // （密钥都是从另一台机器 `cx space export-key` 复制来的，手敲不现实）。
+        if let Some((backend, typed)) = self.join_space.take() {
+            let mut buffer = typed;
+            for ch in text.chars() {
+                if ch == '\r' || ch == '\n' || ch.is_whitespace() {
+                    continue;
+                }
+                if ch.is_ascii_hexdigit() && buffer.chars().count() < 128 {
+                    buffer.push(ch.to_ascii_lowercase());
+                }
+            }
+            self.join_space = Some((backend, buffer));
+            return;
+        }
         if self.filter_input {
             let mut query = self.filter.clone();
             query.push_str(text.replace(['\r', '\n'], "").trim());
@@ -2356,6 +2371,45 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Esc)), KeyOutcome::None);
         assert!(app.exported_key.is_none());
         assert!(app.exported_key_note.is_none(), "返回时要清掉导出结果");
+    }
+    #[test]
+    fn 加入空间支持粘贴整段密钥() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_without_space(
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::Char('i')));
+        assert!(app.join_space.is_some());
+        // 从另一台机器复制来的密钥常带换行/空格，甚至前后有提示文字
+        let pasted = "  E388B01B\n".to_string() + &"a1b2c3d4".repeat(7);
+        app.on_paste(&pasted);
+        let (backend, typed) = app.join_space.clone().unwrap();
+        assert_eq!(backend, "oss");
+        assert_eq!(typed.chars().count(), 64, "应当一次吃下整段密钥");
+        assert!(typed.starts_with("e388b01b"), "统一小写：{typed}");
+        assert!(typed.chars().all(|c| c.is_ascii_hexdigit()));
+        // 满 64 位后回车即为有效提交
+        match app.on_key(key(KeyCode::Enter)) {
+            KeyOutcome::JoinSpace { key, .. } => assert_eq!(key.len(), 64),
+            other => panic!("期望 JoinSpace，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 加入空间粘贴时忽略非十六进制字符() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_without_space(
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::Char('i')));
+        app.on_paste("空间密钥：abc-def ghi");
+        assert_eq!(
+            app.join_space.as_ref().unwrap().1,
+            "abcdef",
+            "只留十六进制字符"
+        );
     }
     #[test]
     fn 面板里按_i_进入加入空间的输入态() {
