@@ -10,6 +10,7 @@
 //! - 后端只读测试、服务端注册、空间发布/加入是用户显式请求的直连操作；
 //!   TUI 后端草稿先测试成功，再事务提交配置与凭据。
 
+mod bundle;
 mod commands;
 mod config_cmd;
 mod doctor;

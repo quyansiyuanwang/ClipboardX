@@ -6,6 +6,7 @@ use cx_core::{Config, Identity, LocalSpace, Paths};
 use cx_daemon::{ControlClient, Daemon, DaemonError, DaemonOptions};
 use cx_proto::control::cmd as commands;
 use serde_json::{Map, json};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// 顶层子命令。
@@ -187,6 +188,19 @@ pub enum ConfigCommand {
         /// 新值；列表类用逗号分隔
         value: String,
     },
+    /// 把整套配置（后端、凭据、空间、空间密钥）导出成一个文件
+    Export {
+        /// 输出路径（默认 ./clipboardx-bundle.json）
+        path: Option<PathBuf>,
+    },
+    /// 从导出文件恢复整套配置（新机器一条命令配好）
+    Import {
+        /// 文件路径
+        path: PathBuf,
+        /// 覆盖本机已有配置
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// `cx backend` 的子命令。
@@ -206,6 +220,41 @@ pub enum BackendCommand {
         /// 后端种类与其参数
         #[command(subcommand)]
         kind: BackendAddCommand,
+    },
+    /// 修改一个已存在的后端（只改给出的字段）
+    Edit {
+        /// 后端名
+        name: String,
+        /// 桶名（S3）
+        #[arg(long)]
+        bucket: Option<String>,
+        /// 端点（S3）
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// 区域（S3）
+        #[arg(long)]
+        region: Option<String>,
+        /// 前缀：两台设备必须一致（对象存放的子目录，可留空表示桶根）
+        #[arg(long)]
+        prefix: Option<String>,
+        /// AccessKeyId（S3）
+        #[arg(long)]
+        access_key_id: Option<String>,
+        /// 改为虚拟主机式寻址（OSS/COS）
+        #[arg(long)]
+        virtual_host: bool,
+        /// 改为路径式寻址（MinIO）
+        #[arg(long)]
+        path_style: bool,
+        /// URL（webdav / server）
+        #[arg(long)]
+        url: Option<String>,
+        /// 用户名（webdav）
+        #[arg(long)]
+        username: Option<String>,
+        /// 从标准输入读取新的私有密钥 / 口令 / 令牌
+        #[arg(long)]
+        secret_stdin: bool,
     },
     /// 移除后端（连同它的凭据文件）
     Remove {
@@ -568,6 +617,29 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                     Ok(ExitCode::FAILURE)
                 }
             }
+            ConfigCommand::Export { path } => {
+                let out = path.unwrap_or_else(|| PathBuf::from("clipboardx-bundle.json"));
+                let bundle = crate::bundle::Bundle::collect(paths, cx_core::now_ms())?;
+                crate::bundle::write_file(&out, &bundle)?;
+                println!("已导出到 {}", out.display());
+                println!(
+                    "含 {} 个凭据{}；这个文件等价于空间密钥，请妥善保管",
+                    bundle.secrets.len(),
+                    if bundle.has_space_key() {
+                        "与空间密钥"
+                    } else {
+                        ""
+                    }
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+            ConfigCommand::Import { path: file, force } => {
+                let bundle = crate::bundle::read_file(&file)?;
+                bundle.restore(paths, force)?;
+                println!("已从 {} 导入配置", file.display());
+                println!("重启守护进程使其生效：cx restart");
+                Ok(ExitCode::SUCCESS)
+            }
             ConfigCommand::Get { key } => {
                 let config = Config::load(paths)?;
                 match key {
@@ -634,7 +706,7 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                 let passphrase = if no_encrypt {
                     None
                 } else if passphrase_stdin {
-                    Some(strip_line_terminator(read_stdin_text(4096)?))
+                    Some(read_stdin_until(4096, Some("空间口令"))?)
                 } else {
                     return Err(DaemonError::Protocol(
                         "请用 `--passphrase-stdin` 提供口令（避免出现在命令历史里），\
@@ -683,12 +755,12 @@ pub fn dispatch(paths: &Paths, command: Command) -> Result<ExitCode, DaemonError
                     ));
                 }
                 if key_stdin {
-                    let text = strip_line_terminator(read_stdin_text(4096)?);
+                    let text = read_stdin_until(4096, Some("空间密钥"))?;
                     let key = parse_space_key(&text)?;
                     ok_or_failure(join_space_with_key(paths, &backend, key)?)
                 } else {
                     let passphrase = if passphrase_stdin {
-                        Some(strip_line_terminator(read_stdin_text(4096)?))
+                        Some(read_stdin_until(4096, Some("空间口令"))?)
                     } else {
                         None
                     };
@@ -916,8 +988,34 @@ fn load_optional_space(paths: &Paths) -> Result<Option<LocalSpace>, DaemonError>
 
 /// 从标准输入读取文本（有上限，避免误操作把巨大文件塞进剪贴板通道）。
 fn read_stdin_text(limit: u64) -> Result<String, DaemonError> {
-    use std::io::Read;
+    read_stdin_until(limit, None)
+}
+
+/// 读标准输入，返回原始文本（不去换行——调用方自己决定要不要 trim）。
+///
+/// **终端里读一行，管道/重定向里读到 EOF**。之前一律读到 EOF，于是
+/// `cx space join <后端> --key-stdin` 在终端里粘完密钥按回车毫无反应——
+/// 它在等 EOF（Windows 上得按 Ctrl+Z 再回车），看起来就是"卡住退不出来"。
+fn read_stdin_until(limit: u64, prompt: Option<&str>) -> Result<String, DaemonError> {
+    use std::io::{BufRead, IsTerminal, Read, Write};
+
     let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        if let Some(prompt) = prompt {
+            // 提示走 stderr：stdout 留给命令输出，脚本重定向时不会混进数据
+            eprint!("{prompt}: ");
+            let _ = std::io::stderr().flush();
+        }
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line).map_err(DaemonError::io)?;
+        if line.len() as u64 > limit {
+            return Err(DaemonError::Protocol(format!(
+                "标准输入超过 {limit} 字节上限"
+            )));
+        }
+        return Ok(strip_line_terminator(line));
+    }
+
     let mut buffer = Vec::new();
     stdin
         .lock()
@@ -984,11 +1082,7 @@ fn join_space_with_key(
     let mut remote = build_named_backend(paths, backend)?;
     let json = cx_backend::load_space_meta(&mut *remote)
         .map_err(|err| DaemonError::Protocol(format!("读取空间元数据失败：{err}")))?
-        .ok_or_else(|| {
-            DaemonError::Protocol(format!(
-                "后端 {backend} 上还没有空间元数据（先在已加入的设备上执行 `cx space publish {backend}`）"
-            ))
-        })?;
+        .ok_or_else(|| DaemonError::Protocol(space_meta_missing_message(paths, backend)))?;
     let space = LocalSpace::join_with_key(paths, &json, key)?;
     // 立刻校验这把钥匙对不对：拿远端任意一个条目试着解开。
     // 否则用户要等到同步报错才发现密钥抄错了，而那时空间已经被写下来了。
@@ -1051,16 +1145,35 @@ fn join_space_with_key(
     println!("cx start 后生效");
     Ok(true)
 }
+/// "找不到空间元数据"到底该怎么说。
+///
+/// 实测最常见的不是"没上传"，而是**这台机器的前缀/桶和另一台不一致**：
+/// 于是它去 `…/clip/cx-space.json` 找不到，而对象其实在 `…/clip/cx-space.json`。
+/// 所以这里必须把"去哪里找的"写出来，否则用户只会反复 publish 却找不到原因。
+fn space_meta_missing_message(paths: &Paths, backend: &str) -> String {
+    let location = Config::load(paths)
+        .ok()
+        .and_then(|config| {
+            config
+                .backends
+                .iter()
+                .find(|section| section.name == backend)
+                .map(backend_target)
+        })
+        .unwrap_or_else(|| "（读不到该后端配置）".to_string());
+    format!(
+        "后端 {backend} 上找不到 cx-space.json：查的是 {location}/cx-space.json。\n\
+         先确认这台机器的桶/前缀与另一台一致（cx backend list 对照）；\
+         一致的话，在已加入的设备上执行 cx space publish {backend}。\n\
+         更省事的做法：另一台执行 cx config export，这台 cx config import <文件>，连密钥一起搬过来。"
+    )
+}
 /// 从某个后端加入已有空间。
 fn join_space(paths: &Paths, backend: &str, passphrase: Option<&str>) -> Result<bool, DaemonError> {
     let mut remote = build_named_backend(paths, backend)?;
     let json = cx_backend::load_space_meta(&mut *remote)
         .map_err(|err| DaemonError::Protocol(format!("读取空间元数据失败：{err}")))?
-        .ok_or_else(|| {
-            DaemonError::Protocol(format!(
-                "后端 {backend} 上还没有空间元数据（先在已加入的设备上执行 `cx space publish {backend}`）"
-            ))
-        })?;
+        .ok_or_else(|| DaemonError::Protocol(space_meta_missing_message(paths, backend)))?;
     let space = LocalSpace::join(paths, &json, passphrase)?;
     println!("已加入空间 {}", space.short_id());
     println!(
@@ -1552,6 +1665,88 @@ fn run_backend(paths: &Paths, command: BackendCommand) -> Result<ExitCode, Daemo
 
         BackendCommand::Add { kind } => ok_or_failure(add_backend(paths, kind)?),
 
+        BackendCommand::Edit {
+            name,
+            bucket,
+            endpoint,
+            region,
+            prefix,
+            access_key_id,
+            virtual_host,
+            path_style,
+            url,
+            username,
+            secret_stdin,
+        } => {
+            if virtual_host && path_style {
+                return Err(DaemonError::Protocol(
+                    "--virtual-host 与 --path-style 只能选一个".to_string(),
+                ));
+            }
+            let mut config = Config::load(paths)?;
+            let index = config
+                .backends
+                .iter()
+                .position(|section| section.name == name)
+                .ok_or_else(|| {
+                    DaemonError::Protocol(format!(
+                        "没有名为 {name} 的后端（用 `cx backend list` 查看）"
+                    ))
+                })?;
+            if let Some(value) = bucket {
+                config.backends[index].bucket = Some(value.trim().to_string());
+            }
+            if let Some(value) = endpoint {
+                config.backends[index].endpoint = nonempty(&value);
+            }
+            if let Some(value) = region {
+                config.backends[index].region = nonempty(&value);
+            }
+            if let Some(value) = prefix {
+                // 空前缀合法（放桶根）；顺手去掉首尾斜杠，免得拼出 //
+                config.backends[index].prefix = nonempty(value.trim().trim_matches('/'));
+            }
+            if let Some(value) = access_key_id {
+                config.backends[index].access_key_id = Some(value.trim().to_string());
+            }
+            if virtual_host {
+                config.backends[index].path_style = Some(false);
+            }
+            if path_style {
+                config.backends[index].path_style = Some(true);
+            }
+            if let Some(value) = url {
+                config.backends[index].url = Some(value.trim().to_string());
+            }
+            if let Some(value) = username {
+                config.backends[index].username = nonempty(&value);
+            }
+            if secret_stdin {
+                let text = read_stdin_until(4096, Some("私有密钥/口令"))?;
+                let file = match config.backends[index].kind {
+                    cx_core::BackendKind::S3 => format!("{name}.key"),
+                    cx_core::BackendKind::Webdav => format!("{name}.password"),
+                    cx_core::BackendKind::Server => format!("{name}.token"),
+                };
+                write_secret_file(paths, &file, text.trim())?;
+                match config.backends[index].kind {
+                    cx_core::BackendKind::S3 => {
+                        config.backends[index].secret_access_key_file = Some(file)
+                    }
+                    cx_core::BackendKind::Webdav => {
+                        config.backends[index].password_file = Some(file)
+                    }
+                    cx_core::BackendKind::Server => config.backends[index].token_file = Some(file),
+                }
+            }
+            config.save(paths)?;
+            println!(
+                "已更新后端 {name}：{}",
+                backend_target(&config.backends[index])
+            );
+            println!("重启后生效：cx restart");
+            Ok(ExitCode::SUCCESS)
+        }
         BackendCommand::Remove { name } => {
             // 与界面里的移除共用一份实现（含凭据清理）
             if let Err(err) = remove_backend(paths, &name) {
