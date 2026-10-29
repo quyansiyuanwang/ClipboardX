@@ -109,9 +109,19 @@ fn draw_config_page(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut lines = vec![Line::from("")];
     for (index, (key, value)) in page.items.iter().enumerate() {
         let selected = index == page.cursor;
+        // 值列可用宽度：内容宽 - 缩进 - 选择标记 - 键列
+        let value_room = content_w.saturating_sub(key_w + 4);
         let shown = match (&page.editing, selected) {
-            (Some(buffer), true) => format!("{buffer}▏"),
-            _ => value.clone(),
+            (Some(buffer), true) => input_tail(buffer, value_room.max(8)) + "▏",
+            _ => {
+                if display_width(value) > value_room {
+                    let mut clipped = input_tail(value, value_room.saturating_sub(1));
+                    clipped.insert(0, '…');
+                    clipped
+                } else {
+                    value.clone()
+                }
+            }
         };
         let key_style = if selected {
             Style::default()
@@ -2457,6 +2467,33 @@ mod tests {
             .map(|form| form.submit())
             .unwrap_or_else(|| panic!("表单应当存在"));
         assert!(submitted.is_ok(), "编辑模式下密钥留空应可提交");
+    }
+    #[test]
+    fn 配置页长值不会顶破边框() {
+        let mut app = App::new();
+        app.config_page = Some(crate::app::ConfigPage {
+            items: vec![(
+                "sync.ignore_globs".to_string(),
+                "**/*.key,**/*.pem,**/id_rsa,**/*.pfx,**/*.p12,**/secrets/**,**/.env".to_string(),
+            )],
+            cursor: 0,
+            editing: None,
+        });
+        for width in [60u16, 100] {
+            let screen = render(&mut app, width, 10);
+            // 右边框必须还在原位：最后一列每行都是边框字符
+            let lines: Vec<&str> = screen.lines().collect();
+            for line in &lines {
+                let chars: Vec<char> = line.chars().collect();
+                if chars.len() > 2 {
+                    let last = chars[chars.len() - 1];
+                    assert!(
+                        matches!(last, '│' | '┐' | '┘' | '─'),
+                        "宽度 {width} 时长值顶破了边框：{line}"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn 配置页列出键值并能行内编辑() {
