@@ -64,6 +64,21 @@ pub enum KeyOutcome {
     ExportKey,
     /// 把空间密钥写到文件里（密钥页上按 x）。
     ExportKeyToFile,
+    /// 打开某个后端的编辑表单（面板里按 E）。
+    EditBackend(String),
+    /// 提交对已有后端的修改。
+    SaveBackend {
+        /// 原后端名。
+        original: String,
+        /// 表单结果。
+        draft: Box<crate::wizard::BackendDraft>,
+    },
+    /// 把空间元数据重新发布到某个后端（面板里按 P）。
+    PublishSpace(String),
+    /// 整套配置导出（面板里按 O）。
+    ExportBundle,
+    /// 整套配置导入（面板里按 I，已确认）。
+    ImportBundle,
     /// 用空间密钥加入已有空间（面板里按 j 并输入密钥）。
     JoinSpace {
         /// 后端名。
@@ -195,6 +210,10 @@ pub struct App {
     pub pending_space_switch: Option<String>,
     /// 导出出来的空间密钥（`e`）：单独一页展示，不在提示行里塞 64 个字符。
     pub exported_key: Option<String>,
+    /// 正在"编辑已有后端"时的原后端名（提交时要按原名替换）。
+    pub wizard_edit_target: Option<String>,
+    /// 导入整包前的确认（会覆盖本机配置、凭据与空间密钥）。
+    pub pending_import: bool,
     /// 密钥页上"导出到文件"的结果（成功路径或错误），显示在同一页里。
     pub exported_key_note: Option<String>,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
@@ -716,6 +735,17 @@ impl App {
         }
     }
 
+    /// 表单提交后该"新增"还是"保存修改"：由 `wizard_edit_target` 决定。
+    pub(crate) fn backend_outcome(&mut self, draft: crate::wizard::BackendDraft) -> KeyOutcome {
+        match self.wizard_edit_target.take() {
+            Some(original) => KeyOutcome::SaveBackend {
+                original,
+                draft: Box::new(draft),
+            },
+            None => KeyOutcome::AddBackend(Box::new(draft)),
+        }
+    }
+
     fn activate_wizard(&mut self) -> KeyOutcome {
         if self
             .wizard
@@ -729,7 +759,7 @@ impl App {
         match self.wizard.as_mut().map(|form| form.submit()) {
             Some(Ok(draft)) => {
                 self.wizard = None;
-                KeyOutcome::AddBackend(Box::new(draft))
+                self.backend_outcome(draft)
             }
             _ => KeyOutcome::None,
         }
@@ -789,6 +819,19 @@ impl App {
                 }
                 _ => {
                     self.note("已取消");
+                    KeyOutcome::None
+                }
+            };
+        }
+        // 导入整包的确认：会覆盖本机配置、凭据与空间密钥
+        if self.pending_import {
+            self.pending_import = false;
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    KeyOutcome::ImportBundle
+                }
+                _ => {
+                    self.note("已取消导入");
                     KeyOutcome::None
                 }
             };
@@ -1062,6 +1105,29 @@ impl App {
                             KeyOutcome::None
                         }
                     }
+                }
+                // E：编辑选中的后端（表单预填现值；保存前仍做连通性自测）
+                KeyCode::Char('E') => match self.selected_backend() {
+                    Some(name) => KeyOutcome::EditBackend(name),
+                    None => {
+                        self.warn("没有可编辑的后端");
+                        KeyOutcome::None
+                    }
+                },
+                // P：把空间元数据重新发布到选中后端（等价 cx space publish）
+                KeyCode::Char('P') => match self.selected_backend() {
+                    Some(name) => KeyOutcome::PublishSpace(name),
+                    None => {
+                        self.warn("没有可发布的后端");
+                        KeyOutcome::None
+                    }
+                },
+                // O：整套配置导出到配置目录
+                KeyCode::Char('O') => KeyOutcome::ExportBundle,
+                // I：从配置目录的整包导入（先确认：会覆盖本机配置）
+                KeyCode::Char('I') => {
+                    self.pending_import = true;
+                    KeyOutcome::None
                 }
                 // e：把空间密钥显示出来（等价于 cx space export-key）
                 KeyCode::Char('e') => {
@@ -2348,6 +2414,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn 面板里按大写e请求编辑选中后端() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('E'))),
+            KeyOutcome::EditBackend("oss".to_string())
+        );
+    }
+
+    #[test]
+    fn 编辑表单提交走保存而不是新增() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        let draft = crate::wizard::BackendDraft {
+            kind: crate::wizard::WizardKind::S3,
+            values: vec!["oss".into(); 10],
+        };
+        // 有编辑目标 → SaveBackend（按原名替换）
+        app.wizard_edit_target = Some("oss".to_string());
+        match app.backend_outcome(draft.clone()) {
+            KeyOutcome::SaveBackend { original, .. } => assert_eq!(original, "oss"),
+            other => panic!("期望 SaveBackend，实际 {other:?}"),
+        }
+        assert!(app.wizard_edit_target.is_none(), "提交后要清掉编辑目标");
+        // 没有编辑目标 → AddBackend（新后端）
+        assert!(matches!(
+            app.backend_outcome(draft),
+            KeyOutcome::AddBackend(_)
+        ));
+    }
+
+    #[test]
+    fn 面板里按大写o导出并按大写i先确认再导入() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('O'))),
+            KeyOutcome::ExportBundle
+        );
+        assert_eq!(app.on_key(key(KeyCode::Char('I'))), KeyOutcome::None);
+        assert!(app.pending_import, "导入要先停在确认页");
+        assert_eq!(app.on_key(key(KeyCode::Char('n'))), KeyOutcome::None);
+        assert!(!app.pending_import);
+        app.on_key(key(KeyCode::Char('I')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('y'))),
+            KeyOutcome::ImportBundle
+        );
+    }
+
+    #[test]
+    fn 面板里按大p重新发布空间元数据() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('P'))),
+            KeyOutcome::PublishSpace("oss".to_string())
+        );
+    }
     #[test]
     fn 面板里按_e_导出空间密钥() {
         let mut app = App::new();

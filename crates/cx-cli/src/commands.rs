@@ -830,6 +830,60 @@ struct TuiBackendAdmin<'a> {
 }
 
 impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
+    /// 面板里按 E：把某个后端的现值装进表单，供用户改。
+    fn edit_draft(&mut self, name: &str) -> Result<cx_tui::TuiBackendDraft, String> {
+        let config = Config::load(self.paths).map_err(|err| err.to_string())?;
+        let section = config
+            .backends
+            .iter()
+            .find(|section| section.name == name)
+            .ok_or_else(|| format!("没有名为 {name} 的后端"))?;
+        Ok(draft_from_section(section))
+    }
+
+    /// 面板里保存对已有后端的修改：与新增走同一条保存/自测路径，只是目标已存在。
+    fn update(
+        &mut self,
+        original: &str,
+        draft: &cx_tui::TuiBackendDraft,
+    ) -> Result<String, String> {
+        update_draft_with_probe(self.paths, original, draft, probe_section)
+            .map_err(|err| err.to_string())?;
+        restart_daemon(self.paths).map_err(|err| err.to_string())?;
+        Ok(format!("已保存 {original}，守护进程已重启"))
+    }
+
+    /// 面板里按 P：把空间元数据重新发布到该后端（等价 `cx space publish`）。
+    fn publish_space(&mut self, backend: &str) -> Result<String, String> {
+        if !self.paths.space_file().exists() {
+            return Err("本机还没有空间，没有可发布的元数据".to_string());
+        }
+        publish_space(self.paths, backend).map_err(|err| err.to_string())?;
+        Ok(format!("已把空间元数据发布到 {backend}"))
+    }
+
+    /// 面板里按 O：整套配置导出到配置目录，返回路径。
+    fn export_bundle(&mut self) -> Result<String, String> {
+        let path = self.paths.config_dir.join("clipboardx-bundle.json");
+        let bundle = crate::bundle::Bundle::collect(self.paths, cx_core::now_ms())
+            .map_err(|err| err.to_string())?;
+        crate::bundle::write_file(&path, &bundle).map_err(|err| err.to_string())?;
+        Ok(format!(
+            "已导出到 {}（含凭据与空间密钥，0600）",
+            path.display()
+        ))
+    }
+
+    /// 面板里按 I：从配置目录里的包恢复（覆盖本机配置，界面已先确认）。
+    fn import_bundle(&mut self) -> Result<String, String> {
+        let path = self.paths.config_dir.join("clipboardx-bundle.json");
+        let bundle = crate::bundle::read_file(&path).map_err(|err| err.to_string())?;
+        bundle
+            .restore(self.paths, true)
+            .map_err(|err| err.to_string())?;
+        restart_daemon(self.paths).map_err(|err| err.to_string())?;
+        Ok(format!("已从 {} 导入，守护进程已重启", path.display()))
+    }
     fn toggle(&mut self, name: &str) -> Result<String, String> {
         let enabled = set_backend_enabled(self.paths, name).map_err(|err| err.to_string())?;
         restart_daemon(self.paths).map_err(|err| err.to_string())?;
@@ -1339,26 +1393,18 @@ fn restart_with_mode(
     Ok(())
 }
 
-/// Prepare and test a draft before committing configuration. Failures roll back secrets.
-fn add_backend_from_draft(
-    paths: &Paths,
+/// 把界面表单草稿映射成后端配置段（新增与编辑共用一份，避免两条路径走岔）。
+///
+/// `is_new` 只影响"服务端注册密钥"这一项：新增时必须填（要靠它换设备令牌），
+/// 编辑时留空表示沿用已有令牌。
+fn draft_to_section(
     draft: &cx_tui::TuiBackendDraft,
-) -> Result<(), DaemonError> {
-    add_draft_with_probe(paths, draft, probe_section)?;
-    restart_daemon(paths)
-}
-
-fn add_draft_with_probe(
-    paths: &Paths,
-    draft: &cx_tui::TuiBackendDraft,
-    probe: impl FnOnce(&Paths, &Config, &cx_core::BackendSection) -> Result<(), DaemonError>,
-) -> Result<(), DaemonError> {
+    is_new: bool,
+) -> Result<(cx_core::BackendSection, Vec<(String, String)>), DaemonError> {
     use cx_core::BackendKind;
     use cx_tui::WizardKind;
     let name = draft.name().trim().to_string();
     check_backend_name(&name)?;
-    let mut config = Config::load(paths)?;
-    ensure_unique_name(&config, &name)?;
     let kind = match draft.kind {
         WizardKind::Server => BackendKind::Server,
         WizardKind::Webdav => BackendKind::Webdav,
@@ -1371,7 +1417,7 @@ fn add_draft_with_probe(
             section.url = Some(draft.get("服务端地址").trim().to_string());
             section.space = Some(draft.get("空间 id").trim().to_string());
             section.token_file = Some(format!("{name}.token"));
-            if draft.get("注册密钥").is_empty() {
+            if is_new && draft.get("注册密钥").is_empty() {
                 return Err(DaemonError::Protocol(
                     "请填写注册密钥以获取设备令牌".to_string(),
                 ));
@@ -1409,7 +1455,6 @@ fn add_draft_with_probe(
                 section.secret_access_key_file = Some(file.clone());
                 secrets.push((file, secret.to_string()));
             }
-            // 可选：STS 临时凭据的会话令牌
             let session_token = draft.get("会话令牌");
             if !session_token.is_empty() {
                 let file = format!("{name}.sessiontoken");
@@ -1418,8 +1463,145 @@ fn add_draft_with_probe(
             }
         }
     }
+    Ok((section, secrets))
+}
+
+/// 把已有后端装成表单草稿（编辑时预填现值）。
+fn draft_from_section(section: &cx_core::BackendSection) -> cx_tui::TuiBackendDraft {
+    use cx_core::BackendKind;
+    use cx_tui::WizardKind;
+    let addressing = match section.path_style {
+        Some(true) => "path",
+        Some(false) => "virtual-host",
+        None => "",
+    };
+    let kind = match section.kind {
+        BackendKind::Server => WizardKind::Server,
+        BackendKind::Webdav => WizardKind::Webdav,
+        BackendKind::S3 => WizardKind::S3,
+    };
+    // 顺序必须与 wizard 的字段顺序一致；密钥类字段留空（不回显，留空即沿用旧值）
+    let values: Vec<String> = match kind {
+        cx_tui::WizardKind::Server => vec![
+            section.name.clone(),
+            section.url.clone().unwrap_or_default(),
+            section.space.clone().unwrap_or_default(),
+            String::new(),
+        ],
+        cx_tui::WizardKind::Webdav => vec![
+            section.name.clone(),
+            section.url.clone().unwrap_or_default(),
+            section.username.clone().unwrap_or_default(),
+            String::new(),
+        ],
+        cx_tui::WizardKind::S3 => vec![
+            section.name.clone(),
+            section.bucket.clone().unwrap_or_default(),
+            String::new(), // 模板：编辑时不重选
+            section.endpoint.clone().unwrap_or_default(),
+            section.region.clone().unwrap_or_default(),
+            section.access_key_id.clone().unwrap_or_default(),
+            String::new(), // SecretAccessKey
+            section.prefix.clone().unwrap_or_default(),
+            addressing.to_string(),
+            String::new(), // 会话令牌
+        ],
+    };
+    cx_tui::TuiBackendDraft { kind, values }
+}
+
+/// 保存"编辑已有后端"：位置字段以草稿为准，凭据字段留空则沿用旧值。
+fn update_draft_with_probe(
+    paths: &Paths,
+    original: &str,
+    draft: &cx_tui::TuiBackendDraft,
+    probe: impl FnOnce(&Paths, &Config, &cx_core::BackendSection) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    let mut config = Config::load(paths)?;
+    let index = config
+        .backends
+        .iter()
+        .position(|section| section.name == original)
+        .ok_or_else(|| {
+            DaemonError::Protocol(format!(
+                "没有名为 {original} 的后端（cx backend list 查看）"
+            ))
+        })?;
+    let old = config.backends[index].clone();
+    let (mut section, secrets) = draft_to_section(draft, false)?;
+    if section.name != old.name
+        && config
+            .backends
+            .iter()
+            .any(|other| other.name == section.name)
+    {
+        return Err(DaemonError::Protocol(format!(
+            "已经有名为 {} 的后端了",
+            section.name
+        )));
+    }
+    // 凭据：草稿留空就沿用旧文件，避免"改个前缀把密钥弄丢"
+    if section.secret_access_key_file.is_none() {
+        section.secret_access_key_file = old.secret_access_key_file.clone();
+        section.secret_access_key_env = old.secret_access_key_env.clone();
+    }
+    if section.session_token_file.is_none() {
+        section.session_token_file = old.session_token_file.clone();
+        section.session_token_env = old.session_token_env.clone();
+    }
+    if section.password_file.is_none() {
+        section.password_file = old.password_file.clone();
+        section.password_env = old.password_env.clone();
+    }
+    if section.token_file.is_none() {
+        section.token_file = old.token_file.clone();
+    }
+    if section.access_key_id.is_none() {
+        section.access_key_id = old.access_key_id.clone();
+    }
+    if section.username.is_none() {
+        section.username = old.username.clone();
+    }
+    if section.ca_file.is_none() {
+        section.ca_file = old.ca_file.clone();
+    }
+    section.enabled = old.enabled;
+    config.backends[index] = section.clone();
+    config.validate()?;
+    // 新的密钥（如果有）先落盘：探测需要读它
+    for (file, value) in &secrets {
+        write_secret_file(paths, file, value)?;
+    }
+    if let Err(err) = probe(paths, &config, &section) {
+        // 探测失败：新写的凭据删掉，配置保持原样
+        for (file, _) in &secrets {
+            let _ = std::fs::remove_file(paths.secret_file(file));
+        }
+        return Err(err);
+    }
+    config.save(paths)?;
+    Ok(())
+}
+/// Prepare and test a draft before committing configuration. Failures roll back secrets.
+fn add_backend_from_draft(
+    paths: &Paths,
+    draft: &cx_tui::TuiBackendDraft,
+) -> Result<(), DaemonError> {
+    add_draft_with_probe(paths, draft, probe_section)?;
+    restart_daemon(paths)
+}
+
+fn add_draft_with_probe(
+    paths: &Paths,
+    draft: &cx_tui::TuiBackendDraft,
+    probe: impl FnOnce(&Paths, &Config, &cx_core::BackendSection) -> Result<(), DaemonError>,
+) -> Result<(), DaemonError> {
+    use cx_tui::WizardKind;
+    let (section, secrets) = draft_to_section(draft, true)?;
+    let name = section.name.clone();
+    let mut config = Config::load(paths)?;
     validate_addition(&config, &section)?;
-    // Validate all core fields and duplicates before identity creation or enrollment.
+    let mut secrets = secrets;
     if draft.kind == WizardKind::Server {
         let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
         let token = cx_backend::enroll(
@@ -2950,6 +3132,105 @@ mod backend_tests {
         let _ = std::fs::remove_dir_all(&paths.config_dir);
     }
 
+    #[test]
+    fn 编辑后端时留空的密钥沿用现值且先探测后落盘() {
+        let paths = temp_paths("edit-keep-secret");
+        std::fs::create_dir_all(paths.secrets_dir()).unwrap();
+        // 先落一个后端（带密钥文件）
+        let mut config = Config::load_or_create(&paths).unwrap();
+        let mut section = empty_section("oss".to_string(), cx_core::BackendKind::S3);
+        section.bucket = Some("old-bucket".to_string());
+        section.endpoint = Some("https://oss-cn-beijing.aliyuncs.com".to_string());
+        section.region = Some("cn-beijing".to_string());
+        section.access_key_id = Some("ak".to_string());
+        section.prefix = Some("old".to_string());
+        section.path_style = Some(false);
+        section.secret_access_key_file = Some("oss.secret".to_string());
+        config.backends.push(section);
+        config.save(&paths).unwrap();
+        write_secret_file(&paths, "oss.secret", "keep-me").unwrap();
+
+        let draft = cx_tui::TuiBackendDraft {
+            kind: cx_tui::WizardKind::S3,
+            values: vec![
+                "oss".into(),
+                "new-bucket".into(),
+                String::new(),
+                "https://oss-cn-beijing.aliyuncs.com".into(),
+                "cn-beijing".into(),
+                "ak".into(),
+                String::new(), // 密钥留空 = 沿用
+                "new-prefix".into(),
+                "virtual-host".into(),
+                String::new(),
+            ],
+        };
+        let probed = std::cell::Cell::new(false);
+        update_draft_with_probe(&paths, "oss", &draft, |_, _, section| {
+            probed.set(true);
+            assert_eq!(section.prefix.as_deref(), Some("new-prefix"));
+            Ok(())
+        })
+        .unwrap();
+        assert!(probed.get(), "编辑也要先做连通性自测");
+
+        let saved = Config::load(&paths).unwrap();
+        let section = saved.backends.first().unwrap();
+        assert_eq!(section.bucket.as_deref(), Some("new-bucket"));
+        assert_eq!(section.prefix.as_deref(), Some("new-prefix"));
+        assert_eq!(
+            section.secret_access_key_file.as_deref(),
+            Some("oss.secret"),
+            "密钥字段留空必须沿用旧文件"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.secret_file("oss.secret")).unwrap(),
+            "keep-me"
+        );
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn 编辑探测失败时保持原配置() {
+        let paths = temp_paths("edit-probe-fail");
+        std::fs::create_dir_all(paths.secrets_dir()).unwrap();
+        let mut config = Config::load_or_create(&paths).unwrap();
+        let mut section = empty_section("oss".to_string(), cx_core::BackendKind::S3);
+        section.bucket = Some("old".to_string());
+        section.access_key_id = Some("ak".to_string());
+        section.secret_access_key_file = Some("oss.secret".to_string());
+        config.backends.push(section);
+        config.save(&paths).unwrap();
+        write_secret_file(&paths, "oss.secret", "keep-me").unwrap();
+        let before = std::fs::read_to_string(paths.config_file()).unwrap();
+
+        let draft = cx_tui::TuiBackendDraft {
+            kind: cx_tui::WizardKind::S3,
+            values: vec![
+                "oss".into(),
+                "new-bucket".into(),
+                String::new(),
+                String::new(),
+                "cn-beijing".into(),
+                "ak".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        };
+        let err = update_draft_with_probe(&paths, "oss", &draft, |_, _, _| {
+            Err(DaemonError::Protocol("连不上".to_string()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("连不上"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).unwrap(),
+            before,
+            "探测失败不该动配置"
+        );
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
     #[test]
     fn 添加_s3_后端时缺少密钥会被校验拦下() {
         let paths = temp_paths("add-s3");

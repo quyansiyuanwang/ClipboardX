@@ -289,6 +289,8 @@ pub struct Wizard {
     pub(crate) scroll: u16,
     pub(crate) max_scroll: u16,
     pub(crate) follow_focus: bool,
+    /// 编辑已有后端：密码类字段可以留空（留空 = 沿用库里的现值）。
+    edit_mode: bool,
 }
 
 impl Default for Wizard {
@@ -329,6 +331,7 @@ impl Wizard {
             scroll: 0,
             max_scroll: 0,
             follow_focus: true,
+            edit_mode: false,
         }
     }
 
@@ -374,6 +377,16 @@ impl Wizard {
     }
 
     /// 切到另一种类型。
+    /// 编辑已有后端时调用：密文字段可以留空（表示沿用现值）。
+    pub fn set_edit_mode(&mut self, editing: bool) {
+        self.edit_mode = editing;
+    }
+
+    /// 是否处于"编辑已有后端"模式。
+    pub fn edit_mode(&self) -> bool {
+        self.edit_mode
+    }
+
     pub fn set_kind(&mut self, index: usize) {
         if index < WizardKind::ALL.len() {
             self.kind_index = index;
@@ -601,8 +614,10 @@ impl Wizard {
                 let anonymous_password = self.kind() == WizardKind::Webdav
                     && field.label == "口令"
                     && self.value(2).trim().is_empty();
+                let keep_existing_secret = self.edit_mode && field.secret;
                 field.required()
                     && !anonymous_password
+                    && !keep_existing_secret
                     && if field.secret {
                         self.value(*index).is_empty()
                     } else {

@@ -66,6 +66,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(key) = &app.exported_key {
         draw_export_key(frame, area, key, app.exported_key_note.as_deref());
     }
+    if app.pending_import {
+        draw_confirm_space(frame, area, "配置目录里的整包", SpaceRisk::ImportBundle);
+    }
     if app.show_help {
         draw_help(frame, area, app);
     }
@@ -87,6 +90,8 @@ enum SpaceRisk {
     Rebuild,
     /// 等价重新 `cx space join`。
     Switch,
+    /// 从配置目录里的整包导入（覆盖本机配置、凭据与空间密钥）。
+    ImportBundle,
 }
 /// 危险动作的确认页：一行问题、一行后果、一行按键。不写教程。
 fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: SpaceRisk) {
@@ -101,6 +106,11 @@ fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: Sp
             " 换空间 ",
             format!("换掉本机空间？（{backend}）"),
             "当前空间与它的对象会留在原地，但不再使用",
+        ),
+        SpaceRisk::ImportBundle => (
+            " 导入整包 ",
+            format!("用 {backend} 覆盖本机配置？"),
+            "会替换 config.toml、凭据与空间密钥",
         ),
     };
     let inner_w = area.width.saturating_sub(2) as usize;
@@ -755,7 +765,10 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let label_w = form
         .fields()
         .iter()
-        .map(|field| display_width(field.label) + usize::from(field.required()))
+        .map(|field| {
+            let keep_existing = form.edit_mode() && field.secret;
+            display_width(field.label) + usize::from(field.required() && !keep_existing)
+        })
         .max()
         .unwrap_or(8)
         + 1;
@@ -815,10 +828,12 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         let anonymous = form.kind() == WizardKind::Webdav
             && field.label == "口令"
             && form.value(2).trim().is_empty();
+        // 编辑已有后端时，密文字段留空表示沿用现值——不该再打必填星号
+        let keep_existing = form.edit_mode() && field.secret;
         let label = format!(
             "{}{}",
             field.label,
-            if field.required() && !anonymous {
+            if field.required() && !anonymous && !keep_existing {
                 "*"
             } else {
                 ""
@@ -834,6 +849,8 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 choice.to_string()
             }
+        } else if field.secret && keep_existing && raw.is_empty() {
+            "留空 = 沿用".to_string()
         } else if field.secret {
             "●".repeat(raw.chars().count().min(room))
         } else {
@@ -992,7 +1009,13 @@ fn draw_wizard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" 添加后端 ")
+                    .title(
+                        if app.wizard.as_ref().is_some_and(|form| form.edit_mode()) {
+                            " 编辑后端 "
+                        } else {
+                            " 添加后端 "
+                        },
+                    )
                     .border_style(Style::default().fg(Color::Cyan)),
             )
             .scroll((scroll, 0)),
@@ -1203,7 +1226,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // 窄屏只留最常用的四个键：空格开关、a 添加、x 移除、Esc 关闭
         "  ↑↓ 选择　空格 开关　a 添加　x 移除　Esc 关闭"
     } else {
-        "  ↑↓ 选后端　空格 开关　x 移除　a 添加　s 建空间　i 加入　e 导出密钥　Esc 返回"
+        "  ↑↓ 选后端　空格 开关　a 添加　E 编辑　x 移除　s 建空间　i 加入　e 密钥　O 导出　I 导入　Esc 返回"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2317,6 +2340,46 @@ mod tests {
             assert!(has(&screen, "x"), "要提示可以导出：{screen}");
             assert!(has(&screen, "导出到文件"), "{screen}");
         }
+    }
+    #[test]
+    fn 编辑页标题是编辑且密文可以留空() {
+        let mut app = App::new();
+        let draft = crate::wizard::BackendDraft {
+            kind: crate::wizard::WizardKind::S3,
+            values: vec![
+                "oss".into(),
+                "clipboard-sync".into(),
+                String::new(),
+                "https://oss-cn-beijing.aliyuncs.com".into(),
+                "cn-beijing".into(),
+                "ak".into(),
+                String::new(),
+                "clip".into(),
+                "virtual-host".into(),
+                String::new(),
+            ],
+        };
+        let mut form = crate::wizard::Wizard::from_draft(&draft, String::new());
+        form.set_edit_mode(true);
+        app.wizard = Some(form);
+        app.wizard_edit_target = Some("oss".into());
+        let screen = render(&mut app, 110, 24);
+        assert!(
+            has(&screen, "编辑后端"),
+            "标题要说明是在改而不是新增：{screen}"
+        );
+        assert!(
+            !has(&screen, "SecretAccessKey*"),
+            "编辑时密钥留空表示沿用，不该标必填：{screen}"
+        );
+        assert!(has(&screen, "留空 = 沿用"), "{screen}");
+        // 表单本身也要能提交（密钥留空不再算缺失）
+        let submitted = app
+            .wizard
+            .as_mut()
+            .map(|form| form.submit())
+            .unwrap_or_else(|| panic!("表单应当存在"));
+        assert!(submitted.is_ok(), "编辑模式下密钥留空应可提交");
     }
     #[test]
     fn 安全与时间文案不误导() {

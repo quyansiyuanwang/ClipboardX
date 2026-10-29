@@ -57,6 +57,21 @@ pub enum TuiExit {
     ExportKey,
     /// 用户在密钥页上要把它写到文件里。
     ExportKeyToFile,
+    /// 用户要编辑某个后端。
+    EditBackend(String),
+    /// 用户提交了对已有后端的修改。
+    SaveBackend {
+        /// 原后端名。
+        original: String,
+        /// 表单结果。
+        draft: Box<BackendDraft>,
+    },
+    /// 用户要把空间元数据重新发布到某个后端。
+    PublishSpace(String),
+    /// 用户要导出整包。
+    ExportBundle,
+    /// 用户要导入整包。
+    ImportBundle,
     /// 用户在面板里要用密钥加入空间。
     JoinSpace {
         /// 后端名。
@@ -92,6 +107,16 @@ pub trait BackendAdmin {
     fn export_key(&mut self) -> Result<String, String>;
     /// 把空间密钥写到文件里，返回写到的路径（供界面回显）。
     fn write_key_file(&mut self) -> Result<String, String>;
+    /// 取某个后端的现值，做成表单草稿（用于"编辑"）。
+    fn edit_draft(&mut self, name: &str) -> Result<BackendDraft, String>;
+    /// 保存对已有后端的修改（含连通性自测）。
+    fn update(&mut self, original: &str, draft: &BackendDraft) -> Result<String, String>;
+    /// 把本机空间元数据重新发布到某后端（等价 `cx space publish`）。
+    fn publish_space(&mut self, backend: &str) -> Result<String, String>;
+    /// 整套配置导出到文件（等价 `cx config export`），返回路径。
+    fn export_bundle(&mut self) -> Result<String, String>;
+    /// 从文件导入整套配置（等价 `cx config import --force`），返回路径。
+    fn import_bundle(&mut self) -> Result<String, String>;
 }
 
 /// 进入全屏 TUI。
@@ -260,6 +285,65 @@ fn run_loop(
                         }
                         Some(handler) => match handler.export_key() {
                             Ok(key) => app.exported_key = Some(key),
+                            Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::EditBackend(name) => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::EditBackend(name);
+                            break;
+                        }
+                        Some(handler) => match handler.edit_draft(&name) {
+                            Ok(draft) => {
+                                let mut form = Wizard::from_draft(&draft, String::new());
+                                // 编辑：密文字段留空表示沿用现值，标题也要换成"编辑"
+                                form.set_edit_mode(true);
+                                app.wizard = Some(form);
+                                app.wizard_edit_target = Some(name);
+                            }
+                            Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::SaveBackend { original, draft } => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::SaveBackend { original, draft };
+                            break;
+                        }
+                        Some(handler) => {
+                            match handler.update(&original, &draft) {
+                                Ok(message) => app.note(message),
+                                Err(message) => app.warn(message),
+                            }
+                            app.show_panel = true;
+                        }
+                    },
+                    KeyOutcome::PublishSpace(backend) => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::PublishSpace(backend);
+                            break;
+                        }
+                        Some(handler) => match handler.publish_space(&backend) {
+                            Ok(message) => app.note(message),
+                            Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::ExportBundle => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::ExportBundle;
+                            break;
+                        }
+                        Some(handler) => match handler.export_bundle() {
+                            Ok(message) => app.note(message),
+                            Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::ImportBundle => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::ImportBundle;
+                            break;
+                        }
+                        Some(handler) => match handler.import_bundle() {
+                            Ok(message) => app.note(message),
                             Err(message) => app.warn(message),
                         },
                     },
@@ -537,6 +621,9 @@ mod tests {
         added: Vec<String>,
         spaces: Vec<String>,
         joins: Vec<(String, usize)>,
+        edited: Vec<String>,
+        updated: Vec<(String, String)>,
+        published: Vec<String>,
         fail_add: Option<&'static str>,
         fail_toggle: Option<&'static str>,
     }
@@ -581,6 +668,44 @@ mod tests {
 
         fn write_key_file(&mut self) -> Result<String, String> {
             Ok("/tmp/cx-space-key.txt".to_string())
+        }
+
+        fn edit_draft(&mut self, name: &str) -> Result<BackendDraft, String> {
+            self.edited.push(name.to_string());
+            Ok(BackendDraft {
+                kind: WizardKind::S3,
+                values: vec![
+                    "oss".into(),
+                    "b".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    "clip".into(),
+                    String::new(),
+                    String::new(),
+                ],
+            })
+        }
+
+        fn update(&mut self, original: &str, draft: &BackendDraft) -> Result<String, String> {
+            self.updated
+                .push((original.to_string(), draft.name().to_string()));
+            Ok(format!("已保存 {original}"))
+        }
+
+        fn publish_space(&mut self, backend: &str) -> Result<String, String> {
+            self.published.push(backend.to_string());
+            Ok(format!("已把空间元数据发布到 {backend}"))
+        }
+
+        fn export_bundle(&mut self) -> Result<String, String> {
+            Ok("/tmp/clipboardx-bundle.json".to_string())
+        }
+
+        fn import_bundle(&mut self) -> Result<String, String> {
+            Ok("已导入".to_string())
         }
     }
 

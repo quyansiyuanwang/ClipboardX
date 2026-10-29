@@ -39,16 +39,17 @@
 | `cx space join --passphrase-stdin` | `b` → `i`（持有旧空间时先确认） | 是 | 是 |
 | `cx space join --key-stdin` | `b` → `i`（输入页支持 Ctrl+V 粘贴） | 是 | 是 |
 | `cx space export-key` | `b` → `e`；密钥页 `x` 导出到文件 | — | — |
+| `cx backend edit` | `b` → `E`（表单预填现值；密文留空 = 沿用） | — | — |
+| `cx space publish` | `b` → `P`（重发空间元数据，排障用） | — | — |
+| `cx config export` | `b` → `O`（写到配置目录的 `clipboardx-bundle.json`） | — | — |
+| `cx config import` | `b` → `I` | 是（覆盖配置/凭据/密钥） | 是 |
 | 退出界面 | `q` | — | — |
 
 ### 2.2 尚未对等（明确的待办，不是"设计如此"）
 
 | CLI | 状态 | 说明 |
 |---|---|---|
-| `cx config export` / `cx config import` | **待补** | 面板里应有"导出整包 / 导入整包"；输入路径需要通用输入页 |
-| `cx backend edit` | **待补** | 面板里对选中行按 `E` 进入表单（预填现值），复用 `a` 的表单 |
 | `cx config get/set/show/path/check` | **待补** | 需要通用"键值"页；`set` 的键名白名单已在 `config_cmd` 里，可直接复用 |
-| `cx space publish` | 待定 | 建空间时已自动 publish；单独重发只在排障时用，可归入 `b` 面板的 `r` 或诊断动作 |
 | `cx stop` / `cx restart` | 待定 | 退出界面等于结束本地客户端，但守护进程仍在跑；是否在界面里提供"停止/重启守护进程"需要产品决定（影响后台同步） |
 
 ### 2.3 明确的例外（不需要对等）
