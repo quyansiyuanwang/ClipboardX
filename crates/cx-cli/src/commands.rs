@@ -789,6 +789,22 @@ impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
             .ok_or_else(|| "该空间未加密，没有密钥".to_string())
     }
 
+    /// 密钥页按 x：把空间密钥写进一个只有本人可读的文件，返回路径。
+    ///
+    /// 为什么不是"复制到剪贴板"：剪贴板本身就是被同步的东西，把主密钥放进去
+    /// 等于把它写进本机历史并上传到每个后端——这是最不该做的搬法。
+    fn write_key_file(&mut self) -> Result<String, String> {
+        let key = self.export_key()?;
+        let path = self.paths.config_dir.join("space-key.txt");
+        cx_core::fsutil::write_atomic(&path, key.as_bytes()).map_err(|err| err.to_string())?;
+        // 0600：这个文件等价于空间密钥本身
+        cx_core::fsutil::tighten_permissions(&path, false).map_err(|err| err.to_string())?;
+        Ok(format!(
+            "{}（权限 0600，用 `cat` 或文本编辑器打开；用完请删除）",
+            path.display()
+        ))
+    }
+
     /// 面板里按 i：用空间密钥加入已有空间（先试解远端条目验证密钥）。
     fn join_space(&mut self, backend: &str, key: &str) -> Result<String, String> {
         let parsed = parse_space_key(key).map_err(|err| err.to_string())?;

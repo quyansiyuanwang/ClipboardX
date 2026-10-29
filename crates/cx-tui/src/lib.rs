@@ -55,6 +55,8 @@ pub enum TuiExit {
     CreateSpace(String),
     /// 用户在面板里要导出空间密钥。
     ExportKey,
+    /// 用户在密钥页上要把它写到文件里。
+    ExportKeyToFile,
     /// 用户在面板里要用密钥加入空间。
     JoinSpace {
         /// 后端名。
@@ -88,6 +90,8 @@ pub trait BackendAdmin {
     fn join_space(&mut self, backend: &str, key: &str) -> Result<String, String>;
     /// 导出空间密钥（等价于 `cx space export-key`）。返回 64 位十六进制。
     fn export_key(&mut self) -> Result<String, String>;
+    /// 把空间密钥写到文件里，返回写到的路径（供界面回显）。
+    fn write_key_file(&mut self) -> Result<String, String>;
 }
 
 /// 进入全屏 TUI。
@@ -257,6 +261,18 @@ fn run_loop(
                         Some(handler) => match handler.export_key() {
                             Ok(key) => app.exported_key = Some(key),
                             Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::ExportKeyToFile => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::ExportKeyToFile;
+                            break;
+                        }
+                        Some(handler) => match handler.write_key_file() {
+                            Ok(path) => app.exported_key_note = Some(format!("已写入 {path}")),
+                            Err(message) => {
+                                app.exported_key_note = Some(format!("写入失败：{message}"))
+                            }
                         },
                     },
                     KeyOutcome::CreateSpace { backend, force } => match admin.as_deref_mut() {
@@ -561,6 +577,10 @@ mod tests {
 
         fn export_key(&mut self) -> Result<String, String> {
             Ok("a".repeat(64))
+        }
+
+        fn write_key_file(&mut self) -> Result<String, String> {
+            Ok("/tmp/cx-space-key.txt".to_string())
         }
     }
 

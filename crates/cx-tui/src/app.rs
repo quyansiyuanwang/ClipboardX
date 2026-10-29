@@ -62,6 +62,8 @@ pub enum KeyOutcome {
     },
     /// 导出空间密钥（`cx space export-key` 的等价物）。
     ExportKey,
+    /// 把空间密钥写到文件里（密钥页上按 x）。
+    ExportKeyToFile,
     /// 用空间密钥加入已有空间（面板里按 j 并输入密钥）。
     JoinSpace {
         /// 后端名。
@@ -193,6 +195,8 @@ pub struct App {
     pub pending_space_switch: Option<String>,
     /// 导出出来的空间密钥（`e`）：单独一页展示，不在提示行里塞 64 个字符。
     pub exported_key: Option<String>,
+    /// 密钥页上"导出到文件"的结果（成功路径或错误），显示在同一页里。
+    pub exported_key_note: Option<String>,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
     pub doctor: Option<DoctorReport>,
     /// 面板内独立错误，避免失败后永远显示读取中。
@@ -774,10 +778,17 @@ impl App {
                 }
             };
         }
-        // 空间密钥展示页：任意键返回
+        // 空间密钥展示页：x 导出到文件（剪贴板不能用来搬密钥——它本身就会被同步），
+        // 其他任意键返回。
         if self.exported_key.is_some() {
-            self.exported_key = None;
-            return KeyOutcome::None;
+            return match key.code {
+                KeyCode::Char('x') | KeyCode::Char('X') => KeyOutcome::ExportKeyToFile,
+                _ => {
+                    self.exported_key = None;
+                    self.exported_key_note = None;
+                    KeyOutcome::None
+                }
+            };
         }
 
         // 移除后端的确认：只有 y/回车 才真的移除
@@ -2331,10 +2342,20 @@ mod tests {
         ))));
         app.on_key(key(KeyCode::Char('b')));
         assert_eq!(app.on_key(key(KeyCode::Char('e'))), KeyOutcome::ExportKey);
-        // 展示页任意键返回
+        // 展示页：x 导出到文件（不是复制到剪贴板——剪贴板会被同步出去）
         app.exported_key = Some("a".repeat(64));
-        assert_eq!(app.on_key(key(KeyCode::Char('x'))), KeyOutcome::None);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('x'))),
+            KeyOutcome::ExportKeyToFile
+        );
+        assert!(
+            app.exported_key.is_some(),
+            "导出后仍停在密钥页，好让用户看到路径"
+        );
+        // 其他任意键返回
+        assert_eq!(app.on_key(key(KeyCode::Esc)), KeyOutcome::None);
         assert!(app.exported_key.is_none());
+        assert!(app.exported_key_note.is_none(), "返回时要清掉导出结果");
     }
     #[test]
     fn 面板里按_i_进入加入空间的输入态() {

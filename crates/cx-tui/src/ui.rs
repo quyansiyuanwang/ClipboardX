@@ -64,7 +64,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_confirm_space(frame, area, backend, SpaceRisk::Switch);
     }
     if let Some(key) = &app.exported_key {
-        draw_export_key(frame, area, key);
+        draw_export_key(frame, area, key, app.exported_key_note.as_deref());
     }
     if app.show_help {
         draw_help(frame, area, app);
@@ -145,25 +145,37 @@ fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: Sp
 }
 
 /// 空间密钥展示页（`cx space export-key` 的等价物）。
-fn draw_export_key(frame: &mut Frame<'_>, area: Rect, key: &str) {
+///
+/// 密钥是 64 个十六进制字符，窄终端里一行放不下——按显示列**折行**，而不是截断：
+/// 截断的密钥看着像完整的，抄走才发现少了几位（用户实测踩过）。
+fn draw_export_key(frame: &mut Frame<'_>, area: Rect, key: &str, note: Option<&str>) {
     let popup = area;
     frame.render_widget(Clear, popup);
     let inner_w = popup.width.saturating_sub(2) as usize;
-    let indent = " ".repeat(inner_w.saturating_sub(inner_w.min(76)) / 2);
-    let lines = vec![
+    let content_w = inner_w.min(76);
+    let content_w_u16 = content_w as u16;
+    let indent = " ".repeat(inner_w.saturating_sub(content_w) / 2);
+    // 左边留一格内边距，密钥按剩余宽度折行
+    let key_w = content_w.saturating_sub(1).max(8);
+    let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("{indent}空间密钥"),
+            format!("{indent}空间密钥（共 {} 位十六进制）", key.chars().count()),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(vec![
+    ];
+    let key_style = Style::default().fg(Color::White).bg(Color::Indexed(238));
+    for chunk in key.as_bytes().chunks(key_w) {
+        let text = String::from_utf8_lossy(chunk);
+        // 右侧补齐底色，让整块看起来是一个整体
+        let pad = key_w.saturating_sub(display_width(&text));
+        lines.push(Line::from(vec![
             Span::raw(format!("{indent} ")),
-            Span::styled(
-                key.to_string(),
-                Style::default().fg(Color::White).bg(Color::Indexed(238)),
-            ),
-        ]),
+            Span::styled(format!("{text}{}", " ".repeat(pad)), key_style),
+        ]));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             format!("{indent}任何人拿到它都能解开你的剪贴板内容。"),
@@ -174,11 +186,30 @@ fn draw_export_key(frame: &mut Frame<'_>, area: Rect, key: &str) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("{indent}任意键返回"),
+        Line::from(vec![
+            Span::styled("  x", Style::default().fg(Color::Yellow)),
+            Span::raw("  导出到文件（0600）　　"),
+            Span::styled("其他任意键", Style::default().fg(Color::DarkGray)),
+            Span::raw("  返回"),
+        ]),
+    ]);
+    if let Some(note) = note {
+        lines.extend(wrapped_lines(
+            Text::from(Line::from(Span::styled(
+                note.to_string(),
+                Style::default().fg(Color::Green),
+            ))),
+            content_w_u16,
+        ));
+    }
+    // 剪贴板不能用来搬密钥：它本身就是被同步的东西。
+    lines.extend(wrapped_lines(
+        Text::from(Line::from(Span::styled(
+            "剪贴板不能用来搬密钥：剪贴板内容会被同步到所有设备与历史里。",
             Style::default().fg(Color::DarkGray),
-        )),
-    ];
+        ))),
+        content_w_u16,
+    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
             Block::default()
@@ -2329,6 +2360,23 @@ mod tests {
         assert!(has(&screen, "‹ 路径式 ›"), "{screen}");
     }
 
+    #[test]
+    fn 密钥页完整显示_64_位并提供导出() {
+        let key = "e388b01b".to_string() + &"a1b2c3d4".repeat(7);
+        assert_eq!(key.chars().count(), 64);
+        for (w, h) in [(100u16, 20u16), (56, 18)] {
+            let mut app = App::new();
+            app.show_panel = true;
+            app.exported_key = Some(key.clone());
+            let screen = render(&mut app, w, h);
+            // 完整：每一段拼接起来必须等于原文（折行不能丢字符）
+            let joined: String = screen.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            assert!(joined.contains(&key), "{w}x{h} 下密钥被截断了：{screen}");
+            assert!(has(&screen, "共 64 位十六进制"), "{screen}");
+            assert!(has(&screen, "x"), "要提示可以导出：{screen}");
+            assert!(has(&screen, "导出到文件"), "{screen}");
+        }
+    }
     #[test]
     fn 安全与时间文案不误导() {
         assert!(absolute_time(1_759_323_998_000).ends_with("UTC"));
