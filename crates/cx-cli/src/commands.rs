@@ -1599,9 +1599,9 @@ fn update_draft_with_probe(
         section.password_file = old.password_file.clone();
         section.password_env = old.password_env.clone();
     }
-    if section.token_file.is_none() {
-        section.token_file = old.token_file.clone();
-    }
+    // 设备令牌与后端名字无关，且改名后新名字的令牌文件根本不存在——必须沿用旧的，
+    // 否则改名会把一个能用的服务端后端变成"缺令牌"的坏配置。
+    section.token_file = old.token_file.clone().or(section.token_file);
     if section.access_key_id.is_none() {
         section.access_key_id = old.access_key_id.clone();
     }
@@ -3333,6 +3333,39 @@ mod backend_tests {
             saved.backends[0].secret_access_key_file.as_deref(),
             Some("oss2.secret")
         );
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+    #[test]
+    fn 服务端后端改名后仍沿用旧令牌文件() {
+        let paths = temp_paths("edit-server-rename");
+        std::fs::create_dir_all(paths.secrets_dir()).unwrap();
+        let mut config = Config::load_or_create(&paths).unwrap();
+        let mut section = empty_section("srv".to_string(), cx_core::BackendKind::Server);
+        section.url = Some("https://example.invalid".to_string());
+        section.space = Some("home".to_string());
+        section.token_file = Some("srv.token".to_string());
+        config.backends.push(section);
+        config.save(&paths).unwrap();
+        write_secret_file(&paths, "srv.token", "dev-token").unwrap();
+
+        let draft = cx_tui::TuiBackendDraft {
+            kind: cx_tui::WizardKind::Server,
+            values: vec![
+                "srv2".into(),
+                "https://example.invalid".into(),
+                "home".into(),
+                String::new(),
+            ],
+        };
+        update_draft_with_probe(&paths, "srv", &draft, |_, _, _| Ok(())).unwrap();
+        let saved = Config::load(&paths).unwrap();
+        assert_eq!(saved.backends[0].name, "srv2");
+        assert_eq!(
+            saved.backends[0].token_file.as_deref(),
+            Some("srv.token"),
+            "令牌与名字无关，改名后必须仍指向能用的那个文件"
+        );
+        assert!(paths.secret_file("srv.token").exists());
         let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
     }
     #[test]
