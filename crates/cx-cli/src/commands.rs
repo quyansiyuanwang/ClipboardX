@@ -1612,6 +1612,29 @@ fn update_draft_with_probe(
         return Err(err);
     }
     config.save(paths)?;
+    // 改名后旧名字的凭据文件不会再被引用：删掉，别把旧密钥留在磁盘上
+    if section.name != old.name {
+        for file in [
+            old.secret_access_key_file.as_deref(),
+            old.session_token_file.as_deref(),
+            old.password_file.as_deref(),
+            old.token_file.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // 只删确实不再被任何后端引用的
+            let still_used = config.backends.iter().any(|other| {
+                other.secret_access_key_file.as_deref() == Some(file)
+                    || other.session_token_file.as_deref() == Some(file)
+                    || other.password_file.as_deref() == Some(file)
+                    || other.token_file.as_deref() == Some(file)
+            });
+            if !still_used {
+                let _ = std::fs::remove_file(paths.secret_file(file));
+            }
+        }
+    }
     Ok(())
 }
 /// Prepare and test a draft before committing configuration. Failures roll back secrets.
@@ -3222,6 +3245,52 @@ mod backend_tests {
         let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
     }
 
+    #[test]
+    fn 后端改名后旧凭据文件会被清掉() {
+        let paths = temp_paths("edit-rename");
+        std::fs::create_dir_all(paths.secrets_dir()).unwrap();
+        let mut config = Config::load_or_create(&paths).unwrap();
+        let mut section = empty_section("oss".to_string(), cx_core::BackendKind::S3);
+        section.bucket = Some("b".to_string());
+        section.access_key_id = Some("ak".to_string());
+        section.secret_access_key_file = Some("oss.secret".to_string());
+        config.backends.push(section);
+        config.save(&paths).unwrap();
+        write_secret_file(&paths, "oss.secret", "old-key").unwrap();
+
+        let draft = cx_tui::TuiBackendDraft {
+            kind: cx_tui::WizardKind::S3,
+            values: vec![
+                "oss2".into(),
+                "b".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "ak".into(),
+                "new-key".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        };
+        update_draft_with_probe(&paths, "oss", &draft, |_, _, _| Ok(())).unwrap();
+
+        assert!(
+            !paths.secret_file("oss.secret").exists(),
+            "改名后旧密钥文件必须删掉，不能永久留在磁盘上"
+        );
+        assert!(
+            paths.secret_file("oss2.secret").exists(),
+            "新名字的密钥要落盘"
+        );
+        let saved = Config::load(&paths).unwrap();
+        assert_eq!(saved.backends[0].name, "oss2");
+        assert_eq!(
+            saved.backends[0].secret_access_key_file.as_deref(),
+            Some("oss2.secret")
+        );
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
     #[test]
     fn 编辑探测失败时保持原配置() {
         let paths = temp_paths("edit-probe-fail");

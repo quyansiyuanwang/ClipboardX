@@ -761,6 +761,13 @@ impl App {
         }
     }
 
+    /// 关掉表单：**同时清掉编辑目标**。漏掉这一步会导致"取消编辑后再新增"被当成
+    /// 保存修改，把之前那个后端覆盖掉（实测过的坑，别再拆开写）。
+    fn close_wizard(&mut self) {
+        self.wizard = None;
+        self.wizard_edit_target = None;
+    }
+
     /// 表单提交后该"新增"还是"保存修改"：由 `wizard_edit_target` 决定。
     pub(crate) fn backend_outcome(&mut self, draft: crate::wizard::BackendDraft) -> KeyOutcome {
         match self.wizard_edit_target.take() {
@@ -778,7 +785,7 @@ impl App {
             .as_ref()
             .is_some_and(|form| form.focus() == Focus::Cancel)
         {
-            self.wizard = None;
+            self.close_wizard();
             self.note("已取消，未做任何改动");
             return KeyOutcome::None;
         }
@@ -1018,7 +1025,7 @@ impl App {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let outcome = match key.code {
                 KeyCode::Esc => {
-                    self.wizard = None;
+                    self.close_wizard();
                     self.note("已取消，未做任何改动");
                     KeyOutcome::None
                 }
@@ -2567,6 +2574,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn 取消编辑后再新增不会被当成保存修改() {
+        let mut app = App::new();
+        app.wizard = Some(crate::wizard::Wizard::new());
+        app.wizard_edit_target = Some("oss".to_string());
+        // Esc 关掉表单
+        assert_eq!(app.on_key(key(KeyCode::Esc)), KeyOutcome::None);
+        assert!(app.wizard.is_none());
+        assert!(
+            app.wizard_edit_target.is_none(),
+            "取消编辑必须清掉编辑目标，否则下一次新增会覆盖那个后端"
+        );
+        // 之后新增照旧是新后端
+        let draft = crate::wizard::BackendDraft {
+            kind: crate::wizard::WizardKind::S3,
+            values: vec!["home".into(); 10],
+        };
+        assert!(matches!(
+            app.backend_outcome(draft),
+            KeyOutcome::AddBackend(_)
+        ));
+    }
     #[test]
     fn 面板里按大写c打开配置页() {
         let mut app = App::new();

@@ -186,7 +186,7 @@ fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: Sp
         ),
         SpaceRisk::Restart => (
             " 重启守护进程 ",
-            format!("重启守护进程（{backend}）？"),
+            "重启守护进程？".to_string(),
             "同步会中断几秒",
         ),
     };
