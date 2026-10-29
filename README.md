@@ -233,6 +233,7 @@ bash packaging/linux/build-deb.sh      # 需要 dpkg-deb
 |---|---|
 | [docs/protocol.md](docs/protocol.md) | 对象布局 v1、item 容器格式、同步算法、回声抑制、控制协议、服务端 REST、局域网协议 |
 | [docs/packaging.md](docs/packaging.md) | MSI / DMG / deb 构建方式、三端自启机制、签名与公证、发布流程 |
+| [docs/parity.md](docs/parity.md) | **界面与命令行的功能对等规则**、对等清单、待补项、新增能力落地清单 |
 
 ## 许可证
 
