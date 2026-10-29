@@ -80,57 +80,47 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// 已有空间时的两个危险动作的确认页。
+/// 危险动作的两种确认：重建空间 / 换空间。
 #[derive(Debug, Clone, Copy)]
 enum SpaceRisk {
-    /// 重建空间（等价 `cx space init --force`）：换新密钥，旧对象永久打不开。
+    /// 等价 `cx space init --force`。
     Rebuild,
-    /// 换到别的空间（等价重新 `cx space join`）：当前空间的对象同样解不开了。
+    /// 等价重新 `cx space join`。
     Switch,
 }
-
+/// 危险动作的确认页：一行问题、一行后果、一行按键。不写教程。
 fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: SpaceRisk) {
-    let popup = area;
-    frame.render_widget(Clear, popup);
-    let (title, question, consequences) = match risk {
+    frame.render_widget(Clear, area);
+    let (title, question, consequence) = match risk {
         SpaceRisk::Rebuild => (
-            " 确认重建空间 ",
-            format!("在本机重建加密空间（并上传到 {backend}）？"),
-            [
-                "会生成新的空间密钥：已上传到云端的对象仍然收得回来，但再也解不开。",
-                "如果只是想换机器同步，应该用 i 拿另一台设备的密钥加入，而不是重建。",
-            ],
+            " 重建空间 ",
+            format!("重建加密空间？（{backend}）"),
+            "旧密钥作废：已上传的对象再也解不开",
         ),
         SpaceRisk::Switch => (
-            " 确认换空间 ",
-            format!("用另一个空间的密钥覆盖本机空间（{backend}）？"),
-            [
-                "本机当前空间与它的对象会留在原地，但不会再被使用/解不开。",
-                "换过去之后，本机历史里旧空间的条目仍在，只是不再参与同步。",
-            ],
+            " 换空间 ",
+            format!("换掉本机空间？（{backend}）"),
+            "当前空间与它的对象会留在原地，但不再使用",
         ),
     };
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let indent = " ".repeat(inner_w.saturating_sub(inner_w.min(76)) / 2);
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  {question}"),
+            format!("{indent}{question}"),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(""),
         Line::from(Span::styled(
-            format!("  {}", consequences[0]),
+            format!("{indent}{consequence}"),
             Style::default().fg(Color::Yellow),
-        )),
-        Line::from(Span::styled(
-            format!("  {}", consequences[1]),
-            Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  y / 回车", Style::default().fg(Color::Yellow)),
-            Span::raw("  继续　　"),
-            Span::styled("其他任意键", Style::default().fg(Color::DarkGray)),
-            Span::raw("  取消"),
+            Span::styled(format!("{indent}y"), Style::default().fg(Color::Yellow)),
+            Span::raw(" 继续　"),
+            Span::styled("其他键", Style::default().fg(Color::DarkGray)),
+            Span::raw(" 取消"),
         ]),
     ];
     frame.render_widget(
@@ -140,151 +130,100 @@ fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: Sp
                 .title(title)
                 .border_style(Style::default().fg(Color::Yellow)),
         ),
-        popup,
+        area,
     );
 }
 
-/// 空间密钥展示页（`cx space export-key` 的等价物）。
-///
-/// 密钥是 64 个十六进制字符，窄终端里一行放不下——按显示列**折行**，而不是截断：
-/// 截断的密钥看着像完整的，抄走才发现少了几位（用户实测踩过）。
+/// 空间密钥页：只有密钥与一行按键。长密钥按显示列折行，绝不截断。
 fn draw_export_key(frame: &mut Frame<'_>, area: Rect, key: &str, note: Option<&str>) {
-    let popup = area;
-    frame.render_widget(Clear, popup);
-    let inner_w = popup.width.saturating_sub(2) as usize;
+    frame.render_widget(Clear, area);
+    let inner_w = area.width.saturating_sub(2) as usize;
     let content_w = inner_w.min(76);
-    let content_w_u16 = content_w as u16;
     let indent = " ".repeat(inner_w.saturating_sub(content_w) / 2);
-    // 左边留一格内边距，密钥按剩余宽度折行
     let key_w = content_w.saturating_sub(1).max(8);
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{indent}空间密钥（共 {} 位十六进制）", key.chars().count()),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    let key_style = Style::default().fg(Color::White).bg(Color::Indexed(238));
+    let style = Style::default().fg(Color::White).bg(Color::Indexed(238));
+    let mut lines = vec![Line::from("")];
     for chunk in key.as_bytes().chunks(key_w) {
         let text = String::from_utf8_lossy(chunk);
-        // 右侧补齐底色，让整块看起来是一个整体
         let pad = key_w.saturating_sub(display_width(&text));
         lines.push(Line::from(vec![
             Span::raw(format!("{indent} ")),
-            Span::styled(format!("{text}{}", " ".repeat(pad)), key_style),
+            Span::styled(format!("{text}{}", " ".repeat(pad)), style),
         ]));
     }
-    lines.extend([
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{indent}任何人拿到它都能解开你的剪贴板内容。"),
-            Style::default().fg(Color::Yellow),
-        )),
-        Line::from(Span::styled(
-            format!("{indent}新设备用它加入：cx space join <后端> --key-stdin"),
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  x", Style::default().fg(Color::Yellow)),
-            Span::raw("  导出到文件（0600）　　"),
-            Span::styled("其他任意键", Style::default().fg(Color::DarkGray)),
-            Span::raw("  返回"),
-        ]),
-    ]);
+    lines.push(Line::from(""));
     if let Some(note) = note {
-        lines.extend(wrapped_lines(
-            Text::from(Line::from(Span::styled(
-                note.to_string(),
-                Style::default().fg(Color::Green),
-            ))),
-            content_w_u16,
-        ));
+        lines.push(Line::from(Span::styled(
+            format!("{indent}{note}"),
+            Style::default().fg(Color::Green),
+        )));
+        lines.push(Line::from(""));
     }
-    // 剪贴板不能用来搬密钥：它本身就是被同步的东西。
-    lines.extend(wrapped_lines(
-        Text::from(Line::from(Span::styled(
-            "剪贴板不能用来搬密钥：剪贴板内容会被同步到所有设备与历史里。",
-            Style::default().fg(Color::DarkGray),
-        ))),
-        content_w_u16,
-    ));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{indent}x"), Style::default().fg(Color::Yellow)),
+        Span::raw(" 导出到文件　"),
+        Span::styled("其他键", Style::default().fg(Color::DarkGray)),
+        Span::raw(" 返回"),
+    ]));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 空间密钥 ")
+                .title(format!(" 空间密钥（{} 位） ", key.chars().count()))
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
-        popup,
+        area,
     );
 }
-/// 用空间密钥加入已有空间：一个整屏的输入页，只有一行输入框。
-///
-/// 为什么单独一页而不是塞进"添加后端"表单：加入空间既不是改后端、也不是改配置，
-/// 它只做一件事——把另一台设备已经能解密的密钥搬过来。
+
+/// 加入空间：一行后端、一行密钥输入、一行进度、一行按键。
 fn draw_join_space(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let popup = area;
-    app.modal_rect = popup;
-    frame.render_widget(Clear, popup);
-    let inner = Rect::new(
-        popup.x.saturating_add(1),
-        popup.y.saturating_add(1),
-        popup.width.saturating_sub(2),
-        popup.height.saturating_sub(2),
-    );
+    app.modal_rect = area;
+    frame.render_widget(Clear, area);
     let Some((backend, typed)) = app.join_space.clone() else {
         return;
     };
-    let content_w = inner.width.min(76) as usize;
-    let indent = " ".repeat((inner.width as usize).saturating_sub(content_w) / 2);
-    let typed_short = if typed.chars().count() > 32 {
-        // 密钥太长，只回显尾部，避免超过一屏
-        typed
-            .chars()
-            .skip(typed.chars().count() - 32)
-            .collect::<String>()
+    const LABEL_W: usize = 6;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let content_w = inner_w.min(76);
+    let indent = " ".repeat(inner_w.saturating_sub(content_w) / 2);
+    let count = typed.chars().count();
+    let shown: String = if count > 40 {
+        typed.chars().skip(count - 40).collect()
     } else {
         typed.clone()
     };
+    let label = |text: &str| {
+        Span::styled(
+            format!("{indent}{}", pad_display(text, LABEL_W)),
+            Style::default().fg(Color::Cyan),
+        )
+    };
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled(
-            format!("{indent}用空间密钥加入 {backend} 上的空间"),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{indent}在已加入的设备上执行 cx space export-key，把打印出来的"),
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            format!("{indent}64 位十六进制粘到这里（只接受 0-9a-f）："),
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
+        Line::from(vec![label("后端"), Span::raw(backend)]),
         Line::from(vec![
-            Span::raw(format!("{indent} ")),
+            label("密钥"),
             Span::styled(
-                format!("{typed_short}▏"),
+                format!("{shown}▏"),
                 Style::default().fg(Color::White).bg(Color::Indexed(238)),
             ),
         ]),
-        Line::from(""),
         Line::from(Span::styled(
-            format!("{indent}已输入 {} / 64 位", typed.chars().count().min(64)),
-            Style::default().fg(if typed.chars().count() == 64 {
+            format!("{indent}{}{} / 64", " ".repeat(LABEL_W), count.min(64)),
+            Style::default().fg(if count == 64 {
                 Color::Green
             } else {
                 Color::DarkGray
             }),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("{indent}回车 加入　Esc 取消　（加入成功后守护进程会自动重启）"),
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(vec![
+            Span::styled(format!("{indent}回车"), Style::default().fg(Color::Yellow)),
+            Span::raw(" 加入　"),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+            Span::raw(" 取消"),
+        ]),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
@@ -293,7 +232,7 @@ fn draw_join_space(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 .title(" 加入空间 ")
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
-        popup,
+        area,
     );
 }
 /// 移除后端的确认：与删除历史条目一样，破坏性操作默认"不删"。
@@ -2372,7 +2311,7 @@ mod tests {
             // 完整：每一段拼接起来必须等于原文（折行不能丢字符）
             let joined: String = screen.chars().filter(|c| c.is_ascii_hexdigit()).collect();
             assert!(joined.contains(&key), "{w}x{h} 下密钥被截断了：{screen}");
-            assert!(has(&screen, "共 64 位十六进制"), "{screen}");
+            assert!(has(&screen, "64 位"), "要标出长度：{screen}");
             assert!(has(&screen, "x"), "要提示可以导出：{screen}");
             assert!(has(&screen, "导出到文件"), "{screen}");
         }
