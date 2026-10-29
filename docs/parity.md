@@ -31,7 +31,7 @@
 | `cx reload` | `R` | — | — |
 | `cx backend list` | `b` 面板表格 | — | — |
 | `cx backend add` | `b` → `a`（表单 + 真实连通性自测） | — | — |
-| `cx backend test` | 同 `a`：保存前必测 | — | — |
+| `cx backend test` | `b` → `T`（只读探测选中后端）；`a`/`E` 保存前也会自动测 | — | — |
 | `cx backend remove` | `b` → `x` | 是 | 是 |
 | 启用/停用后端 | `b` → `空格` / `t` | — | — |
 | `cx space init` | `b` → `s` | 是（换密钥） | 是 |

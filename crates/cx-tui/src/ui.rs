@@ -1313,7 +1313,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // 窄屏只留最常用的四个键：空格开关、a 添加、x 移除、Esc 关闭
         "  ↑↓ 选择　空格 开关　a 添加　x 移除　Esc 关闭"
     } else {
-        "  ↑↓ 选后端　空格 开关　a 添加　E 编辑　x 移除　s 建空间　i 加入　e 密钥　C 配置　O 导出　I 导入　R 重启　Esc 返回"
+        "  ↑↓ 选后端　空格 开关　a 添加　E 编辑　x 移除　s 建空间　i 加入　e 密钥　T 测试　C 配置　O 导出　I 导入　R 重启　Esc 返回"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(

@@ -90,6 +90,8 @@ pub enum KeyOutcome {
     },
     /// 重启守护进程（面板里按 R，已确认）。
     RestartDaemon,
+    /// 只读探测某个后端（面板里按 T）。
+    TestBackend(String),
     /// 用空间密钥加入已有空间（面板里按 j 并输入密钥）。
     JoinSpace {
         /// 后端名。
@@ -1233,6 +1235,14 @@ impl App {
                     Some(name) => KeyOutcome::PublishSpace(name),
                     None => {
                         self.warn("没有可发布的后端");
+                        KeyOutcome::None
+                    }
+                },
+                // T：只读探测选中后端（等价 cx backend test）
+                KeyCode::Char('T') => match self.selected_backend() {
+                    Some(name) => KeyOutcome::TestBackend(name),
+                    None => {
+                        self.warn("没有可测试的后端");
                         KeyOutcome::None
                     }
                 },
@@ -2595,6 +2605,19 @@ mod tests {
             app.backend_outcome(draft),
             KeyOutcome::AddBackend(_)
         ));
+    }
+    #[test]
+    fn 面板里按大t测试选中后端() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('T'))),
+            KeyOutcome::TestBackend("oss".to_string())
+        );
     }
     #[test]
     fn 面板里按大写c打开配置页() {

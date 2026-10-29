@@ -830,6 +830,10 @@ struct TuiBackendAdmin<'a> {
 }
 
 impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
+    /// 面板里按 T：只读探测选中后端（等价 `cx backend test`）。
+    fn test_backend(&mut self, name: &str) -> Result<String, String> {
+        test_backend_summary(self.paths, name).map_err(|err| err.to_string())
+    }
     /// 面板里按 C：列出可设置的配置项（键名 + 当前值）。
     fn config_items(&mut self) -> Result<Vec<(String, String)>, String> {
         let config = Config::load(self.paths).map_err(|err| err.to_string())?;
@@ -1621,7 +1625,13 @@ fn update_draft_with_probe(
         }
         return Err(err);
     }
-    config.save(paths)?;
+    if let Err(err) = config.save(paths) {
+        // 配置没写成功：新写的凭据也要撤掉，别留下"有密钥没配置"的半套状态
+        for (file, _) in &secrets {
+            let _ = std::fs::remove_file(paths.secret_file(file));
+        }
+        return Err(err.into());
+    }
     // 改名后旧名字的凭据文件不会再被引用：删掉，别把旧密钥留在磁盘上
     if section.name != old.name {
         for file in [
@@ -2019,6 +2029,30 @@ fn ok_or_failure(ok: bool) -> Result<ExitCode, DaemonError> {
     })
 }
 
+/// 只读探测某个后端，返回一句话结果（界面里的 `T` 用；`cx backend test` 的打印版不动）。
+fn test_backend_summary(paths: &Paths, name: &str) -> Result<String, DaemonError> {
+    let config = Config::load(paths)?;
+    let section = config
+        .backends
+        .iter()
+        .find(|backend| backend.name == name)
+        .ok_or_else(|| {
+            DaemonError::Protocol(format!(
+                "没有名为 {name} 的后端（用 `cx backend list` 查看）"
+            ))
+        })?;
+    let backend = cx_backend::build_backend(section, paths, std::time::Duration::from_secs(30))
+        .map_err(|err| DaemonError::Protocol(format!("无法构造后端 {name}：{err}")))?;
+    let identity = Identity::load_or_create(paths, config.device.name.as_deref())?;
+    let mut sync = cx_sync::RemoteSync::new(backend, &identity.device_id, &identity.name);
+    match sync.probe() {
+        Ok(summary) => Ok(format!("{name} 可用：{summary}")),
+        Err(err) => Err(DaemonError::Protocol(format!(
+            "{name} 不可用：{err}。{}",
+            backend_error_tip(&err)
+        ))),
+    }
+}
 /// 后端的一句话描述（`list` 与错误信息复用）。
 fn backend_target(backend: &cx_core::BackendSection) -> String {
     match backend.kind {

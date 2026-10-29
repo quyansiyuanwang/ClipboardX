@@ -107,14 +107,25 @@ impl Bundle {
             cx_core::fsutil::write_atomic(&path, &decode(encoded)?)?;
             cx_core::fsutil::tighten_permissions(&path, false)?;
         }
-        if let Some(json) = &self.space_json {
-            let path = paths.space_file();
-            cx_core::fsutil::write_atomic(&path, json.as_bytes())?;
-        }
-        if let Some(encoded) = &self.space_key {
-            let path = paths.space_key_file();
-            cx_core::fsutil::write_atomic(&path, &decode(encoded)?)?;
-            cx_core::fsutil::tighten_permissions(&path, false)?;
+        // 空间的两个文件必须**成对**恢复，否则会出现"space.json 是新的、space.key 是旧的"
+        // 这种状态：界面显示新空间，却一把钥匙都打不开。包里没有空间就按没有空间恢复。
+        match (&self.space_json, &self.space_key) {
+            (Some(json), Some(encoded)) => {
+                cx_core::fsutil::write_atomic(&paths.space_file(), json.as_bytes())?;
+                let key_path = paths.space_key_file();
+                cx_core::fsutil::write_atomic(&key_path, &decode(encoded)?)?;
+                cx_core::fsutil::tighten_permissions(&key_path, false)?;
+            }
+            (Some(json), None) => {
+                // 有元数据没密钥：保留元数据，删掉本机旧密钥（旧密钥对新空间无效）
+                cx_core::fsutil::write_atomic(&paths.space_file(), json.as_bytes())?;
+                let _ = std::fs::remove_file(paths.space_key_file());
+            }
+            (None, _) => {
+                // 包里没有空间：本机也不该留着上一个空间的残骸
+                let _ = std::fs::remove_file(paths.space_file());
+                let _ = std::fs::remove_file(paths.space_key_file());
+            }
         }
         Ok(())
     }
@@ -236,6 +247,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
     }
 
+    #[test]
+    fn 导入没有空间的包会清掉本机旧空间() {
+        let paths = temp_paths("nospace");
+        std::fs::write(paths.config_dir.join("config.toml"), "x").unwrap();
+        std::fs::write(paths.space_file(), r#"{"space_id":"old"}"#).unwrap();
+        std::fs::write(paths.space_key_file(), "b".repeat(64)).unwrap();
+        let bundle = Bundle {
+            format: FORMAT.to_string(),
+            exported_ms: 0,
+            config_toml: "y".to_string(),
+            secrets: BTreeMap::new(),
+            space_json: None,
+            space_key: None,
+        };
+        bundle.restore(&paths, true).unwrap();
+        assert!(!paths.space_file().exists(), "旧空间的元数据要清掉");
+        assert!(!paths.space_key_file().exists(), "旧空间的密钥也要清掉");
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn 有元数据没密钥时不会留下旧密钥() {
+        let paths = temp_paths("jsononly");
+        std::fs::write(paths.config_dir.join("config.toml"), "x").unwrap();
+        std::fs::write(paths.space_key_file(), "c".repeat(64)).unwrap();
+        let bundle = Bundle {
+            format: FORMAT.to_string(),
+            exported_ms: 0,
+            config_toml: "y".to_string(),
+            secrets: BTreeMap::new(),
+            space_json: Some(r#"{"space_id":"new"}"#.to_string()),
+            space_key: None,
+        };
+        bundle.restore(&paths, true).unwrap();
+        assert!(paths.space_file().exists());
+        assert!(
+            !paths.space_key_file().exists(),
+            "旧密钥对新空间无效，必须删掉，否则会静默解不开"
+        );
+        let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
     #[test]
     fn 不认识的格式会被拒绝() {
         let text = r#"{"format":"something-else","exported_ms":0,"config_toml":"","secrets":{}}"#;

@@ -83,6 +83,8 @@ pub enum TuiExit {
     },
     /// 用户要重启守护进程。
     RestartDaemon,
+    /// 用户要测试某个后端。
+    TestBackend(String),
     /// 用户在面板里要用密钥加入空间。
     JoinSpace {
         /// 后端名。
@@ -134,6 +136,8 @@ pub trait BackendAdmin {
     fn set_config(&mut self, key: &str, value: &str) -> Result<String, String>;
     /// 重启守护进程（等价 `cx restart`）。
     fn restart_daemon(&mut self) -> Result<String, String>;
+    /// 只读探测某个后端（等价 `cx backend test`）。
+    fn test_backend(&mut self, name: &str) -> Result<String, String>;
 }
 
 /// 进入全屏 TUI。
@@ -340,6 +344,16 @@ fn run_loop(
                             break;
                         }
                         Some(handler) => match handler.publish_space(&backend) {
+                            Ok(message) => app.note(message),
+                            Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::TestBackend(name) => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::TestBackend(name);
+                            break;
+                        }
+                        Some(handler) => match handler.test_backend(&name) {
                             Ok(message) => app.note(message),
                             Err(message) => app.warn(message),
                         },
@@ -687,6 +701,7 @@ mod tests {
         updated: Vec<(String, String)>,
         published: Vec<String>,
         config_sets: Vec<(String, String)>,
+        tested: Vec<String>,
         fail_add: Option<&'static str>,
         fail_toggle: Option<&'static str>,
     }
@@ -785,6 +800,11 @@ mod tests {
 
         fn restart_daemon(&mut self) -> Result<String, String> {
             Ok("守护进程已重启".to_string())
+        }
+
+        fn test_backend(&mut self, name: &str) -> Result<String, String> {
+            self.tested.push(name.to_string());
+            Ok(format!("{name} 可用"))
         }
     }
 
