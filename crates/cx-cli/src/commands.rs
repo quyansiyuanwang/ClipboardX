@@ -845,16 +845,26 @@ impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
     }
 
     /// 面板里改一个配置项：与 `cx config set` 走同一个 set（含范围检查与写盘校验）。
+    ///
+    /// 不需要重启的键要**顺手 reload**：只写盘不 reload 的话，守护进程还用着旧值，
+    /// 界面上看着"改好了"，实际没生效。
     fn set_config(&mut self, key: &str, value: &str) -> Result<String, String> {
         let mut config = Config::load(self.paths).map_err(|err| err.to_string())?;
         let needs_restart = crate::config_cmd::set(&mut config, key, value)?;
         config.save(self.paths).map_err(|err| err.to_string())?;
         let shown = crate::config_cmd::get(&config, key).unwrap_or_default();
-        Ok(if needs_restart {
-            format!("{key} = {shown}（重启后生效）")
-        } else {
-            format!("{key} = {shown}")
-        })
+        if needs_restart {
+            return Ok(format!("{key} = {shown}（重启后生效，按 R）"));
+        }
+        match ControlClient::connect(self.paths) {
+            Ok(mut client) => match client.simple(commands::RELOAD) {
+                Ok(_) => Ok(format!("{key} = {shown}（已生效）")),
+                Err(err) => Ok(format!("{key} = {shown}（已写入，但重载失败：{err}）")),
+            },
+            Err(err) => Ok(format!(
+                "{key} = {shown}（已写入，但守护进程未连上：{err}）"
+            )),
+        }
     }
 
     /// 面板里按 R：重启守护进程（等价 `cx restart`）。
