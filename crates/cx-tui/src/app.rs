@@ -79,6 +79,17 @@ pub enum KeyOutcome {
     ExportBundle,
     /// 整套配置导入（面板里按 I，已确认）。
     ImportBundle,
+    /// 打开配置页（面板里按 C）。
+    OpenConfig,
+    /// 提交一个配置项修改。
+    SetConfig {
+        /// 键名。
+        key: String,
+        /// 新值。
+        value: String,
+    },
+    /// 重启守护进程（面板里按 R，已确认）。
+    RestartDaemon,
     /// 用空间密钥加入已有空间（面板里按 j 并输入密钥）。
     JoinSpace {
         /// 后端名。
@@ -143,6 +154,17 @@ impl PreviewState {
             .map(|text| text.lines().count().max(1))
             .unwrap_or(1)
     }
+}
+
+/// 配置页的状态：列表 + 光标 + 行内编辑缓冲。
+#[derive(Debug, Default, Clone)]
+pub struct ConfigPage {
+    /// `(键名, 当前值)`，顺序与 `config_cmd::keys()` 一致。
+    pub items: Vec<(String, String)>,
+    /// 光标所在行。
+    pub cursor: usize,
+    /// 正在编辑的输入缓冲（`None` 表示没在编辑）。
+    pub editing: Option<String>,
 }
 
 /// 界面状态。
@@ -214,6 +236,10 @@ pub struct App {
     pub wizard_edit_target: Option<String>,
     /// 导入整包前的确认（会覆盖本机配置、凭据与空间密钥）。
     pub pending_import: bool,
+    /// 配置页：`(键, 值)` 列表 + 选中行 + 正在编辑的输入缓冲。
+    pub config_page: Option<ConfigPage>,
+    /// 重启守护进程前的确认。
+    pub pending_restart: bool,
     /// 密钥页上"导出到文件"的结果（成功路径或错误），显示在同一页里。
     pub exported_key_note: Option<String>,
     /// 最近一次诊断报告（面板里的局域网对端等信息只有它知道）。
@@ -823,6 +849,87 @@ impl App {
                 }
             };
         }
+        // 重启守护进程的确认：会短暂中断同步
+        if self.pending_restart {
+            self.pending_restart = false;
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    KeyOutcome::RestartDaemon
+                }
+                _ => {
+                    self.note("已取消重启");
+                    KeyOutcome::None
+                }
+            };
+        }
+        // 配置页：↑↓ 选键、回车编辑、Esc 返回；编辑中回车提交、Esc 放弃
+        if self.config_page.is_some() {
+            let page = self.config_page.as_mut().expect("配置页存在");
+            if let Some(buffer) = page.editing.take() {
+                let outcome = match key.code {
+                    KeyCode::Esc => {
+                        self.note("已放弃修改");
+                        KeyOutcome::None
+                    }
+                    KeyCode::Backspace => {
+                        let mut buffer = buffer;
+                        buffer.pop();
+                        self.config_page.as_mut().unwrap().editing = Some(buffer);
+                        KeyOutcome::None
+                    }
+                    KeyCode::Enter => {
+                        let key_name = page
+                            .items
+                            .get(page.cursor)
+                            .map(|(key, _)| key.clone())
+                            .unwrap_or_default();
+                        KeyOutcome::SetConfig {
+                            key: key_name,
+                            value: buffer,
+                        }
+                    }
+                    KeyCode::Char(ch) => {
+                        let mut buffer = buffer;
+                        buffer.push(ch);
+                        self.config_page.as_mut().unwrap().editing = Some(buffer);
+                        KeyOutcome::None
+                    }
+                    _ => {
+                        self.config_page.as_mut().unwrap().editing = Some(buffer);
+                        KeyOutcome::None
+                    }
+                };
+                return outcome;
+            }
+            return match key.code {
+                KeyCode::Esc => {
+                    self.config_page = None;
+                    KeyOutcome::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    page.cursor = page.cursor.saturating_sub(1);
+                    KeyOutcome::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if page.cursor + 1 < page.items.len() {
+                        page.cursor += 1;
+                    }
+                    KeyOutcome::None
+                }
+                KeyCode::Enter => {
+                    // 进入行内编辑，初值是当前值（改端口这类场景直接覆盖即可）
+                    let current = page
+                        .items
+                        .get(page.cursor)
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_default();
+                    page.editing = Some(current);
+                    KeyOutcome::None
+                }
+                _ => KeyOutcome::None,
+            };
+        }
+
         // 导入整包的确认：会覆盖本机配置、凭据与空间密钥
         if self.pending_import {
             self.pending_import = false;
@@ -1122,6 +1229,13 @@ impl App {
                         KeyOutcome::None
                     }
                 },
+                // C：配置键值页（等价 cx config get/set）
+                KeyCode::Char('C') => KeyOutcome::OpenConfig,
+                // R：重启守护进程（先确认）
+                KeyCode::Char('R') => {
+                    self.pending_restart = true;
+                    KeyOutcome::None
+                }
                 // O：整套配置导出到配置目录
                 KeyCode::Char('O') => KeyOutcome::ExportBundle,
                 // I：从配置目录的整包导入（先确认：会覆盖本机配置）
@@ -2453,6 +2567,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn 面板里按大写c打开配置页() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('C'))), KeyOutcome::OpenConfig);
+    }
+
+    #[test]
+    fn 配置页回车编辑_提交产生设置意图() {
+        let mut app = App::new();
+        app.config_page = Some(ConfigPage {
+            items: vec![("lan.port".to_string(), "8688".to_string())],
+            cursor: 0,
+            editing: None,
+        });
+        // 进入编辑：初值是当前值
+        assert_eq!(app.on_key(key(KeyCode::Enter)), KeyOutcome::None);
+        assert_eq!(
+            app.config_page.as_ref().unwrap().editing.as_deref(),
+            Some("8688")
+        );
+        // 追加一位后提交
+        app.on_key(key(KeyCode::Char('0')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            KeyOutcome::SetConfig {
+                key: "lan.port".to_string(),
+                value: "86880".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn 配置页按esc先放弃编辑再关闭页面() {
+        let mut app = App::new();
+        app.config_page = Some(ConfigPage {
+            items: vec![("lan.port".to_string(), "8688".to_string())],
+            cursor: 0,
+            editing: Some("123".to_string()),
+        });
+        assert_eq!(app.on_key(key(KeyCode::Esc)), KeyOutcome::None);
+        let page = app.config_page.as_ref().expect("第一次 Esc 只放弃编辑");
+        assert!(page.editing.is_none());
+        assert_eq!(page.items[0].1, "8688", "放弃编辑不该改值");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), KeyOutcome::None);
+        assert!(app.config_page.is_none(), "第二次 Esc 关闭配置页");
+    }
+
+    #[test]
+    fn 面板里按大写r先确认再重启守护进程() {
+        let mut app = App::new();
+        app.apply(UiEvent::Status(Box::new(status_with_backends(
+            false,
+            serde_json::json!([backend("oss", true, 0, None)]),
+        ))));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Char('R'))), KeyOutcome::None);
+        assert!(app.pending_restart);
+        assert_eq!(app.on_key(key(KeyCode::Esc)), KeyOutcome::None);
+        assert!(!app.pending_restart, "Esc 取消重启");
+        app.on_key(key(KeyCode::Char('R')));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('y'))),
+            KeyOutcome::RestartDaemon
+        );
+    }
     #[test]
     fn 面板里按大写o导出并按大写i先确认再导入() {
         let mut app = App::new();

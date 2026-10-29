@@ -830,6 +830,38 @@ struct TuiBackendAdmin<'a> {
 }
 
 impl cx_tui::BackendAdmin for TuiBackendAdmin<'_> {
+    /// 面板里按 C：列出可设置的配置项（键名 + 当前值）。
+    fn config_items(&mut self) -> Result<Vec<(String, String)>, String> {
+        let config = Config::load(self.paths).map_err(|err| err.to_string())?;
+        Ok(crate::config_cmd::keys()
+            .into_iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    crate::config_cmd::get(&config, key).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// 面板里改一个配置项：与 `cx config set` 走同一个 set（含范围检查与写盘校验）。
+    fn set_config(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let mut config = Config::load(self.paths).map_err(|err| err.to_string())?;
+        let needs_restart = crate::config_cmd::set(&mut config, key, value)?;
+        config.save(self.paths).map_err(|err| err.to_string())?;
+        let shown = crate::config_cmd::get(&config, key).unwrap_or_default();
+        Ok(if needs_restart {
+            format!("{key} = {shown}（重启后生效）")
+        } else {
+            format!("{key} = {shown}")
+        })
+    }
+
+    /// 面板里按 R：重启守护进程（等价 `cx restart`）。
+    fn restart_daemon(&mut self) -> Result<String, String> {
+        restart_daemon(self.paths).map_err(|err| err.to_string())?;
+        Ok("守护进程已重启".to_string())
+    }
     /// 面板里按 E：把某个后端的现值装进表单，供用户改。
     fn edit_draft(&mut self, name: &str) -> Result<cx_tui::TuiBackendDraft, String> {
         let config = Config::load(self.paths).map_err(|err| err.to_string())?;

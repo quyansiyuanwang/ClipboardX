@@ -72,6 +72,17 @@ pub enum TuiExit {
     ExportBundle,
     /// 用户要导入整包。
     ImportBundle,
+    /// 用户要打开配置页。
+    OpenConfig,
+    /// 用户要修改一个配置项。
+    SetConfig {
+        /// 键名。
+        key: String,
+        /// 新值。
+        value: String,
+    },
+    /// 用户要重启守护进程。
+    RestartDaemon,
     /// 用户在面板里要用密钥加入空间。
     JoinSpace {
         /// 后端名。
@@ -117,6 +128,12 @@ pub trait BackendAdmin {
     fn export_bundle(&mut self) -> Result<String, String>;
     /// 从文件导入整套配置（等价 `cx config import --force`），返回路径。
     fn import_bundle(&mut self) -> Result<String, String>;
+    /// 列出可设置的配置项（键名 + 当前值），等价 `cx config get`。
+    fn config_items(&mut self) -> Result<Vec<(String, String)>, String>;
+    /// 修改一个配置项（等价 `cx config set`）。
+    fn set_config(&mut self, key: &str, value: &str) -> Result<String, String>;
+    /// 重启守护进程（等价 `cx restart`）。
+    fn restart_daemon(&mut self) -> Result<String, String>;
 }
 
 /// 进入全屏 TUI。
@@ -323,6 +340,51 @@ fn run_loop(
                             break;
                         }
                         Some(handler) => match handler.publish_space(&backend) {
+                            Ok(message) => app.note(message),
+                            Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::OpenConfig => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::OpenConfig;
+                            break;
+                        }
+                        Some(handler) => match handler.config_items() {
+                            Ok(items) => {
+                                app.config_page = Some(crate::app::ConfigPage {
+                                    items,
+                                    cursor: 0,
+                                    editing: None,
+                                })
+                            }
+                            Err(message) => app.warn(message),
+                        },
+                    },
+                    KeyOutcome::SetConfig { key, value } => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::SetConfig { key, value };
+                            break;
+                        }
+                        Some(handler) => {
+                            match handler.set_config(&key, &value) {
+                                Ok(message) => app.note(message),
+                                Err(message) => app.warn(message),
+                            }
+                            // 重新读一遍：值可能被规范化（如布尔 true/false）
+                            if let Ok(items) = handler.config_items()
+                                && let Some(page) = app.config_page.as_mut()
+                            {
+                                page.items = items;
+                                page.editing = None;
+                            }
+                        }
+                    },
+                    KeyOutcome::RestartDaemon => match admin.as_deref_mut() {
+                        None => {
+                            exit = TuiExit::RestartDaemon;
+                            break;
+                        }
+                        Some(handler) => match handler.restart_daemon() {
                             Ok(message) => app.note(message),
                             Err(message) => app.warn(message),
                         },
@@ -624,6 +686,7 @@ mod tests {
         edited: Vec<String>,
         updated: Vec<(String, String)>,
         published: Vec<String>,
+        config_sets: Vec<(String, String)>,
         fail_add: Option<&'static str>,
         fail_toggle: Option<&'static str>,
     }
@@ -706,6 +769,22 @@ mod tests {
 
         fn import_bundle(&mut self) -> Result<String, String> {
             Ok("已导入".to_string())
+        }
+
+        fn config_items(&mut self) -> Result<Vec<(String, String)>, String> {
+            Ok(vec![
+                ("sync.poll_active_ms".to_string(), "1000".to_string()),
+                ("lan.enabled".to_string(), "false".to_string()),
+            ])
+        }
+
+        fn set_config(&mut self, key: &str, value: &str) -> Result<String, String> {
+            self.config_sets.push((key.to_string(), value.to_string()));
+            Ok(format!("{key} = {value}"))
+        }
+
+        fn restart_daemon(&mut self) -> Result<String, String> {
+            Ok("守护进程已重启".to_string())
         }
     }
 

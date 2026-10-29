@@ -69,6 +69,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.pending_import {
         draw_confirm_space(frame, area, "配置目录里的整包", SpaceRisk::ImportBundle);
     }
+    if app.config_page.is_some() {
+        draw_config_page(frame, area, app);
+    }
+    if app.pending_restart {
+        draw_confirm_space(frame, area, "本机", SpaceRisk::Restart);
+    }
     if app.show_help {
         draw_help(frame, area, app);
     }
@@ -83,6 +89,70 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+/// 配置页：一列键、一列值；回车就地编辑，改完回车提交。
+fn draw_config_page(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    app.modal_rect = area;
+    frame.render_widget(Clear, area);
+    let Some(page) = app.config_page.as_ref() else {
+        return;
+    };
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let content_w = inner_w.min(84);
+    let indent = " ".repeat(inner_w.saturating_sub(content_w) / 2);
+    let key_w = page
+        .items
+        .iter()
+        .map(|(key, _)| display_width(key))
+        .max()
+        .unwrap_or(20)
+        .min(32);
+    let mut lines = vec![Line::from("")];
+    for (index, (key, value)) in page.items.iter().enumerate() {
+        let selected = index == page.cursor;
+        let shown = match (&page.editing, selected) {
+            (Some(buffer), true) => format!("{buffer}▏"),
+            _ => value.clone(),
+        };
+        let key_style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let value_style = if selected {
+            Style::default().fg(Color::White).bg(Color::Indexed(238))
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{indent}{}", if selected { "▸ " } else { "  " })),
+            Span::styled(pad_display(key, key_w + 2), key_style),
+            Span::styled(shown, value_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{indent}{}",
+            if page.editing.is_some() {
+                "回车 保存　Esc 放弃"
+            } else {
+                "↑↓ 选择　回车 修改　Esc 返回"
+            }
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 配置 ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
 /// 危险动作的两种确认：重建空间 / 换空间。
 #[derive(Debug, Clone, Copy)]
 enum SpaceRisk {
@@ -92,6 +162,8 @@ enum SpaceRisk {
     Switch,
     /// 从配置目录里的整包导入（覆盖本机配置、凭据与空间密钥）。
     ImportBundle,
+    /// 重启守护进程（同步会短暂中断）。
+    Restart,
 }
 /// 危险动作的确认页：一行问题、一行后果、一行按键。不写教程。
 fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: SpaceRisk) {
@@ -111,6 +183,11 @@ fn draw_confirm_space(frame: &mut Frame<'_>, area: Rect, backend: &str, risk: Sp
             " 导入整包 ",
             format!("用 {backend} 覆盖本机配置？"),
             "会替换 config.toml、凭据与空间密钥",
+        ),
+        SpaceRisk::Restart => (
+            " 重启守护进程 ",
+            format!("重启守护进程（{backend}）？"),
+            "同步会中断几秒",
         ),
     };
     let inner_w = area.width.saturating_sub(2) as usize;
@@ -1226,7 +1303,7 @@ fn draw_panel(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // 窄屏只留最常用的四个键：空格开关、a 添加、x 移除、Esc 关闭
         "  ↑↓ 选择　空格 开关　a 添加　x 移除　Esc 关闭"
     } else {
-        "  ↑↓ 选后端　空格 开关　a 添加　E 编辑　x 移除　s 建空间　i 加入　e 密钥　O 导出　I 导入　Esc 返回"
+        "  ↑↓ 选后端　空格 开关　a 添加　E 编辑　x 移除　s 建空间　i 加入　e 密钥　C 配置　O 导出　I 导入　R 重启　Esc 返回"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2380,6 +2457,28 @@ mod tests {
             .map(|form| form.submit())
             .unwrap_or_else(|| panic!("表单应当存在"));
         assert!(submitted.is_ok(), "编辑模式下密钥留空应可提交");
+    }
+    #[test]
+    fn 配置页列出键值并能行内编辑() {
+        let mut app = App::new();
+        app.config_page = Some(crate::app::ConfigPage {
+            items: vec![
+                ("lan.enabled".into(), "false".into()),
+                ("lan.port".into(), "8688".into()),
+            ],
+            cursor: 1,
+            editing: None,
+        });
+        let screen = render(&mut app, 100, 12);
+        assert!(has(&screen, "配置"), "{screen}");
+        assert!(has(&screen, "lan.enabled"), "{screen}");
+        assert!(has(&screen, "8688"), "要显示当前值：{screen}");
+        assert!(has(&screen, "▸"), "要标出选中行：{screen}");
+        // 编辑态显示光标
+        app.config_page.as_mut().unwrap().editing = Some("8700".into());
+        let screen = render(&mut app, 100, 12);
+        assert!(has(&screen, "8700"), "{screen}");
+        assert!(has(&screen, "保存"), "编辑时要提示怎么提交：{screen}");
     }
     #[test]
     fn 安全与时间文案不误导() {
