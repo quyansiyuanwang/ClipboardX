@@ -28,6 +28,7 @@ $bucket = 'clipboardx'
 $accessKey = 'clipboardx-access'
 $secretKey = 'clipboardx-secret-0123456789'
 
+$script:skipped = $false
 $failures = [System.Collections.Generic.List[string]]::new()
 $originalClipboard = $null
 $s3Process = $null
@@ -116,6 +117,12 @@ try {
     & $pip install --quiet 'moto[server]' 2>&1 | Select-Object -Last 2
     $moto = Join-Path $venv 'Scripts\moto_server.exe'
     if (-not (Test-Path $moto)) { $moto = Join-Path $venv 'bin/moto_server' }
+    if (-not (Test-Path $moto)) {
+        # 装不到就说清楚是环境问题，别让下一步抛"找不到 bin/moto_server"这种怪错
+        throw ("装不到 moto（需要联网执行 pip install 'moto[server]'）。" +
+            "S3 的线格式与签名由仓库内测试服务端覆盖（cargo test -p cx-backend --test s3_server），" +
+            "这里只是额外用 moto 这份独立实现验证互通；联网后重跑本脚本即可。")
+    }
 
     $s3Process = Start-Hidden $moto @('-p', "$port", '-H', '127.0.0.1') $null
     $ready = $false
@@ -259,7 +266,19 @@ print("bucket ready")
     Assert-True ((Invoke-Device $deviceB @('stop')).Code -eq 0) 'B 已停止'
 }
 catch {
-    Fail "未预期的异常：$($_.Exception.Message)"
+    # 环境不满足（例如离线装不到 moto/wsgidav）时单独归类：本地跳过，CI 里仍算失败，
+    # 免得"依赖装不上"被当成"实现有问题"，也免得在 CI 上被静默跳过。
+    if ($_.Exception.Message -like '装不到*') {
+        Write-Host ''
+        Write-Host "跳过：$($_.Exception.Message)" -ForegroundColor Yellow
+        if ($env:CI) {
+            Fail "环境不满足：$($_.Exception.Message)"
+        }
+        $script:skipped = $true
+    }
+    else {
+        Fail "未预期的异常：$($_.Exception.Message)"
+    }
 }
 finally {
     if ($null -ne $originalClipboard) {
@@ -285,6 +304,10 @@ finally {
 }
 
 Write-Host ''
+if ($failures.Count -eq 0 -and $script:skipped) {
+    Write-Host '本次跳过（环境不满足，见上面原因）' -ForegroundColor Yellow
+    exit 0
+}
 if ($failures.Count -eq 0) {
     Write-Host 'S3 双设备端到端验收全部通过' -ForegroundColor Green
     exit 0

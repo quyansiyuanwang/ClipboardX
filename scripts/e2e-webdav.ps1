@@ -27,6 +27,7 @@ $venv = Join-Path $root 'venv'
 $port = 18080 + (Get-Random -Maximum 200)
 $baseUrl = "http://127.0.0.1:$port/"
 
+$script:skipped = $false
 $failures = [System.Collections.Generic.List[string]]::new()
 $originalClipboard = $null
 $davProcess = $null
@@ -112,6 +113,12 @@ try {
     & $pip install --quiet wsgidav cheroot 2>&1 | Select-Object -Last 2
     $wsgidav = Join-Path $venv 'Scripts\wsgidav.exe'
     if (-not (Test-Path $wsgidav)) { $wsgidav = Join-Path $venv 'bin/wsgidav' }
+    if (-not (Test-Path $wsgidav)) {
+        # 装不到就说清楚是环境问题（离线/镜像不可用），而不是下一步抛"找不到 bin/wsgidav"
+        throw ("装不到 wsgidav（需要联网执行 pip install wsgidav cheroot）。" +
+            "WebDAV 的线格式另由仓库内测试服务端覆盖（cargo test -p cx-backend --test webdav_server）；" +
+            "联网后重跑本脚本即可。")
+    }
 
     $davProcess = Start-Hidden $wsgidav @("--host=127.0.0.1", "--port=$port", "--root=$davRoot", "--auth=anonymous") $null
     $ready = $false
@@ -244,7 +251,19 @@ try {
     Assert-True ((Invoke-Device $deviceB @('stop')).Code -eq 0) 'B 已停止'
 }
 catch {
-    Fail "未预期的异常：$($_.Exception.Message)"
+    # 环境不满足（例如离线装不到 moto/wsgidav）时单独归类：本地跳过，CI 里仍算失败，
+    # 免得"依赖装不上"被当成"实现有问题"，也免得在 CI 上被静默跳过。
+    if ($_.Exception.Message -like '装不到*') {
+        Write-Host ''
+        Write-Host "跳过：$($_.Exception.Message)" -ForegroundColor Yellow
+        if ($env:CI) {
+            Fail "环境不满足：$($_.Exception.Message)"
+        }
+        $script:skipped = $true
+    }
+    else {
+        Fail "未预期的异常：$($_.Exception.Message)"
+    }
 }
 finally {
     if ($null -ne $originalClipboard) {
@@ -270,6 +289,10 @@ finally {
 }
 
 Write-Host ''
+if ($failures.Count -eq 0 -and $script:skipped) {
+    Write-Host '本次跳过（环境不满足，见上面原因）' -ForegroundColor Yellow
+    exit 0
+}
 if ($failures.Count -eq 0) {
     Write-Host 'WebDAV 双设备端到端验收全部通过' -ForegroundColor Green
     exit 0

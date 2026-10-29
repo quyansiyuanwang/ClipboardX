@@ -145,8 +145,17 @@ pub fn write_file(path: &Path, bundle: &Bundle) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// 从文件读入。
+/// 从文件读入。文件不存在时给一句"该怎么办"，而不是裸的 os error 2。
 pub fn read_file(path: &Path) -> Result<Bundle, CoreError> {
+    if !path.exists() {
+        return Err(CoreError::malformed(
+            "bundle",
+            format!(
+                "没有找到 {}（先用 `cx config export` 或面板里的 O 导出一份）",
+                path.display()
+            ),
+        ));
+    }
     let text = std::fs::read_to_string(path).map_err(|err| CoreError::io(path, err))?;
     Bundle::parse(&text)
 }
@@ -287,6 +296,17 @@ mod tests {
             "旧密钥对新空间无效，必须删掉，否则会静默解不开"
         );
         let _ = std::fs::remove_dir_all(paths.config_dir.parent().unwrap());
+    }
+    #[test]
+    fn 整包不存在时给出可操作的提示() {
+        let path = std::env::temp_dir().join("cx-no-such-bundle.json");
+        let _ = std::fs::remove_file(&path);
+        let err = read_file(&path).unwrap_err().to_string();
+        assert!(err.contains("没有找到"), "{err}");
+        assert!(
+            err.contains("config export"),
+            "要告诉用户怎么产出这个文件：{err}"
+        );
     }
     #[test]
     fn 不认识的格式会被拒绝() {
